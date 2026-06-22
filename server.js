@@ -13,7 +13,6 @@ const {
   capturePayPalOrder,
 } = require('./paypal');
 const { mountCatalog, getCatalogReadiness, getCatalogCache } = require('./catalog');
-const { mountCatalogSyncRoutes } = require('./catalog/routes');
 const app = express();
 const storage = createStorage();
 const pendingOrders = storage.pendingOrders.items;
@@ -2852,9 +2851,7 @@ async function startServer() {
     }
   }
 
-  if (cache) {
-    mountCatalogSyncRoutes(app, { cache, requireAdminApiKey });
-  } else {
+  if (!cache) {
     console.error('[NOOD catalog] sync routes not mounted because cache is unavailable');
   }
 

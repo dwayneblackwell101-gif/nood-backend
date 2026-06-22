@@ -89,19 +89,37 @@ async function checkpointCache(cache) {
   }
 }
 
+async function getCatalogCounts(cache) {
+  const productCount =
+    typeof cache.getProductCount === 'function'
+      ? Number(await cache.getProductCount())
+      : Number((await cache.getMeta())?.productCount || 0);
+  const collectionCount =
+    typeof cache.getCollectionCount === 'function'
+      ? Number(await cache.getCollectionCount())
+      : Number((await cache.getMeta())?.collectionCount || 0);
+
+  return { productCount, collectionCount };
+}
+
 async function getCatalogSyncStatus(cache) {
   const state = await getSyncState(cache);
-  const meta = await cache.getMeta();
+  const counts = await getCatalogCounts(cache);
+  const cursor =
+    state.phase === 'collections'
+      ? state.collectionCursor || null
+      : state.productCursor || null;
 
   return {
     status: state.status || 'idle',
     phase: state.phase || null,
+    productCount: counts.productCount,
+    collectionCount: counts.collectionCount,
+    cursor,
     productCursor: state.productCursor || null,
     collectionCursor: state.collectionCursor || null,
     syncedProductCount: Number(state.syncedProductCount || 0),
     syncedCollectionCount: Number(state.syncedCollectionCount || 0),
-    productCount: Number(meta.productCount || state.syncedProductCount || 0),
-    collectionCount: Number(meta.collectionCount || state.syncedCollectionCount || 0),
     startedAt: state.startedAt || null,
     updatedAt: state.updatedAt || null,
     completedAt: state.completedAt || null,
@@ -283,8 +301,12 @@ async function syncProductsPhase(cache, config, state, options = {}) {
       guard += 1;
       pageAttempts = 0;
 
+      const liveProductCount =
+        typeof cache.getProductCount === 'function'
+          ? await cache.getProductCount()
+          : totalSaved;
       const meta = await cache.setMeta({
-        productCount: totalSaved,
+        productCount: liveProductCount,
         syncInProgress: true,
         source: 'shopify',
       });
@@ -356,8 +378,12 @@ async function syncCollectionsPhase(cache, state, options = {}) {
       guard += 1;
       pageAttempts = 0;
 
+      const liveCollectionCount =
+        typeof cache.getCollectionCount === 'function'
+          ? await cache.getCollectionCount()
+          : totalSaved;
       const meta = await cache.setMeta({
-        collectionCount: totalSaved,
+        collectionCount: liveCollectionCount,
         syncInProgress: true,
         source: 'shopify',
       });
@@ -442,11 +468,11 @@ async function runResumableCatalogSync(cache, options = {}) {
       await syncMenus(cache);
     }
 
-    const metaBeforeFinalize = await cache.getMeta();
+    const counts = await getCatalogCounts(cache);
     const meta = await cache.setMeta({
       lastSyncAt: new Date().toISOString(),
-      productCount: Number(metaBeforeFinalize.productCount || 0),
-      collectionCount: Number(metaBeforeFinalize.collectionCount || 0),
+      productCount: counts.productCount,
+      collectionCount: counts.collectionCount,
       syncDurationMs: Date.now() - startedAt,
       source: 'shopify',
       syncInProgress: false,

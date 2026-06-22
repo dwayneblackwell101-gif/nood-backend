@@ -15,6 +15,18 @@ function emptyState() {
     productsById: {},
     collections: {},
     menus: {},
+    syncState: {
+      status: 'idle',
+      phase: null,
+      productCursor: null,
+      collectionCursor: null,
+      syncedProductCount: 0,
+      syncedCollectionCount: 0,
+      startedAt: null,
+      updatedAt: null,
+      lastError: null,
+      completedAt: null,
+    },
   };
 }
 
@@ -38,6 +50,7 @@ class JsonCatalogCache {
         collections: parsed.collections || {},
         menus: parsed.menus || {},
         meta: { ...emptyState().meta, ...(parsed.meta || {}) },
+        syncState: { ...emptyState().syncState, ...(parsed.syncState || {}) },
       };
     } catch (error) {
       console.error('[NOOD catalog] failed to load JSON cache:', error.message);
@@ -66,6 +79,37 @@ class JsonCatalogCache {
     return handle ? this.state.products[handle] : null;
   }
 
+  async mergeProducts(incomingProducts = []) {
+    let saved = 0;
+
+    for (const product of incomingProducts) {
+      const key = String(product?.handle || '').trim();
+      if (!key) continue;
+      this.state.products[key] = product;
+      if (product?.id) {
+        this.state.productsById[String(product.id)] = key;
+      }
+      saved += 1;
+    }
+
+    await this.persist();
+    return saved;
+  }
+
+  async mergeCollections(incomingCollections = []) {
+    let saved = 0;
+
+    for (const collection of incomingCollections) {
+      const key = String(collection?.handle || '').trim();
+      if (!key) continue;
+      this.state.collections[key] = collection;
+      saved += 1;
+    }
+
+    await this.persist();
+    return saved;
+  }
+
   async setProduct(handle, product) {
     const key = String(handle || '').trim();
     if (!key) return null;
@@ -86,6 +130,14 @@ class JsonCatalogCache {
     }
     await this.persist();
     return true;
+  }
+
+  async getProductCount() {
+    return Object.keys(this.state.products || {}).length;
+  }
+
+  async getCollectionCount() {
+    return Object.keys(this.state.collections || {}).length;
   }
 
   async getAllProducts() {
@@ -156,6 +208,20 @@ class JsonCatalogCache {
 
   async ping() {
     return fs.existsSync(CACHE_FILE) ? 'OK' : 'MISSING';
+  }
+
+  async getSyncState() {
+    return { ...this.state.syncState };
+  }
+
+  async setSyncState(state) {
+    this.state.syncState = {
+      ...this.state.syncState,
+      ...state,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.persist();
+    return this.getSyncState();
   }
 }
 

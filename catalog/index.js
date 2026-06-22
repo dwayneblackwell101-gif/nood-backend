@@ -1,5 +1,5 @@
 const { createCatalogCache } = require('./cache/redis-cache');
-const { createCatalogRouter } = require('./routes');
+const { createCatalogRouter, mountCatalogSyncRoutes } = require('./routes');
 const { createWebhookRouter } = require('./webhooks');
 const { ensureCatalogWarm } = require('./sync');
 
@@ -30,8 +30,14 @@ async function getCatalogReadiness() {
   }
 
   const meta = await mountedCache.getMeta();
-  const productCount = Number(meta.productCount || 0);
-  const collectionCount = Number(meta.collectionCount || 0);
+  const productCount =
+    typeof mountedCache.getProductCount === 'function'
+      ? Number(await mountedCache.getProductCount())
+      : Number(meta.productCount || 0);
+  const collectionCount =
+    typeof mountedCache.getCollectionCount === 'function'
+      ? Number(await mountedCache.getCollectionCount())
+      : Number(meta.collectionCount || 0);
   const cacheDriver = mountedCache.driver();
   let redisPing = null;
 
@@ -73,6 +79,7 @@ async function mountCatalog(app, { requireAdminApiKey }) {
 
     app.use('/api/catalog', catalogRouter);
     app.use('/api/webhooks', webhookRouter);
+    mountCatalogSyncRoutes(app, { cache, requireAdminApiKey });
 
     mountedCache = cache;
     catalogMounted = true;

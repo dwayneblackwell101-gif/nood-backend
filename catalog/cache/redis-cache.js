@@ -229,15 +229,73 @@ async function createRedisCache(redisUrl) {
       );
     }
 
+    async getProductCount() {
+      await this.ensureLegacyMigrated();
+      const hashCount = Number(await this.client.hlen(PRODUCTS_HASH_KEY)) || 0;
+      if (hashCount > 0) {
+        console.log(`[NOOD cache] redis product hash count=${hashCount}`);
+        return hashCount;
+      }
+
+      const legacy = await this.getJson(LEGACY_PRODUCTS_KEY, {});
+      const legacyCount = Object.keys(legacy || {}).length;
+      if (legacyCount > 0) {
+        console.log(`[NOOD cache] redis legacy product blob count=${legacyCount}`);
+        return legacyCount;
+      }
+
+      console.log('[NOOD cache] redis product hash count=0');
+      return 0;
+    }
+
+    async getCollectionCount() {
+      await this.ensureLegacyMigrated();
+      const hashCount = Number(await this.client.hlen(COLLECTIONS_HASH_KEY)) || 0;
+      if (hashCount > 0) {
+        return hashCount;
+      }
+
+      const legacy = await this.getJson(LEGACY_COLLECTIONS_KEY, {});
+      return Object.keys(legacy || {}).length;
+    }
+
+    async getLegacyProductsArray() {
+      const legacy = await this.getJson(LEGACY_PRODUCTS_KEY, null);
+      if (!legacy || typeof legacy !== 'object') {
+        return [];
+      }
+      return Object.values(legacy).filter(Boolean);
+    }
+
     async getAllProductHandles() {
       await this.ensureLegacyMigrated();
-      return this.client.hkeys(PRODUCTS_HASH_KEY);
+      const handles = await this.client.hkeys(PRODUCTS_HASH_KEY);
+      if (handles.length > 0) {
+        return handles;
+      }
+      const legacy = await this.getLegacyProductsArray();
+      return legacy.map((product) => product.handle).filter(Boolean);
     }
 
     async getAllProducts() {
       await this.ensureLegacyMigrated();
-      const raw = await this.client.hgetall(PRODUCTS_HASH_KEY);
-      return parseHashValues(raw);
+      const hashCount = Number(await this.client.hlen(PRODUCTS_HASH_KEY)) || 0;
+      console.log(`[NOOD cache] redis product hash count=${hashCount}`);
+
+      if (hashCount > 0) {
+        const raw = await this.client.hgetall(PRODUCTS_HASH_KEY);
+        return parseHashValues(raw);
+      }
+
+      const legacyProducts = await this.getLegacyProductsArray();
+      if (legacyProducts.length > 0) {
+        console.log(`[NOOD cache] redis legacy product blob count=${legacyProducts.length}`);
+        await this.mergeProducts(legacyProducts);
+        await this.client.del(LEGACY_PRODUCTS_KEY, LEGACY_PRODUCTS_BY_ID_KEY);
+        return legacyProducts;
+      }
+
+      return [];
     }
 
     async getCollection(handle) {
@@ -252,8 +310,24 @@ async function createRedisCache(redisUrl) {
 
     async getAllCollections() {
       await this.ensureLegacyMigrated();
-      const raw = await this.client.hgetall(COLLECTIONS_HASH_KEY);
-      return parseHashValues(raw);
+      const hashCount = Number(await this.client.hlen(COLLECTIONS_HASH_KEY)) || 0;
+
+      if (hashCount > 0) {
+        const raw = await this.client.hgetall(COLLECTIONS_HASH_KEY);
+        return parseHashValues(raw);
+      }
+
+      const legacy = await this.getJson(LEGACY_COLLECTIONS_KEY, null);
+      if (legacy && typeof legacy === 'object') {
+        const legacyCollections = Object.values(legacy).filter(Boolean);
+        if (legacyCollections.length > 0) {
+          await this.mergeCollections(legacyCollections);
+          await this.client.del(LEGACY_COLLECTIONS_KEY);
+          return legacyCollections;
+        }
+      }
+
+      return [];
     }
 
     async setMenu(handle, menu) {
