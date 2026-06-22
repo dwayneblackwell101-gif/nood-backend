@@ -1,0 +1,45 @@
+services:
+  - type: web
+    name: nood-backend
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SHOPIFY_ADMIN_API_VERSION
+        value: 2025-10
+      - key: SHOPIFY_STOREFRONT_API_VERSION
+        value: 2025-10
+      - key: STORAGE_DRIVER
+        value: json
+      - key: REDIS_URL
+        sync: false
+      - key: BACKEND_BASE_URL
+        sync: false
+      - key: ADMIN_API_KEY
+        sync: false
+      - key: NOOD_ALLOWED_ORIGINS
+        sync: false
+      - key: SHOPIFY_STORE_DOMAIN
+        sync: false
+      - key: SHOPIFY_ADMIN_ACCESS_TOKEN
+        sync: false
+      - key: SHOPIFY_STOREFRONT_ACCESS_TOKEN
+        sync: false
+      - key: SHOPIFY_WEBHOOK_SECRET
+        sync: false
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_ENV
+        sync: false
+      - key: WIPAY_ACCOUNT_NUMBER
+        sync: false
+      - key: WIPAY_API_KEY
+        sync: false
+      - key: WIPAY_ENVIRONMENT
+        sync: false

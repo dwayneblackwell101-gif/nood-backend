@@ -1,0 +1,13 @@
+.env
+.env.local
+node_modules/
+.expo/
+
+# Local JSON caches and payment storage (use Redis + remote storage in production)
+catalog-cache.json
+pending-orders.json
+failed-paid-orders.json
+payment-records.json
+
+*.log
+.DS_Store

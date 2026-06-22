@@ -1,0 +1,10 @@
+node_modules
+.env
+.env.*
+.git
+.expo
+catalog-cache.json
+pending-orders.json
+failed-paid-orders.json
+payment-records.json
+*.log
