@@ -140,22 +140,36 @@ async function checkpointCache(cache) {
   }
 }
 
-async function getCatalogCounts(cache) {
-  const productCount =
+function metaCount(meta, field, fallback = 0) {
+  return Number(meta?.[field] ?? fallback) || 0;
+}
+
+async function getCatalogCounts(cache, options = {}) {
+  const meta = (await cache.getMeta?.()) || null;
+  const liveProductCount =
     typeof cache.getProductCount === 'function'
-      ? Number(await cache.getProductCount())
-      : Number((await cache.getMeta())?.productCount || 0);
-  const collectionCount =
+      ? Number(await cache.getProductCount()) || 0
+      : 0;
+  const liveCollectionCount =
     typeof cache.getCollectionCount === 'function'
-      ? Number(await cache.getCollectionCount())
-      : Number((await cache.getMeta())?.collectionCount || 0);
+      ? Number(await cache.getCollectionCount()) || 0
+      : 0;
+
+  const productCount = liveProductCount || metaCount(meta, 'productCount', 0);
+  const collectionCount =
+    options.phase === 'collections' || options.phase === 'completed'
+      ? liveCollectionCount || metaCount(meta, 'collectionCount', 0)
+      : Number(options.syncedCollectionCount ?? 0) || 0;
 
   return { productCount, collectionCount };
 }
 
 async function getCatalogSyncStatus(cache) {
   const state = await getSyncState(cache);
-  const counts = await getCatalogCounts(cache);
+  const counts = await getCatalogCounts(cache, {
+    phase: state.phase || null,
+    syncedCollectionCount: state.syncedCollectionCount,
+  });
   const cursor =
     state.phase === 'collections'
       ? state.collectionCursor || null
@@ -181,7 +195,7 @@ async function getCatalogSyncStatus(cache) {
 }
 
 async function prepareFreshSync(cache) {
-  const meta = await cache.getMeta();
+  const meta = (await cache.getMeta()) || {};
 
   if (typeof cache.clearProducts === 'function') {
     await cache.clearProducts();
@@ -354,13 +368,17 @@ async function syncProductsPhase(cache, config, state, options = {}) {
 
       const liveProductCount =
         typeof cache.getProductCount === 'function'
-          ? await cache.getProductCount()
+          ? Number(await cache.getProductCount()) || 0
           : totalSaved;
-      const meta = await cache.setMeta({
-        productCount: liveProductCount,
-        syncInProgress: true,
-        source: 'shopify',
-      });
+      const productCount = metaCount(
+        await cache.setMeta({
+          productCount: liveProductCount,
+          syncInProgress: true,
+          source: 'shopify',
+        }),
+        'productCount',
+        liveProductCount
+      );
 
       await setSyncState(cache, {
         status: 'running',
@@ -373,15 +391,16 @@ async function syncProductsPhase(cache, config, state, options = {}) {
 
       await checkpointCache(cache);
       console.log(
-        `[NOOD sync] page saved products=${meta.productCount || totalSaved} cursor=${after || 'end'}`
+        `[NOOD sync] page saved products=${productCount} cursor=${after || 'end'}`
       );
     } catch (error) {
       const nonRetryable =
         error?.code === 'MISSING_SHOPIFY_SYNC_FUNCTION' ||
-        /is not a function/i.test(safeString(error?.message));
+        /is not a function/i.test(safeString(error?.message)) ||
+        /cannot read properties of undefined/i.test(safeString(error?.message));
 
       if (nonRetryable) {
-        console.error(`[NOOD sync] ${safeString(error.message, 'sync dependency missing')}`);
+        console.error(`[NOOD sync] ${safeString(error.message, 'sync page failed')}`);
         throw error;
       }
 
@@ -440,13 +459,17 @@ async function syncCollectionsPhase(cache, state, options = {}) {
 
       const liveCollectionCount =
         typeof cache.getCollectionCount === 'function'
-          ? await cache.getCollectionCount()
+          ? Number(await cache.getCollectionCount()) || 0
           : totalSaved;
-      const meta = await cache.setMeta({
-        collectionCount: liveCollectionCount,
-        syncInProgress: true,
-        source: 'shopify',
-      });
+      const collectionCount = metaCount(
+        await cache.setMeta({
+          collectionCount: liveCollectionCount,
+          syncInProgress: true,
+          source: 'shopify',
+        }),
+        'collectionCount',
+        liveCollectionCount
+      );
 
       await setSyncState(cache, {
         status: 'running',
@@ -458,15 +481,16 @@ async function syncCollectionsPhase(cache, state, options = {}) {
 
       await checkpointCache(cache);
       console.log(
-        `[NOOD sync] page saved collections=${meta.collectionCount || totalSaved} cursor=${after || 'end'}`
+        `[NOOD sync] page saved collections=${collectionCount} cursor=${after || 'end'}`
       );
     } catch (error) {
       const nonRetryable =
         error?.code === 'MISSING_SHOPIFY_SYNC_FUNCTION' ||
-        /is not a function/i.test(safeString(error?.message));
+        /is not a function/i.test(safeString(error?.message)) ||
+        /cannot read properties of undefined/i.test(safeString(error?.message));
 
       if (nonRetryable) {
-        console.error(`[NOOD sync] ${safeString(error.message, 'sync dependency missing')}`);
+        console.error(`[NOOD sync] ${safeString(error.message, 'sync page failed')}`);
         throw error;
       }
 
@@ -537,7 +561,7 @@ async function runResumableCatalogSync(cache, options = {}) {
       await syncMenus(cache);
     }
 
-    const counts = await getCatalogCounts(cache);
+    const counts = await getCatalogCounts(cache, { phase: 'completed' });
     const meta = await cache.setMeta({
       lastSyncAt: new Date().toISOString(),
       productCount: counts.productCount,
@@ -546,14 +570,16 @@ async function runResumableCatalogSync(cache, options = {}) {
       source: 'shopify',
       syncInProgress: false,
     });
+    const productCount = metaCount(meta, 'productCount', counts.productCount);
+    const collectionCount = metaCount(meta, 'collectionCount', counts.collectionCount);
 
     await setSyncState(cache, {
       status: 'completed',
       phase: 'completed',
       productCursor: null,
       collectionCursor: null,
-      syncedProductCount: Number(meta.productCount || 0),
-      syncedCollectionCount: Number(meta.collectionCount || 0),
+      syncedProductCount: productCount,
+      syncedCollectionCount: collectionCount,
       lastError: null,
       completedAt: new Date().toISOString(),
     });
@@ -562,10 +588,14 @@ async function runResumableCatalogSync(cache, options = {}) {
     await checkpointCache(cache);
 
     console.log(
-      `[NOOD sync] completed productCount=${meta.productCount} collectionCount=${meta.collectionCount}`
+      `[NOOD sync] completed productCount=${productCount} collectionCount=${collectionCount}`
     );
 
-    return meta;
+    return {
+      ...(meta || {}),
+      productCount,
+      collectionCount,
+    };
   } catch (error) {
     await setSyncState(cache, {
       status: 'failed',
@@ -637,8 +667,8 @@ async function ensureCatalogWarm(cache) {
   if (String(process.env.NODE_ENV || '').trim() === 'production') {
     console.log('[NOOD catalog] production startup warm check skipped auto-sync', {
       cacheDriver: cache.driver(),
-      productCount: meta.productCount || products.length,
-      collectionCount: meta.collectionCount || 0,
+      productCount: metaCount(meta, 'productCount', products.length),
+      collectionCount: metaCount(meta, 'collectionCount', 0),
     });
     return { warmed: false, meta, source: 'cache', skipped: true };
   }

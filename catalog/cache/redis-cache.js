@@ -134,14 +134,38 @@ async function createRedisCache(redisUrl) {
       this._legacyMigrated = true;
     }
 
-    async getMeta() {
-      return this.getJson(META_KEY, { version: 1, lastSyncAt: null, productCount: 0, collectionCount: 0 });
+    defaultMeta() {
+      return {
+        version: 1,
+        lastSyncAt: null,
+        productCount: 0,
+        collectionCount: 0,
+        syncInProgress: false,
+        source: null,
+      };
     }
 
-    async setMeta(meta) {
+    normalizeMeta(meta) {
+      const base = this.defaultMeta();
+      const safeMeta = meta && typeof meta === 'object' ? meta : {};
+      return {
+        ...base,
+        ...safeMeta,
+        productCount: Number(safeMeta.productCount ?? base.productCount) || 0,
+        collectionCount: Number(safeMeta.collectionCount ?? base.collectionCount) || 0,
+      };
+    }
+
+    async getMeta() {
+      const stored = await this.getJson(META_KEY, null);
+      return this.normalizeMeta(stored);
+    }
+
+    async setMeta(meta = {}) {
       const current = await this.getMeta();
-      await this.setJson(META_KEY, { ...current, ...meta });
-      return this.getMeta();
+      const next = this.normalizeMeta({ ...current, ...(meta || {}) });
+      await this.setJson(META_KEY, next);
+      return next;
     }
 
     async getProduct(handle) {
