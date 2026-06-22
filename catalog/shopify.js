@@ -1,6 +1,59 @@
 const axios = require('axios');
 const { safeString } = require('./transform');
 
+const DEFAULT_MAX_GRAPHQL_ATTEMPTS = 15;
+const INTER_PAGE_DELAY_MS = 400;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isThrottledGraphqlPayload(payload) {
+  const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+  return errors.some((entry) => String(entry?.message || '').toLowerCase().includes('throttl'));
+}
+
+function getRequestedQueryCost(payload, fallback = 50) {
+  const cost = Number(payload?.extensions?.cost?.requestedQueryCost);
+  return Number.isFinite(cost) && cost > 0 ? cost : fallback;
+}
+
+function getThrottleWaitMs(throttleStatus, requestedQueryCost = 50, attempt = 1) {
+  const jitter = 2000 + Math.floor(Math.random() * 3001);
+
+  if (!throttleStatus) {
+    return Math.min(jitter * Math.pow(2, Math.max(0, attempt - 1)), 60000);
+  }
+
+  const available = Number(throttleStatus.currentlyAvailable ?? 0);
+  const restoreRate = Number(throttleStatus.restoreRate ?? 50) || 50;
+  const cost = Math.max(1, Number(requestedQueryCost ?? 50));
+
+  if (available >= cost) {
+    return Math.min(jitter * Math.pow(2, Math.max(0, attempt - 1)), 60000);
+  }
+
+  const deficit = Math.max(0, cost - available);
+  const restoreMs = Math.ceil((deficit / restoreRate) * 1000) + 250;
+  return Math.min(Math.max(restoreMs, jitter) * Math.pow(2, Math.max(0, attempt - 1)), 60000);
+}
+
+function getLowBucketWaitMs(throttleStatus, requestedQueryCost = 50) {
+  if (!throttleStatus) return 0;
+
+  const available = Number(throttleStatus.currentlyAvailable ?? 0);
+  const restoreRate = Number(throttleStatus.restoreRate ?? 50) || 50;
+  const cost = Math.max(1, Number(requestedQueryCost ?? 50));
+
+  if (available >= cost * 2) {
+    return 0;
+  }
+
+  const target = cost * 2;
+  const deficit = Math.max(0, target - available);
+  return Math.ceil((deficit / restoreRate) * 1000) + 150;
+}
+
 function getShopifyConfig() {
   return {
     storeDomain: safeString(process.env.SHOPIFY_STORE_DOMAIN),
@@ -15,31 +68,90 @@ function getShopifyConfig() {
   };
 }
 
-async function adminGraphql(query, variables = {}) {
+async function adminGraphql(query, variables = {}, options = {}) {
   const config = getShopifyConfig();
   if (!config.storeDomain || !config.adminToken) {
     throw new Error('Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN.');
   }
 
-  const response = await axios.post(
-    `https://${config.storeDomain}/admin/api/${config.adminApiVersion}/graphql.json`,
-    { query, variables },
-    {
-      headers: {
-        'X-Shopify-Access-Token': config.adminToken,
-        'Content-Type': 'application/json',
-      },
-      timeout: 60000,
-    }
-  );
+  const maxAttempts = Number(options.maxAttempts || DEFAULT_MAX_GRAPHQL_ATTEMPTS);
+  let lastThrottleStatus = null;
+  let throttleAttempt = 0;
 
-  if (response.data?.errors?.length) {
-    const error = new Error(response.data.errors[0]?.message || 'Shopify Admin GraphQL error');
-    error.shopifyErrors = response.data.errors;
-    throw error;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (options.interPageDelayMs && attempt === 1) {
+      await sleep(options.interPageDelayMs);
+    }
+
+    const preWaitMs = getLowBucketWaitMs(lastThrottleStatus, options.requestedQueryCost || 50);
+    if (preWaitMs > 0) {
+      console.log(`[NOOD sync] throttled, waiting ${preWaitMs} ms before retry`);
+      await sleep(preWaitMs);
+    }
+
+    let response;
+    try {
+      response = await axios.post(
+        `https://${config.storeDomain}/admin/api/${config.adminApiVersion}/graphql.json`,
+        { query, variables },
+        {
+          headers: {
+            'X-Shopify-Access-Token': config.adminToken,
+            'Content-Type': 'application/json',
+          },
+          timeout: 60000,
+        }
+      );
+    } catch (error) {
+      const retryable =
+        error?.code === 'ECONNABORTED' ||
+        error?.response?.status === 429 ||
+        (error?.response?.status >= 500 && error?.response?.status < 600);
+
+      if (retryable && attempt < maxAttempts) {
+        throttleAttempt += 1;
+        const waitMs = getThrottleWaitMs(lastThrottleStatus, options.requestedQueryCost || 50, throttleAttempt);
+        console.log(`[NOOD sync] throttled, waiting ${waitMs} ms before retry`);
+        await sleep(waitMs);
+        continue;
+      }
+
+      throw error;
+    }
+
+    const payload = response.data;
+    const throttleStatus = payload?.extensions?.cost?.throttleStatus || null;
+    const requestedQueryCost = getRequestedQueryCost(payload, options.requestedQueryCost || 50);
+
+    if (throttleStatus) {
+      lastThrottleStatus = throttleStatus;
+    }
+
+    if (isThrottledGraphqlPayload(payload)) {
+      throttleAttempt += 1;
+      const waitMs = getThrottleWaitMs(throttleStatus || lastThrottleStatus, requestedQueryCost, throttleAttempt);
+      console.log(`[NOOD sync] throttled, waiting ${waitMs} ms before retry`);
+      await sleep(waitMs);
+      continue;
+    }
+
+    if (payload?.errors?.length) {
+      const error = new Error(payload.errors[0]?.message || 'Shopify Admin GraphQL error');
+      error.shopifyErrors = payload.errors;
+      throw error;
+    }
+
+    const postWaitMs = getLowBucketWaitMs(throttleStatus, requestedQueryCost);
+    if (postWaitMs > 0) {
+      await sleep(postWaitMs);
+    }
+
+    return payload;
   }
 
-  return response.data;
+  const error = new Error('Throttled');
+  error.shopifyErrors = [{ message: 'Throttled' }];
+  throw error;
 }
 
 async function storefrontGraphql(query, variables = {}) {
@@ -458,16 +570,25 @@ async function fetchAllAdminProducts() {
   let guard = 0;
 
   while (hasMore && guard < 200) {
-    const payload = await adminGraphql(ADMIN_PRODUCTS_PAGE_QUERY, {
-      first: 50,
-      after,
-    });
+    const payload = await adminGraphql(
+      ADMIN_PRODUCTS_PAGE_QUERY,
+      {
+        first: 50,
+        after,
+      },
+      {
+        interPageDelayMs: guard > 0 ? INTER_PAGE_DELAY_MS : 0,
+        requestedQueryCost: 50,
+      }
+    );
     const connection = payload?.data?.products;
     const edges = connection?.edges || [];
     products.push(...edges.map((edge) => edge.node).filter(Boolean));
     after = connection?.pageInfo?.endCursor || null;
     hasMore = Boolean(connection?.pageInfo?.hasNextPage && after);
     guard += 1;
+
+    console.log(`[NOOD sync] page synced products=${products.length}`);
   }
 
   return products;
@@ -485,16 +606,25 @@ async function fetchAllAdminCollections() {
   let guard = 0;
 
   while (hasMore && guard < 100) {
-    const payload = await adminGraphql(ADMIN_COLLECTIONS_PAGE_QUERY, {
-      first: 50,
-      after,
-    });
+    const payload = await adminGraphql(
+      ADMIN_COLLECTIONS_PAGE_QUERY,
+      {
+        first: 50,
+        after,
+      },
+      {
+        interPageDelayMs: guard > 0 ? INTER_PAGE_DELAY_MS : 0,
+        requestedQueryCost: 50,
+      }
+    );
     const connection = payload?.data?.collections;
     const edges = connection?.edges || [];
     collections.push(...edges.map((edge) => edge.node).filter(Boolean));
     after = connection?.pageInfo?.endCursor || null;
     hasMore = Boolean(connection?.pageInfo?.hasNextPage && after);
     guard += 1;
+
+    console.log(`[NOOD sync] page synced collections=${collections.length}`);
   }
 
   return collections;

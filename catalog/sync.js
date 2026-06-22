@@ -74,17 +74,7 @@ async function syncProductByAdminId(cache, adminProductId) {
 
 const { clearMixedFeedCache } = require('./feed-mix');
 
-async function syncAllProducts(cache, options = {}) {
-  const startedAt = Date.now();
-  const source = 'shopify';
-  console.log('[NOOD catalog] full product sync started');
-
-  const config = getShopifyConfig();
-  const [adminProducts, adminCollections] = await Promise.all([
-    fetchAllAdminProducts(),
-    fetchAllAdminCollections(),
-  ]);
-
+function buildSyncedCatalog(adminProducts, adminCollections, config) {
   const activeProducts = adminProducts.filter(
     (product) => safeString(product?.status).toUpperCase() !== 'ARCHIVED'
   );
@@ -96,37 +86,102 @@ async function syncAllProducts(cache, options = {}) {
   const collections = adminCollections.map(normalizeCollection);
 
   for (const collection of collections) {
-    const resolvedHandles = collection.productHandles.filter((handle) =>
+    collection.productHandles = collection.productHandles.filter((handle) =>
       products.some((product) => product.handle === handle)
     );
-    collection.productHandles = resolvedHandles;
   }
 
-  const menus = options.syncMenus === false ? {} : await syncMenus(cache);
+  return { products, collections };
+}
 
-  const meta = await cache.replaceAll({
+async function persistPartialCatalog(cache, adminProducts, adminCollections, config, startedAt) {
+  const { products, collections } = buildSyncedCatalog(adminProducts, adminCollections, config);
+
+  if (!products.length && !collections.length) {
+    return null;
+  }
+
+  return cache.replaceAll({
     products,
     collections,
-    menus,
+    menus: {},
     meta: {
       lastSyncAt: new Date().toISOString(),
       productCount: products.length,
       collectionCount: collections.length,
       syncDurationMs: Date.now() - startedAt,
-      source,
+      source: 'shopify',
+      syncInProgress: true,
     },
   });
+}
 
-  clearMixedFeedCache();
+async function syncAllProducts(cache, options = {}) {
+  const startedAt = Date.now();
+  const source = 'shopify';
+  const config = getShopifyConfig();
+  let adminProducts = [];
+  let adminCollections = [];
 
-  console.log('[NOOD catalog] full product sync finished', {
-    source,
-    productCount: meta.productCount,
-    collectionCount: meta.collectionCount,
-    durationMs: Date.now() - startedAt,
-  });
+  console.log('[NOOD catalog] full product sync started');
 
-  return meta;
+  try {
+    adminProducts = await fetchAllAdminProducts();
+    await persistPartialCatalog(cache, adminProducts, [], config, startedAt);
+
+    adminCollections = await fetchAllAdminCollections();
+
+    const { products, collections } = buildSyncedCatalog(
+      adminProducts,
+      adminCollections,
+      config
+    );
+
+    const menus = options.syncMenus === false ? {} : await syncMenus(cache);
+
+    const meta = await cache.replaceAll({
+      products,
+      collections,
+      menus,
+      meta: {
+        lastSyncAt: new Date().toISOString(),
+        productCount: products.length,
+        collectionCount: collections.length,
+        syncDurationMs: Date.now() - startedAt,
+        source,
+        syncInProgress: false,
+      },
+    });
+
+    clearMixedFeedCache();
+
+    console.log(
+      `[NOOD sync] completed productCount=${meta.productCount} collectionCount=${meta.collectionCount}`
+    );
+
+    return meta;
+  } catch (error) {
+    try {
+      const partialMeta = await persistPartialCatalog(
+        cache,
+        adminProducts,
+        adminCollections,
+        config,
+        startedAt
+      );
+      if (partialMeta) {
+        console.warn('[NOOD sync] saved partial catalog progress before failure', {
+          productCount: partialMeta.productCount,
+          collectionCount: partialMeta.collectionCount,
+          error: error.message,
+        });
+      }
+    } catch (partialError) {
+      console.warn('[NOOD sync] failed to save partial catalog progress:', partialError.message);
+    }
+
+    throw error;
+  }
 }
 
 async function ensureCatalogWarm(cache) {
