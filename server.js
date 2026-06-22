@@ -12,7 +12,8 @@ const {
   createPayPalOrder,
   capturePayPalOrder,
 } = require('./paypal');
-const { mountCatalog, getCatalogReadiness } = require('./catalog');
+const { mountCatalog, getCatalogReadiness, getCatalogCache } = require('./catalog');
+const { mountCatalogSyncRoutes } = require('./catalog/routes');
 const app = express();
 const storage = createStorage();
 const pendingOrders = storage.pendingOrders.items;
@@ -2837,20 +2838,42 @@ async function createShopifyOrder({
   return result.order;
 }
 
-mountCatalog(app, { requireAdminApiKey }).catch((error) => {
-  console.error('[NOOD catalog] failed to mount catalog routes:', error.message);
-});
+async function startServer() {
+  let cache = null;
 
-app.listen(PORT, '0.0.0.0', () => {
-  const localUrl = `http://localhost:${PORT}`;
-  const loopbackUrl = `http://127.0.0.1:${PORT}`;
-  const networkUrl = `http://${LOCAL_IP}:${PORT}`;
+  try {
+    cache = await mountCatalog(app, { requireAdminApiKey });
+  } catch (error) {
+    console.error('[NOOD catalog] failed to mount catalog routes:', error.message);
+    try {
+      cache = await getCatalogCache();
+    } catch (cacheError) {
+      console.error('[NOOD catalog] failed to initialize cache:', cacheError.message);
+    }
+  }
 
-  console.log('[NOOD backend] listening on 0.0.0.0:' + PORT);
-  console.log('[NOOD backend] Local:    ' + localUrl);
-  console.log('[NOOD backend] Loopback: ' + loopbackUrl);
-  console.log('[NOOD backend] Network:  ' + networkUrl);
-  console.log('[NOOD backend] Base URL: ' + BACKEND_BASE_URL);
+  if (cache) {
+    mountCatalogSyncRoutes(app, { cache, requireAdminApiKey });
+  } else {
+    console.error('[NOOD catalog] sync routes not mounted because cache is unavailable');
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    const localUrl = `http://localhost:${PORT}`;
+    const loopbackUrl = `http://127.0.0.1:${PORT}`;
+    const networkUrl = `http://${LOCAL_IP}:${PORT}`;
+
+    console.log('[NOOD backend] listening on 0.0.0.0:' + PORT);
+    console.log('[NOOD backend] Local:    ' + localUrl);
+    console.log('[NOOD backend] Loopback: ' + loopbackUrl);
+    console.log('[NOOD backend] Network:  ' + networkUrl);
+    console.log('[NOOD backend] Base URL: ' + BACKEND_BASE_URL);
+  });
+}
+
+startServer().catch((error) => {
+  console.error('[NOOD backend] failed to start:', error.message);
+  process.exit(1);
 });
 
 

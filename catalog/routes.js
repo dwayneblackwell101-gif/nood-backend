@@ -353,7 +353,11 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
     );
   });
 
-  router.post('/sync/shopify/products', requireAdminApiKey, async (req, res) => {
+  return router;
+}
+
+function createCatalogSyncHandler(cache) {
+  return async function handleCatalogSync(req, res) {
     try {
       const meta = await syncAllProducts(cache, { syncMenus: true });
       return res.json({
@@ -370,11 +374,21 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
         message: error.message || 'Catalog sync failed.',
       });
     }
-  });
+  };
+}
 
-  return router;
+function mountCatalogSyncRoutes(app, { cache, requireAdminApiKey }) {
+  const handler = createCatalogSyncHandler(cache);
+
+  app.post('/api/sync/shopify/products', requireAdminApiKey, handler);
+  console.log('[NOOD routes] mounted POST /api/sync/shopify/products');
+
+  app.post('/api/catalog/sync/shopify/products', requireAdminApiKey, handler);
+  console.log('[NOOD routes] mounted POST /api/catalog/sync/shopify/products');
 }
 
 module.exports = {
   createCatalogRouter,
+  createCatalogSyncHandler,
+  mountCatalogSyncRoutes,
 };

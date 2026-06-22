@@ -132,6 +132,16 @@ async function syncAllProducts(cache, options = {}) {
 async function ensureCatalogWarm(cache) {
   const meta = await cache.getMeta();
   const products = await cache.getAllProducts();
+
+  if (String(process.env.NODE_ENV || '').trim() === 'production') {
+    console.log('[NOOD catalog] production startup warm check skipped auto-sync', {
+      cacheDriver: cache.driver(),
+      productCount: meta.productCount || products.length,
+      collectionCount: meta.collectionCount || 0,
+    });
+    return { warmed: false, meta, source: 'cache', skipped: true };
+  }
+
   if (products.length > 0) {
     return { warmed: false, meta, source: 'cache' };
   }
