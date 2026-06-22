@@ -2,10 +2,44 @@ const { JsonCatalogCache } = require('./json-cache');
 
 const KEY_PREFIX = 'nood:catalog:';
 const META_KEY = `${KEY_PREFIX}meta`;
-const PRODUCTS_KEY = `${KEY_PREFIX}products`;
-const PRODUCTS_BY_ID_KEY = `${KEY_PREFIX}productsById`;
-const COLLECTIONS_KEY = `${KEY_PREFIX}collections`;
-const MENUS_KEY = `${KEY_PREFIX}menus`;
+const PRODUCTS_HASH_KEY = `${KEY_PREFIX}products:h`;
+const PRODUCTS_BY_ID_HASH_KEY = `${KEY_PREFIX}productsById:h`;
+const COLLECTIONS_HASH_KEY = `${KEY_PREFIX}collections:h`;
+const MENUS_HASH_KEY = `${KEY_PREFIX}menus:h`;
+const SYNC_STATE_KEY = `${KEY_PREFIX}syncState`;
+
+const LEGACY_PRODUCTS_KEY = `${KEY_PREFIX}products`;
+const LEGACY_PRODUCTS_BY_ID_KEY = `${KEY_PREFIX}productsById`;
+const LEGACY_COLLECTIONS_KEY = `${KEY_PREFIX}collections`;
+const LEGACY_MENUS_KEY = `${KEY_PREFIX}menus`;
+
+function defaultSyncState() {
+  return {
+    status: 'idle',
+    phase: null,
+    productCursor: null,
+    collectionCursor: null,
+    syncedProductCount: 0,
+    syncedCollectionCount: 0,
+    startedAt: null,
+    updatedAt: null,
+    lastError: null,
+    completedAt: null,
+  };
+}
+
+function parseHashValues(rawMap = {}) {
+  const items = [];
+  for (const value of Object.values(rawMap)) {
+    if (!value) continue;
+    try {
+      items.push(JSON.parse(value));
+    } catch {
+      // skip invalid entries
+    }
+  }
+  return items;
+}
 
 async function createRedisCache(redisUrl) {
   let Redis;
@@ -17,8 +51,10 @@ async function createRedisCache(redisUrl) {
 
   const useTls = redisUrl.startsWith('rediss://');
   const client = new Redis(redisUrl, {
-    maxRetriesPerRequest: 2,
+    maxRetriesPerRequest: 3,
     lazyConnect: true,
+    connectTimeout: 20000,
+    commandTimeout: 120000,
     tls: useTls ? { rejectUnauthorized: false } : undefined,
   });
 
@@ -27,6 +63,7 @@ async function createRedisCache(redisUrl) {
   class RedisCatalogCache {
     constructor() {
       this.client = client;
+      this._legacyMigrated = false;
     }
 
     async getJson(key, fallback) {
@@ -43,6 +80,60 @@ async function createRedisCache(redisUrl) {
       await this.client.set(key, JSON.stringify(value));
     }
 
+    async ensureLegacyMigrated() {
+      if (this._legacyMigrated) {
+        return;
+      }
+
+      const [legacyProducts, legacyById, legacyCollections, legacyMenus] = await Promise.all([
+        this.client.get(LEGACY_PRODUCTS_KEY),
+        this.client.get(LEGACY_PRODUCTS_BY_ID_KEY),
+        this.client.get(LEGACY_COLLECTIONS_KEY),
+        this.client.get(LEGACY_MENUS_KEY),
+      ]);
+
+      if (legacyProducts) {
+        const products = JSON.parse(legacyProducts);
+        const pipeline = this.client.multi();
+        for (const product of Object.values(products || {})) {
+          if (!product?.handle) continue;
+          pipeline.hset(PRODUCTS_HASH_KEY, product.handle, JSON.stringify(product));
+          if (product.id) {
+            pipeline.hset(PRODUCTS_BY_ID_HASH_KEY, String(product.id), product.handle);
+          }
+        }
+        await pipeline.exec();
+        await this.client.del(LEGACY_PRODUCTS_KEY);
+      }
+
+      if (legacyById) {
+        await this.client.del(LEGACY_PRODUCTS_BY_ID_KEY);
+      }
+
+      if (legacyCollections) {
+        const collections = JSON.parse(legacyCollections);
+        const pipeline = this.client.multi();
+        for (const collection of Object.values(collections || {})) {
+          if (!collection?.handle) continue;
+          pipeline.hset(COLLECTIONS_HASH_KEY, collection.handle, JSON.stringify(collection));
+        }
+        await pipeline.exec();
+        await this.client.del(LEGACY_COLLECTIONS_KEY);
+      }
+
+      if (legacyMenus) {
+        const menus = JSON.parse(legacyMenus);
+        const pipeline = this.client.multi();
+        for (const [handle, menu] of Object.entries(menus || {})) {
+          pipeline.hset(MENUS_HASH_KEY, handle, JSON.stringify(menu));
+        }
+        await pipeline.exec();
+        await this.client.del(LEGACY_MENUS_KEY);
+      }
+
+      this._legacyMigrated = true;
+    }
+
     async getMeta() {
       return this.getJson(META_KEY, { version: 1, lastSyncAt: null, productCount: 0, collectionCount: 0 });
     }
@@ -50,118 +141,166 @@ async function createRedisCache(redisUrl) {
     async setMeta(meta) {
       const current = await this.getMeta();
       await this.setJson(META_KEY, { ...current, ...meta });
+      return this.getMeta();
     }
 
     async getProduct(handle) {
-      const products = await this.getJson(PRODUCTS_KEY, {});
-      return products[String(handle || '').trim()] || null;
+      await this.ensureLegacyMigrated();
+      const raw = await this.client.hget(PRODUCTS_HASH_KEY, String(handle || '').trim());
+      return raw ? JSON.parse(raw) : null;
     }
 
     async getProductById(id) {
-      const map = await this.getJson(PRODUCTS_BY_ID_KEY, {});
-      const handle = map[String(id || '').trim()];
+      await this.ensureLegacyMigrated();
+      const handle = await this.client.hget(PRODUCTS_BY_ID_HASH_KEY, String(id || '').trim());
       return handle ? this.getProduct(handle) : null;
     }
 
-    async setProduct(handle, product) {
-      const key = String(handle || '').trim();
-      if (!key) return null;
-      const products = await this.getJson(PRODUCTS_KEY, {});
-      const byId = await this.getJson(PRODUCTS_BY_ID_KEY, {});
-      products[key] = product;
-      if (product?.id) {
-        byId[String(product.id)] = key;
+    async mergeProducts(incomingProducts = []) {
+      await this.ensureLegacyMigrated();
+      if (!incomingProducts.length) {
+        return 0;
       }
-      await this.setJson(PRODUCTS_KEY, products);
-      await this.setJson(PRODUCTS_BY_ID_KEY, byId);
-      return product;
+
+      const pipeline = this.client.multi();
+      let saved = 0;
+
+      for (const product of incomingProducts) {
+        const key = String(product?.handle || '').trim();
+        if (!key) continue;
+        pipeline.hset(PRODUCTS_HASH_KEY, key, JSON.stringify(product));
+        if (product?.id) {
+          pipeline.hset(PRODUCTS_BY_ID_HASH_KEY, String(product.id), key);
+        }
+        saved += 1;
+      }
+
+      await pipeline.exec();
+      return saved;
+    }
+
+    async mergeCollections(incomingCollections = []) {
+      await this.ensureLegacyMigrated();
+      if (!incomingCollections.length) {
+        return 0;
+      }
+
+      const pipeline = this.client.multi();
+      let saved = 0;
+
+      for (const collection of incomingCollections) {
+        const key = String(collection?.handle || '').trim();
+        if (!key) continue;
+        pipeline.hset(COLLECTIONS_HASH_KEY, key, JSON.stringify(collection));
+        saved += 1;
+      }
+
+      await pipeline.exec();
+      return saved;
+    }
+
+    async setProduct(handle, product) {
+      return this.mergeProducts([product]);
     }
 
     async deleteProduct(handle) {
+      await this.ensureLegacyMigrated();
       const key = String(handle || '').trim();
-      const products = await this.getJson(PRODUCTS_KEY, {});
-      const product = products[key];
-      if (!product) return false;
-      delete products[key];
-      const byId = await this.getJson(PRODUCTS_BY_ID_KEY, {});
-      if (product.id) {
-        delete byId[String(product.id)];
+      const raw = await this.client.hget(PRODUCTS_HASH_KEY, key);
+      if (!raw) return false;
+
+      const product = JSON.parse(raw);
+      const pipeline = this.client.multi();
+      pipeline.hdel(PRODUCTS_HASH_KEY, key);
+      if (product?.id) {
+        pipeline.hdel(PRODUCTS_BY_ID_HASH_KEY, String(product.id));
       }
-      await this.setJson(PRODUCTS_KEY, products);
-      await this.setJson(PRODUCTS_BY_ID_KEY, byId);
+      await pipeline.exec();
       return true;
     }
 
+    async clearProducts() {
+      await this.ensureLegacyMigrated();
+      await this.client.del(
+        PRODUCTS_HASH_KEY,
+        PRODUCTS_BY_ID_HASH_KEY,
+        LEGACY_PRODUCTS_KEY,
+        LEGACY_PRODUCTS_BY_ID_KEY
+      );
+    }
+
+    async getAllProductHandles() {
+      await this.ensureLegacyMigrated();
+      return this.client.hkeys(PRODUCTS_HASH_KEY);
+    }
+
     async getAllProducts() {
-      const products = await this.getJson(PRODUCTS_KEY, {});
-      return Object.values(products);
+      await this.ensureLegacyMigrated();
+      const raw = await this.client.hgetall(PRODUCTS_HASH_KEY);
+      return parseHashValues(raw);
     }
 
     async getCollection(handle) {
-      const collections = await this.getJson(COLLECTIONS_KEY, {});
-      return collections[String(handle || '').trim()] || null;
+      await this.ensureLegacyMigrated();
+      const raw = await this.client.hget(COLLECTIONS_HASH_KEY, String(handle || '').trim());
+      return raw ? JSON.parse(raw) : null;
     }
 
     async setCollection(handle, collection) {
-      const key = String(handle || '').trim();
-      if (!key) return null;
-      const collections = await this.getJson(COLLECTIONS_KEY, {});
-      collections[key] = collection;
-      await this.setJson(COLLECTIONS_KEY, collections);
-      return collection;
+      return this.mergeCollections([collection]);
     }
 
     async getAllCollections() {
-      const collections = await this.getJson(COLLECTIONS_KEY, {});
-      return Object.values(collections);
+      await this.ensureLegacyMigrated();
+      const raw = await this.client.hgetall(COLLECTIONS_HASH_KEY);
+      return parseHashValues(raw);
     }
 
     async setMenu(handle, menu) {
+      await this.ensureLegacyMigrated();
       const key = String(handle || '').trim();
       if (!key) return null;
-      const menus = await this.getJson(MENUS_KEY, {});
-      menus[key] = menu;
-      await this.setJson(MENUS_KEY, menus);
+      await this.client.hset(MENUS_HASH_KEY, key, JSON.stringify(menu));
       return menu;
     }
 
     async getMenu(handle) {
-      const menus = await this.getJson(MENUS_KEY, {});
-      return menus[String(handle || '').trim()] || null;
+      await this.ensureLegacyMigrated();
+      const raw = await this.client.hget(MENUS_HASH_KEY, String(handle || '').trim());
+      return raw ? JSON.parse(raw) : null;
     }
 
     async replaceAll({ products, collections, menus, meta }) {
-      const nextProducts = {};
-      const nextById = {};
-      const nextCollections = {};
-      const nextMenus = {};
+      await this.ensureLegacyMigrated();
+      await this.client.del(
+        PRODUCTS_HASH_KEY,
+        PRODUCTS_BY_ID_HASH_KEY,
+        COLLECTIONS_HASH_KEY,
+        MENUS_HASH_KEY,
+        LEGACY_PRODUCTS_KEY,
+        LEGACY_PRODUCTS_BY_ID_KEY,
+        LEGACY_COLLECTIONS_KEY,
+        LEGACY_MENUS_KEY
+      );
 
-      for (const product of products || []) {
-        if (!product?.handle) continue;
-        nextProducts[product.handle] = product;
-        if (product.id) {
-          nextById[String(product.id)] = product.handle;
+      const productList = Array.isArray(products) ? products : [];
+      const collectionList = Array.isArray(collections) ? collections : [];
+
+      for (let index = 0; index < productList.length; index += 50) {
+        await this.mergeProducts(productList.slice(index, index + 50));
+      }
+
+      for (let index = 0; index < collectionList.length; index += 50) {
+        await this.mergeCollections(collectionList.slice(index, index + 50));
+      }
+
+      if (menus && typeof menus === 'object') {
+        for (const [menuHandle, menu] of Object.entries(menus)) {
+          await this.setMenu(menuHandle, menu);
         }
       }
 
-      for (const collection of collections || []) {
-        if (!collection?.handle) continue;
-        nextCollections[collection.handle] = collection;
-      }
-
-      for (const [menuHandle, menu] of Object.entries(menus || {})) {
-        nextMenus[menuHandle] = menu;
-      }
-
-      await Promise.all([
-        this.setJson(PRODUCTS_KEY, nextProducts),
-        this.setJson(PRODUCTS_BY_ID_KEY, nextById),
-        this.setJson(COLLECTIONS_KEY, nextCollections),
-        this.setJson(MENUS_KEY, nextMenus),
-        this.setMeta(meta || {}),
-      ]);
-
-      return this.getMeta();
+      return this.setMeta(meta || {});
     }
 
     async flush() {
@@ -174,6 +313,20 @@ async function createRedisCache(redisUrl) {
 
     async ping() {
       return this.client.ping();
+    }
+
+    async getSyncState() {
+      return this.getJson(SYNC_STATE_KEY, defaultSyncState());
+    }
+
+    async setSyncState(state) {
+      const current = await this.getSyncState();
+      await this.setJson(SYNC_STATE_KEY, {
+        ...current,
+        ...state,
+        updatedAt: new Date().toISOString(),
+      });
+      return this.getSyncState();
     }
   }
 
