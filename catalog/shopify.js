@@ -85,7 +85,7 @@ async function adminGraphql(query, variables = {}, options = {}) {
 
     const preWaitMs = getLowBucketWaitMs(lastThrottleStatus, options.requestedQueryCost || 50);
     if (preWaitMs > 0) {
-      console.log(`[NOOD sync] throttled, waiting ${preWaitMs} ms before retry`);
+      console.log(`[NOOD sync] throttled waiting ${preWaitMs} ms`);
       await sleep(preWaitMs);
     }
 
@@ -111,7 +111,7 @@ async function adminGraphql(query, variables = {}, options = {}) {
       if (retryable && attempt < maxAttempts) {
         throttleAttempt += 1;
         const waitMs = getThrottleWaitMs(lastThrottleStatus, options.requestedQueryCost || 50, throttleAttempt);
-        console.log(`[NOOD sync] throttled, waiting ${waitMs} ms before retry`);
+        console.log(`[NOOD sync] throttled waiting ${waitMs} ms`);
         await sleep(waitMs);
         continue;
       }
@@ -130,7 +130,7 @@ async function adminGraphql(query, variables = {}, options = {}) {
     if (isThrottledGraphqlPayload(payload)) {
       throttleAttempt += 1;
       const waitMs = getThrottleWaitMs(throttleStatus || lastThrottleStatus, requestedQueryCost, throttleAttempt);
-      console.log(`[NOOD sync] throttled, waiting ${waitMs} ms before retry`);
+      console.log(`[NOOD sync] throttled waiting ${waitMs} ms`);
       await sleep(waitMs);
       continue;
     }
@@ -563,6 +563,48 @@ const STOREFRONT_RECOMMENDATIONS_QUERY = `
   }
 `;
 
+async function fetchAdminProductsPage(after = null, options = {}) {
+  const payload = await adminGraphql(
+    ADMIN_PRODUCTS_PAGE_QUERY,
+    {
+      first: 50,
+      after,
+    },
+    {
+      interPageDelayMs: options.interPageDelayMs || 0,
+      requestedQueryCost: 50,
+    }
+  );
+  const connection = payload?.data?.products;
+  const edges = connection?.edges || [];
+
+  return {
+    items: edges.map((edge) => edge.node).filter(Boolean),
+    pageInfo: connection?.pageInfo || { hasNextPage: false, endCursor: null },
+  };
+}
+
+async function fetchAdminCollectionsPage(after = null, options = {}) {
+  const payload = await adminGraphql(
+    ADMIN_COLLECTIONS_PAGE_QUERY,
+    {
+      first: 50,
+      after,
+    },
+    {
+      interPageDelayMs: options.interPageDelayMs || 0,
+      requestedQueryCost: 50,
+    }
+  );
+  const connection = payload?.data?.collections;
+  const edges = connection?.edges || [];
+
+  return {
+    items: edges.map((edge) => edge.node).filter(Boolean),
+    pageInfo: connection?.pageInfo || { hasNextPage: false, endCursor: null },
+  };
+}
+
 async function fetchAllAdminProducts() {
   const products = [];
   let after = null;
@@ -634,6 +676,8 @@ module.exports = {
   getShopifyConfig,
   adminGraphql,
   storefrontGraphql,
+  fetchAdminProductsPage,
+  fetchAdminCollectionsPage,
   fetchAllAdminProducts,
   fetchAdminProductById,
   fetchAllAdminCollections,
@@ -642,3 +686,6 @@ module.exports = {
   STOREFRONT_PRODUCT_DETAIL_QUERY,
   STOREFRONT_RECOMMENDATIONS_QUERY,
 };
+
+module.exports.fetchAdminProductsPage = fetchAdminProductsPage;
+module.exports.fetchAdminCollectionsPage = fetchAdminCollectionsPage;

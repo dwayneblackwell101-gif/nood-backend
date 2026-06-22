@@ -1,11 +1,62 @@
+const shopify = require('./shopify');
+
+const MISSING_SHOPIFY_PRODUCTS_PAGE_FETCHER =
+  'catalog/shopify.js must export fetchAdminProductsPage (Admin GraphQL products page fetcher).';
+const MISSING_SHOPIFY_COLLECTIONS_PAGE_FETCHER =
+  'catalog/shopify.js must export fetchAdminCollectionsPage (Admin GraphQL collections page fetcher).';
+
+function listShopifyFunctionExports() {
+  return Object.keys(shopify)
+    .filter((key) => typeof shopify[key] === 'function')
+    .sort()
+    .join(', ');
+}
+
+function buildMissingShopifyFetcherError(exportName, message) {
+  const error = new Error(
+    `${message} Missing export "${exportName}". Available functions: ${listShopifyFunctionExports() || 'none'}.`
+  );
+  error.code = 'MISSING_SHOPIFY_SYNC_FUNCTION';
+  return error;
+}
+
+const rawFetchAdminProductsPage = shopify.fetchAdminProductsPage;
+const rawFetchAdminCollectionsPage = shopify.fetchAdminCollectionsPage;
+const fetchAdminProductsPageAvailable = typeof rawFetchAdminProductsPage === 'function';
+const fetchAdminCollectionsPageAvailable = typeof rawFetchAdminCollectionsPage === 'function';
+
+console.log(
+  `[NOOD sync] fetchAdminProductsPage available=${fetchAdminProductsPageAvailable}`
+);
+
+async function fetchAdminProductsPage(after = null, options = {}) {
+  if (!fetchAdminProductsPageAvailable) {
+    throw buildMissingShopifyFetcherError(
+      'fetchAdminProductsPage',
+      MISSING_SHOPIFY_PRODUCTS_PAGE_FETCHER
+    );
+  }
+
+  return rawFetchAdminProductsPage(after, options);
+}
+
+async function fetchAdminCollectionsPage(after = null, options = {}) {
+  if (!fetchAdminCollectionsPageAvailable) {
+    throw buildMissingShopifyFetcherError(
+      'fetchAdminCollectionsPage',
+      MISSING_SHOPIFY_COLLECTIONS_PAGE_FETCHER
+    );
+  }
+
+  return rawFetchAdminCollectionsPage(after, options);
+}
+
 const {
-  fetchAdminProductsPage,
-  fetchAdminCollectionsPage,
   fetchAdminProductById,
   storefrontGraphql,
   getShopifyConfig,
   STOREFRONT_MENU_QUERY,
-} = require('./shopify');
+} = shopify;
 const { transformAdminProduct, safeString } = require('./transform');
 const { clearMixedFeedCache } = require('./feed-mix');
 
@@ -325,6 +376,15 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         `[NOOD sync] page saved products=${meta.productCount || totalSaved} cursor=${after || 'end'}`
       );
     } catch (error) {
+      const nonRetryable =
+        error?.code === 'MISSING_SHOPIFY_SYNC_FUNCTION' ||
+        /is not a function/i.test(safeString(error?.message));
+
+      if (nonRetryable) {
+        console.error(`[NOOD sync] ${safeString(error.message, 'sync dependency missing')}`);
+        throw error;
+      }
+
       pageAttempts += 1;
       const waitMs = Math.min(2000 * Math.pow(2, pageAttempts - 1), 30000);
       console.log(`[NOOD sync] throttled waiting ${waitMs} ms`);
@@ -401,6 +461,15 @@ async function syncCollectionsPhase(cache, state, options = {}) {
         `[NOOD sync] page saved collections=${meta.collectionCount || totalSaved} cursor=${after || 'end'}`
       );
     } catch (error) {
+      const nonRetryable =
+        error?.code === 'MISSING_SHOPIFY_SYNC_FUNCTION' ||
+        /is not a function/i.test(safeString(error?.message));
+
+      if (nonRetryable) {
+        console.error(`[NOOD sync] ${safeString(error.message, 'sync dependency missing')}`);
+        throw error;
+      }
+
       pageAttempts += 1;
       const waitMs = Math.min(2000 * Math.pow(2, pageAttempts - 1), 30000);
       console.log(`[NOOD sync] throttled waiting ${waitMs} ms`);
