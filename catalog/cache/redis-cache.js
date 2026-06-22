@@ -168,6 +168,13 @@ async function createRedisCache(redisUrl) {
       return next;
     }
 
+    async hasProduct(handle) {
+      await this.ensureLegacyMigrated();
+      const key = String(handle || '').trim();
+      if (!key) return false;
+      return Boolean(await this.client.hexists(PRODUCTS_HASH_KEY, key));
+    }
+
     async getProduct(handle) {
       await this.ensureLegacyMigrated();
       const raw = await this.client.hget(PRODUCTS_HASH_KEY, String(handle || '').trim());

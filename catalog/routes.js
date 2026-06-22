@@ -372,6 +372,14 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
   return router;
 }
 
+function parseSyncInt(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
 function createCatalogSyncHandler(cache) {
   return async function handleCatalogSync(req, res) {
     try {
@@ -379,10 +387,14 @@ function createCatalogSyncHandler(cache) {
         req.query.restart === '1' ||
         req.query.restart === 'true' ||
         req.body?.restart === true;
+      const pages = parseSyncInt(req.query.pages ?? req.body?.pages, 10);
+      const pageSize = parseSyncInt(req.query.pageSize ?? req.body?.pageSize, 25);
 
       const result = await startBackgroundCatalogSync(cache, {
         syncMenus: true,
         restart,
+        pages,
+        pageSize,
       });
 
       return res.status(202).json({
@@ -391,10 +403,13 @@ function createCatalogSyncHandler(cache) {
         status: result.status,
         resume: Boolean(result.resume),
         restart: Boolean(result.restart),
+        pages: result.pages ?? pages,
+        pageSize: result.pageSize ?? pageSize,
         message:
-          result.status === 'already_running'
-            ? 'Catalog sync is already running.'
-            : 'Catalog sync started in background.',
+          result.message ||
+          (result.status === 'already_running'
+            ? 'Catalog sync chunk is already running.'
+            : 'Catalog sync chunk started in background.'),
       });
     } catch (error) {
       console.error('[NOOD catalog] manual sync failed:', error.message);
@@ -418,8 +433,11 @@ function createCatalogSyncStatusHandler(cache) {
         collectionCount: status.collectionCount,
         cursor: status.cursor,
         lastError: status.lastError,
+        message: status.message,
         updatedAt: status.updatedAt,
         phase: status.phase,
+        chunkPages: status.chunkPages,
+        chunkPageSize: status.chunkPageSize,
         cacheDriver: status.cacheDriver,
       });
     } catch (error) {

@@ -70,10 +70,30 @@ const DEFAULT_MENU_HANDLES = [
 
 const SYNC_STALE_MS = 5 * 60 * 1000;
 const INTER_PAGE_DELAY_MS = 400;
-const MAX_PRODUCT_PAGES = 250;
-const MAX_COLLECTION_PAGES = 100;
+const MAX_CHUNK_PAGES = 50;
+const MAX_PAGE_SIZE = 50;
+const CHUNK_COMPLETE_MESSAGE = 'chunk complete, resume required';
 
 let activeSyncPromise = null;
+
+function isProductionEnv() {
+  return String(process.env.NODE_ENV || '').trim() === 'production';
+}
+
+function resolveSyncChunkOptions(options = {}) {
+  const defaultPages = isProductionEnv() ? 10 : 10;
+  const defaultPageSize = isProductionEnv() ? 25 : 25;
+  const pages = Math.min(
+    MAX_CHUNK_PAGES,
+    Math.max(1, Number(options.pages ?? options.maxPages) || defaultPages)
+  );
+  const pageSize = Math.min(
+    MAX_PAGE_SIZE,
+    Math.max(1, Number(options.pageSize) || defaultPageSize)
+  );
+
+  return { pages, pageSize };
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -90,8 +110,35 @@ function defaultSyncState() {
     startedAt: null,
     updatedAt: null,
     lastError: null,
+    message: null,
+    chunkPages: null,
+    chunkPageSize: null,
     completedAt: null,
   };
+}
+
+function resolveSyncPhase(state, resume) {
+  if (!resume) {
+    return 'products';
+  }
+
+  if (state.phase === 'completed') {
+    return 'completed';
+  }
+
+  if (state.phase === 'collections' || state.phase === 'menus') {
+    return 'collections';
+  }
+
+  if (state.productCursor) {
+    return 'products';
+  }
+
+  if (Number(state.syncedProductCount || 0) > 0 && !state.collectionCursor) {
+    return 'collections';
+  }
+
+  return state.phase || 'products';
 }
 
 function normalizeCollection(adminCollection) {
@@ -189,6 +236,9 @@ async function getCatalogSyncStatus(cache) {
     updatedAt: state.updatedAt || null,
     completedAt: state.completedAt || null,
     lastError: state.lastError || null,
+    message: state.message || null,
+    chunkPages: Number(state.chunkPages || 0) || null,
+    chunkPageSize: Number(state.chunkPageSize || 0) || null,
     cacheDriver: cache.driver(),
     stale: isSyncStale(state),
   };
@@ -230,6 +280,7 @@ async function prepareFreshSync(cache) {
 
 async function saveProductPage(cache, adminProducts, config) {
   const transformed = [];
+  let saved = 0;
 
   for (const adminProduct of adminProducts) {
     const product = transformAdminProduct(adminProduct, config.currencyCode);
@@ -245,34 +296,49 @@ async function saveProductPage(cache, adminProducts, config) {
     transformed.push(product);
   }
 
-  if (!transformed.length) {
-    return 0;
+  if (transformed.length) {
+    if (typeof cache.mergeProducts === 'function') {
+      saved = await cache.mergeProducts(transformed);
+    } else {
+      for (const product of transformed) {
+        await cache.setProduct(product.handle, product);
+        saved += 1;
+      }
+    }
   }
 
-  if (typeof cache.mergeProducts === 'function') {
-    return cache.mergeProducts(transformed);
-  }
-
-  let saved = 0;
-  for (const product of transformed) {
-    await cache.setProduct(product.handle, product);
-    saved += 1;
-  }
+  transformed.length = 0;
   return saved;
 }
 
-async function getCachedProductHandles(cache) {
-  if (typeof cache.getAllProductHandles === 'function') {
-    const handles = await cache.getAllProductHandles();
-    return new Set(handles);
+async function productHandleExists(cache, handle) {
+  if (typeof cache.hasProduct === 'function') {
+    return cache.hasProduct(handle);
   }
 
-  const products = await cache.getAllProducts();
-  return new Set(products.map((product) => product.handle));
+  if (typeof cache.getProduct === 'function') {
+    const product = await cache.getProduct(handle);
+    return Boolean(product);
+  }
+
+  return false;
 }
 
-async function saveCollectionPage(cache, adminCollections, productHandles) {
+async function filterHandlesInCatalog(cache, handles = []) {
+  const existing = [];
+
+  for (const handle of handles) {
+    if (await productHandleExists(cache, handle)) {
+      existing.push(handle);
+    }
+  }
+
+  return existing;
+}
+
+async function saveCollectionPage(cache, adminCollections) {
   const normalized = [];
+  let saved = 0;
 
   for (const adminCollection of adminCollections) {
     const collection = normalizeCollection(adminCollection);
@@ -280,45 +346,45 @@ async function saveCollectionPage(cache, adminCollections, productHandles) {
       continue;
     }
 
-    collection.productHandles = collection.productHandles.filter((handle) =>
-      productHandles.has(handle)
+    collection.productHandles = await filterHandlesInCatalog(
+      cache,
+      collection.productHandles
     );
     normalized.push(collection);
   }
 
-  if (!normalized.length) {
-    return 0;
+  if (normalized.length) {
+    if (typeof cache.mergeCollections === 'function') {
+      saved = await cache.mergeCollections(normalized);
+    } else {
+      for (const collection of normalized) {
+        await cache.setCollection(collection.handle, collection);
+        saved += 1;
+      }
+    }
   }
 
-  if (typeof cache.mergeCollections === 'function') {
-    return cache.mergeCollections(normalized);
-  }
-
-  let saved = 0;
-  for (const collection of normalized) {
-    await cache.setCollection(collection.handle, collection);
-    saved += 1;
-  }
+  normalized.length = 0;
   return saved;
 }
 
 async function syncMenus(cache, menuHandles = DEFAULT_MENU_HANDLES) {
-  const menus = {};
+  let saved = 0;
 
   for (const handle of menuHandles) {
     try {
       const payload = await storefrontGraphql(STOREFRONT_MENU_QUERY, { handle });
       const menu = payload?.data?.menu;
       if (menu) {
-        menus[handle] = menu;
         await cache.setMenu(handle, menu);
+        saved += 1;
       }
     } catch (error) {
       console.warn(`[NOOD catalog] menu sync skipped for ${handle}:`, error.message);
     }
   }
 
-  return menus;
+  return saved;
 }
 
 async function syncSingleProduct(cache, adminProduct) {
@@ -344,26 +410,32 @@ async function syncProductByAdminId(cache, adminProductId) {
 }
 
 async function syncProductsPhase(cache, config, state, options = {}) {
+  const maxPages = Math.max(1, Number(options.maxPages) || 10);
+  const pageSize = Math.max(1, Number(options.pageSize) || 25);
   let after =
-    options.resume && state.phase === 'products' && state.productCursor
-      ? state.productCursor
-      : null;
+    options.resume && state.productCursor ? state.productCursor : null;
   let totalSaved = options.resume ? Number(state.syncedProductCount || 0) : 0;
   let hasMore = true;
-  let guard = 0;
+  let pagesProcessed = 0;
   let pageAttempts = 0;
 
-  while (hasMore && guard < MAX_PRODUCT_PAGES) {
+  while (hasMore && pagesProcessed < maxPages) {
+    let pageItems = null;
+    let pageInfo = null;
+
     try {
       const page = await fetchAdminProductsPage(after, {
-        interPageDelayMs: guard > 0 ? INTER_PAGE_DELAY_MS : 0,
+        interPageDelayMs: pagesProcessed > 0 ? INTER_PAGE_DELAY_MS : 0,
+        pageSize,
       });
 
-      const savedThisPage = await saveProductPage(cache, page.items, config);
+      pageItems = page.items;
+      pageInfo = page.pageInfo;
+      const savedThisPage = await saveProductPage(cache, pageItems, config);
       totalSaved += savedThisPage;
-      after = page.pageInfo?.endCursor || null;
-      hasMore = Boolean(page.pageInfo?.hasNextPage && after);
-      guard += 1;
+      after = pageInfo?.endCursor || null;
+      hasMore = Boolean(pageInfo?.hasNextPage && after);
+      pagesProcessed += 1;
       pageAttempts = 0;
 
       const liveProductCount =
@@ -386,13 +458,14 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         productCursor: after,
         syncedProductCount: totalSaved,
         lastError: null,
+        message: null,
+        chunkPages: maxPages,
+        chunkPageSize: pageSize,
         startedAt: state.startedAt || new Date().toISOString(),
       });
 
       await checkpointCache(cache);
-      console.log(
-        `[NOOD sync] page saved products=${productCount} cursor=${after || 'end'}`
-      );
+      console.log(`[NOOD sync] page saved products=${productCount}`);
     } catch (error) {
       const nonRetryable =
         error?.code === 'MISSING_SHOPIFY_SYNC_FUNCTION' ||
@@ -413,6 +486,8 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         productCursor: after,
         syncedProductCount: totalSaved,
         lastError: safeString(error.message, 'sync page failed'),
+        chunkPages: maxPages,
+        chunkPageSize: pageSize,
       });
 
       if (pageAttempts >= 8) {
@@ -420,6 +495,10 @@ async function syncProductsPhase(cache, config, state, options = {}) {
       }
 
       await sleep(waitMs);
+      continue;
+    } finally {
+      pageItems = null;
+      pageInfo = null;
     }
   }
 
@@ -427,34 +506,38 @@ async function syncProductsPhase(cache, config, state, options = {}) {
     totalSaved,
     nextCursor: after,
     completed: !hasMore,
+    paused: hasMore,
+    pagesProcessed,
   };
 }
 
 async function syncCollectionsPhase(cache, state, options = {}) {
+  const maxPages = Math.max(1, Number(options.maxPages) || 10);
+  const pageSize = Math.max(1, Number(options.pageSize) || 25);
   let after =
-    options.resume && state.phase === 'collections' && state.collectionCursor
-      ? state.collectionCursor
-      : null;
-  let totalSaved =
-    options.resume && state.phase === 'collections'
-      ? Number(state.syncedCollectionCount || 0)
-      : 0;
+    options.resume && state.collectionCursor ? state.collectionCursor : null;
+  let totalSaved = options.resume ? Number(state.syncedCollectionCount || 0) : 0;
   let hasMore = true;
-  let guard = 0;
+  let pagesProcessed = 0;
   let pageAttempts = 0;
-  const productHandles = await getCachedProductHandles(cache);
 
-  while (hasMore && guard < MAX_COLLECTION_PAGES) {
+  while (hasMore && pagesProcessed < maxPages) {
+    let pageItems = null;
+    let pageInfo = null;
+
     try {
       const page = await fetchAdminCollectionsPage(after, {
-        interPageDelayMs: guard > 0 ? INTER_PAGE_DELAY_MS : 0,
+        interPageDelayMs: pagesProcessed > 0 ? INTER_PAGE_DELAY_MS : 0,
+        pageSize,
       });
 
-      const savedThisPage = await saveCollectionPage(cache, page.items, productHandles);
+      pageItems = page.items;
+      pageInfo = page.pageInfo;
+      const savedThisPage = await saveCollectionPage(cache, pageItems);
       totalSaved += savedThisPage;
-      after = page.pageInfo?.endCursor || null;
-      hasMore = Boolean(page.pageInfo?.hasNextPage && after);
-      guard += 1;
+      after = pageInfo?.endCursor || null;
+      hasMore = Boolean(pageInfo?.hasNextPage && after);
+      pagesProcessed += 1;
       pageAttempts = 0;
 
       const liveCollectionCount =
@@ -477,12 +560,13 @@ async function syncCollectionsPhase(cache, state, options = {}) {
         collectionCursor: after,
         syncedCollectionCount: totalSaved,
         lastError: null,
+        message: null,
+        chunkPages: maxPages,
+        chunkPageSize: pageSize,
       });
 
       await checkpointCache(cache);
-      console.log(
-        `[NOOD sync] page saved collections=${collectionCount} cursor=${after || 'end'}`
-      );
+      console.log(`[NOOD sync] page saved collections=${collectionCount}`);
     } catch (error) {
       const nonRetryable =
         error?.code === 'MISSING_SHOPIFY_SYNC_FUNCTION' ||
@@ -503,6 +587,8 @@ async function syncCollectionsPhase(cache, state, options = {}) {
         collectionCursor: after,
         syncedCollectionCount: totalSaved,
         lastError: safeString(error.message, 'sync page failed'),
+        chunkPages: maxPages,
+        chunkPageSize: pageSize,
       });
 
       if (pageAttempts >= 8) {
@@ -510,12 +596,48 @@ async function syncCollectionsPhase(cache, state, options = {}) {
       }
 
       await sleep(waitMs);
+      continue;
+    } finally {
+      pageItems = null;
+      pageInfo = null;
     }
   }
 
   return {
     totalSaved,
+    nextCursor: after,
     completed: !hasMore,
+    paused: hasMore,
+    pagesProcessed,
+  };
+}
+
+async function pauseSyncChunk(cache, patch = {}) {
+  const counts = await getCatalogCounts(cache, {
+    phase: patch.phase || null,
+    syncedCollectionCount: patch.syncedCollectionCount,
+  });
+
+  await setSyncState(cache, {
+    status: 'paused',
+    lastError: null,
+    message: CHUNK_COMPLETE_MESSAGE,
+    ...patch,
+  });
+  await checkpointCache(cache);
+
+  if (patch.phase === 'collections') {
+    console.log(`[NOOD sync] chunk complete collections=${counts.collectionCount}`);
+  } else {
+    console.log(`[NOOD sync] chunk complete products=${counts.productCount}`);
+  }
+
+  return {
+    status: 'paused',
+    message: CHUNK_COMPLETE_MESSAGE,
+    productCount: counts.productCount,
+    collectionCount: counts.collectionCount,
+    phase: patch.phase || null,
   };
 }
 
@@ -525,38 +647,84 @@ async function runResumableCatalogSync(cache, options = {}) {
   const previousState = await getSyncState(cache);
   const resume = Boolean(options.resume);
   const state = resume ? previousState : defaultSyncState();
+  const chunk = resolveSyncChunkOptions(options);
+  const phase = resolveSyncPhase(state, resume);
+
+  if (phase === 'completed') {
+    const counts = await getCatalogCounts(cache, { phase: 'completed' });
+    return {
+      status: 'completed',
+      message: 'Catalog sync already completed.',
+      productCount: counts.productCount,
+      collectionCount: counts.collectionCount,
+    };
+  }
 
   await setSyncState(cache, {
     status: 'running',
-    phase: resume && state.phase === 'collections' ? 'collections' : 'products',
+    phase,
     productCursor: resume ? state.productCursor : null,
     collectionCursor: resume ? state.collectionCursor : null,
     syncedProductCount: resume ? Number(state.syncedProductCount || 0) : 0,
     syncedCollectionCount: resume ? Number(state.syncedCollectionCount || 0) : 0,
     startedAt: resume && state.startedAt ? state.startedAt : new Date().toISOString(),
     lastError: null,
+    message: null,
+    chunkPages: chunk.pages,
+    chunkPageSize: chunk.pageSize,
     completedAt: null,
   });
 
   try {
-    if (!resume || state.phase !== 'collections') {
-      await syncProductsPhase(cache, config, state, { resume });
+    if (phase === 'products') {
+      const productsResult = await syncProductsPhase(cache, config, state, {
+        resume,
+        maxPages: chunk.pages,
+        pageSize: chunk.pageSize,
+      });
+
+      if (productsResult.paused) {
+        return pauseSyncChunk(cache, {
+          phase: 'products',
+          productCursor: productsResult.nextCursor,
+          syncedProductCount: productsResult.totalSaved,
+          chunkPages: chunk.pages,
+          chunkPageSize: chunk.pageSize,
+        });
+      }
+
+      return pauseSyncChunk(cache, {
+        phase: 'collections',
+        productCursor: null,
+        collectionCursor: null,
+        syncedProductCount: productsResult.totalSaved,
+        syncedCollectionCount: 0,
+        chunkPages: chunk.pages,
+        chunkPageSize: chunk.pageSize,
+      });
     }
 
-    await setSyncState(cache, {
-      status: 'running',
-      phase: 'collections',
-      productCursor: null,
+    const collectionsResult = await syncCollectionsPhase(cache, state, {
+      resume,
+      maxPages: chunk.pages,
+      pageSize: chunk.pageSize,
     });
 
-    await syncCollectionsPhase(cache, state, {
-      resume: resume && state.phase === 'collections',
-    });
+    if (collectionsResult.paused) {
+      return pauseSyncChunk(cache, {
+        phase: 'collections',
+        collectionCursor: collectionsResult.nextCursor,
+        syncedCollectionCount: collectionsResult.totalSaved,
+        chunkPages: chunk.pages,
+        chunkPageSize: chunk.pageSize,
+      });
+    }
 
     if (options.syncMenus !== false) {
       await setSyncState(cache, {
         status: 'running',
         phase: 'menus',
+        message: null,
       });
       await syncMenus(cache);
     }
@@ -581,6 +749,7 @@ async function runResumableCatalogSync(cache, options = {}) {
       syncedProductCount: productCount,
       syncedCollectionCount: collectionCount,
       lastError: null,
+      message: null,
       completedAt: new Date().toISOString(),
     });
 
@@ -592,7 +761,8 @@ async function runResumableCatalogSync(cache, options = {}) {
     );
 
     return {
-      ...(meta || {}),
+      status: 'completed',
+      message: null,
       productCount,
       collectionCount,
     };
@@ -600,6 +770,7 @@ async function runResumableCatalogSync(cache, options = {}) {
     await setSyncState(cache, {
       status: 'failed',
       lastError: safeString(error.message, 'Catalog sync failed.'),
+      message: null,
     });
     await checkpointCache(cache);
     console.log(`[NOOD sync] failed error=${error.message}`);
@@ -611,33 +782,44 @@ async function startBackgroundCatalogSync(cache, options = {}) {
   const state = await getSyncState(cache);
   const restart = Boolean(options.restart);
   const stale = isSyncStale(state);
+  const chunk = resolveSyncChunkOptions(options);
   const alreadyRunning = state.status === 'running' && !stale;
 
+  if (state.status === 'completed' && !restart) {
+    return {
+      status: 'already_completed',
+      message: 'Catalog sync already completed.',
+    };
+  }
+
   if (activeSyncPromise && alreadyRunning && !restart) {
-    return { status: 'already_running' };
+    return { status: 'already_running', message: 'Catalog sync chunk is already running.' };
   }
 
   if (alreadyRunning && !restart) {
-    return { status: 'already_running' };
+    return { status: 'already_running', message: 'Catalog sync chunk is already running.' };
   }
 
   const shouldResume =
     !restart &&
-    (state.status === 'failed' || (state.status === 'running' && stale)) &&
-    (state.productCursor || state.collectionCursor || Number(state.syncedProductCount || 0) > 0);
+    (state.status === 'paused' ||
+      state.status === 'failed' ||
+      (state.status === 'running' && stale)) &&
+    state.status !== 'completed';
 
   if (restart) {
     await prepareFreshSync(cache);
   }
 
-  console.log('[NOOD sync] started', {
-    resume: shouldResume,
-    restart,
-  });
+  console.log(
+    `[NOOD sync] started resume=${shouldResume} restart=${restart} pages=${chunk.pages} pageSize=${chunk.pageSize}`
+  );
 
   activeSyncPromise = runResumableCatalogSync(cache, {
     syncMenus: options.syncMenus !== false,
     resume: shouldResume,
+    pages: chunk.pages,
+    pageSize: chunk.pageSize,
   })
     .catch(() => null)
     .finally(() => {
@@ -650,6 +832,9 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     status: 'started',
     resume: shouldResume,
     restart,
+    pages: chunk.pages,
+    pageSize: chunk.pageSize,
+    message: 'Catalog sync chunk started in background.',
   };
 }
 
@@ -661,19 +846,20 @@ async function syncAllProducts(cache, options = {}) {
 }
 
 async function ensureCatalogWarm(cache) {
-  const meta = await cache.getMeta();
-  const products = await cache.getAllProducts();
+  const meta = (await cache.getMeta()) || {};
+  const productCount =
+    typeof cache.getProductCount === 'function'
+      ? Number(await cache.getProductCount()) || 0
+      : metaCount(meta, 'productCount', 0);
 
-  if (String(process.env.NODE_ENV || '').trim() === 'production') {
-    console.log('[NOOD catalog] production startup warm check skipped auto-sync', {
-      cacheDriver: cache.driver(),
-      productCount: metaCount(meta, 'productCount', products.length),
-      collectionCount: metaCount(meta, 'collectionCount', 0),
-    });
+  if (isProductionEnv()) {
+    console.log(
+      `[NOOD catalog] production startup warm check skipped auto-sync productCount=${productCount}`
+    );
     return { warmed: false, meta, source: 'cache', skipped: true };
   }
 
-  if (products.length > 0) {
+  if (productCount > 0) {
     return { warmed: false, meta, source: 'cache' };
   }
 

@@ -563,11 +563,20 @@ const STOREFRONT_RECOMMENDATIONS_QUERY = `
   }
 `;
 
+function resolvePageSize(pageSize, fallback = 25) {
+  const size = Number(pageSize);
+  if (!Number.isFinite(size) || size < 1) {
+    return fallback;
+  }
+  return Math.min(50, Math.max(1, Math.floor(size)));
+}
+
 async function fetchAdminProductsPage(after = null, options = {}) {
+  const pageSize = resolvePageSize(options.pageSize, 25);
   const payload = await adminGraphql(
     ADMIN_PRODUCTS_PAGE_QUERY,
     {
-      first: 50,
+      first: pageSize,
       after,
     },
     {
@@ -585,10 +594,11 @@ async function fetchAdminProductsPage(after = null, options = {}) {
 }
 
 async function fetchAdminCollectionsPage(after = null, options = {}) {
+  const pageSize = resolvePageSize(options.pageSize, 25);
   const payload = await adminGraphql(
     ADMIN_COLLECTIONS_PAGE_QUERY,
     {
-      first: 50,
+      first: pageSize,
       after,
     },
     {
