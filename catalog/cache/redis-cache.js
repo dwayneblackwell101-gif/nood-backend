@@ -11,6 +11,9 @@ const PRODUCTS_BY_ID_HASH_KEY = `${KEY_PREFIX}productsById:h`;
 const COLLECTIONS_HASH_KEY = `${KEY_PREFIX}collections:h`;
 const MENUS_HASH_KEY = `${KEY_PREFIX}menus:h`;
 const SYNC_STATE_KEY = `${KEY_PREFIX}syncState`;
+const MIX_META_INDEX_PREFIX = `${KEY_PREFIX}mixMetaIndex`;
+const MIX_HANDLE_ORDER_PREFIX = `${KEY_PREFIX}mixedHandles`;
+const MIX_CACHE_TTL_SECONDS = 60 * 60 * 24;
 
 const LEGACY_PRODUCTS_KEY = `${KEY_PREFIX}products`;
 const LEGACY_PRODUCTS_BY_ID_KEY = `${KEY_PREFIX}productsById`;
@@ -96,6 +99,46 @@ function parseProductSummary(handle, raw) {
   };
 }
 
+function parseProductMixMeta(handle, raw) {
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+
+    const productHandle = safeString(parsed.handle) || safeString(handle);
+    if (!productHandle || !parsed.id) {
+      return null;
+    }
+
+    if (safeString(parsed.status).toUpperCase() === 'ARCHIVED') {
+      return null;
+    }
+
+    const collectionHandles = Array.isArray(parsed.collectionHandles) && parsed.collectionHandles.length
+      ? parsed.collectionHandles.map((value) => safeString(value)).filter(Boolean)
+      : (parsed.collections?.edges || [])
+          .map((edge) => safeString(edge?.node?.handle))
+          .filter(Boolean);
+
+    return {
+      handle: productHandle,
+      id: String(parsed.id),
+      collectionHandles,
+      tags: Array.isArray(parsed.tags) ? parsed.tags.slice(0, 12) : [],
+      productType: safeString(parsed.productType),
+      vendor: safeString(parsed.vendor),
+    };
+  } catch {
+    logSkippedRedisProduct(handle, 'mix_meta_bad_json');
+    return null;
+  }
+}
+
 async function createRedisCache(redisUrl) {
   let Redis;
   try {
@@ -133,6 +176,10 @@ async function createRedisCache(redisUrl) {
 
     async setJson(key, value) {
       await this.client.set(key, JSON.stringify(value));
+    }
+
+    async setJsonWithTtl(key, value, ttlSeconds = MIX_CACHE_TTL_SECONDS) {
+      await this.client.set(key, JSON.stringify(value), 'EX', Math.max(60, Number(ttlSeconds) || MIX_CACHE_TTL_SECONDS));
     }
 
     async ensureLegacyMigrated() {
@@ -450,6 +497,81 @@ async function createRedisCache(redisUrl) {
       });
 
       return summaries;
+    }
+
+    async listProductMixMeta() {
+      const rows = [];
+
+      await this.scanProductEntries((handle, raw) => {
+        const mixMeta = parseProductMixMeta(handle, raw);
+        if (mixMeta) {
+          rows.push(mixMeta);
+        }
+      });
+
+      return rows;
+    }
+
+    getMixMetaIndexKey(productCount) {
+      return `${MIX_META_INDEX_PREFIX}:${Math.max(0, Number(productCount) || 0)}`;
+    }
+
+    getMixedHandleOrderKey(productCount, mixKey) {
+      return `${MIX_HANDLE_ORDER_PREFIX}:${Math.max(0, Number(productCount) || 0)}:${safeString(mixKey)}`;
+    }
+
+    async getProductMixIndex() {
+      const productCount = await this.getProductCount();
+      const cacheKey = this.getMixMetaIndexKey(productCount);
+      const cached = await this.getJson(cacheKey, null);
+
+      if (Array.isArray(cached) && cached.length > 0) {
+        return cached;
+      }
+
+      const built = await this.listProductMixMeta();
+      if (built.length > 0) {
+        await this.setJsonWithTtl(cacheKey, built, MIX_CACHE_TTL_SECONDS);
+      }
+
+      return built;
+    }
+
+    async getMixedHandleOrder(productCount, mixKey) {
+      const cacheKey = this.getMixedHandleOrderKey(productCount, mixKey);
+      const cached = await this.getJson(cacheKey, null);
+      return Array.isArray(cached) ? cached : null;
+    }
+
+    async setMixedHandleOrder(productCount, mixKey, handles = []) {
+      const cacheKey = this.getMixedHandleOrderKey(productCount, mixKey);
+      const normalizedHandles = Array.isArray(handles)
+        ? handles.map((handle) => safeString(handle)).filter(Boolean)
+        : [];
+
+      if (!normalizedHandles.length) {
+        return false;
+      }
+
+      await this.setJsonWithTtl(cacheKey, normalizedHandles, MIX_CACHE_TTL_SECONDS);
+      return true;
+    }
+
+    async clearMixedFeedCaches() {
+      const patterns = [`${MIX_META_INDEX_PREFIX}:*`, `${MIX_HANDLE_ORDER_PREFIX}:*`];
+
+      for (const pattern of patterns) {
+        let cursor = '0';
+
+        do {
+          const [nextCursor, keys] = await this.client.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+          cursor = nextCursor;
+
+          if (keys.length) {
+            await this.client.del(...keys);
+          }
+        } while (cursor !== '0');
+      }
     }
 
     async listProductsPage({ limit = 50, after = null, sortKey = 'updated' } = {}) {

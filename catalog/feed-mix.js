@@ -26,6 +26,7 @@ const CATEGORY_MATCH_ORDER = [
 
 const MAX_CACHED_MIX_KEYS = 48;
 const mixedFeedCache = new Map();
+const mixedHandleOrderCache = new Map();
 
 function createSeededRandom(seed) {
   let state = seed >>> 0;
@@ -338,13 +339,52 @@ function getOrBuildMixedFeed(products, mixKey) {
   return { items, cacheHit: false };
 }
 
+function buildBalancedFeedFromMixMeta(mixMetaRows, mixSeed = 0) {
+  return buildBalancedFeed(mixMetaRows, mixSeed);
+}
+
+function rememberMixedHandleOrder(cacheKey, handles, productCount) {
+  if (mixedHandleOrderCache.size >= MAX_CACHED_MIX_KEYS) {
+    const oldestKey = mixedHandleOrderCache.keys().next().value;
+    if (oldestKey) {
+      mixedHandleOrderCache.delete(oldestKey);
+    }
+  }
+
+  mixedHandleOrderCache.set(cacheKey, {
+    handles,
+    productCount,
+    builtAt: Date.now(),
+  });
+}
+
+function getOrBuildMixedHandleOrder(mixMetaRows, mixKey) {
+  const cacheKey = getMixedFeedCacheKey(mixKey, mixMetaRows.length);
+  const cached = mixedHandleOrderCache.get(cacheKey);
+
+  if (cached && cached.productCount === mixMetaRows.length && Array.isArray(cached.handles)) {
+    return { handles: cached.handles, cacheHit: true };
+  }
+
+  const seed = parseMixSeed(mixKey);
+  const mixedRows = buildBalancedFeedFromMixMeta(mixMetaRows, seed);
+  const handles = mixedRows.map((row) => String(row?.handle || '')).filter(Boolean);
+
+  rememberMixedHandleOrder(cacheKey, handles, mixMetaRows.length);
+
+  return { handles, cacheHit: false };
+}
+
 function clearMixedFeedCache() {
   mixedFeedCache.clear();
+  mixedHandleOrderCache.clear();
 }
 
 module.exports = {
   buildBalancedFeed,
+  buildBalancedFeedFromMixMeta,
   getOrBuildMixedFeed,
+  getOrBuildMixedHandleOrder,
   clearMixedFeedCache,
   resolveMainCategory,
 };

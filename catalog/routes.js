@@ -6,7 +6,7 @@ const {
   safeString,
   toStorefrontListProduct,
 } = require('./transform');
-const { getOrBuildMixedFeed } = require('./feed-mix');
+const { getOrBuildMixedHandleOrder } = require('./feed-mix');
 const { startBackgroundCatalogSync, getCatalogSyncStatus } = require('./sync');
 const {
   storefrontGraphql,
@@ -88,22 +88,116 @@ function buildProductListPage(items, total, hasNextPage, endCursor) {
   };
 }
 
+async function loadMixMetaIndex(cache) {
+  if (typeof cache.getProductMixIndex === 'function') {
+    return cache.getProductMixIndex();
+  }
+
+  if (typeof cache.listProductMixMeta === 'function') {
+    return cache.listProductMixMeta();
+  }
+
+  const products = getActiveProducts(await cache.getAllProducts());
+  return products.map((product) => ({
+    handle: product.handle,
+    id: String(product.id),
+    collectionHandles: Array.isArray(product.collectionHandles) && product.collectionHandles.length
+      ? product.collectionHandles.map((value) => safeString(value)).filter(Boolean)
+      : (product.collections?.edges || [])
+          .map((edge) => safeString(edge?.node?.handle))
+          .filter(Boolean),
+    tags: Array.isArray(product.tags) ? product.tags.slice(0, 12) : [],
+    productType: safeString(product.productType),
+    vendor: safeString(product.vendor),
+  }));
+}
+
+async function getOrBuildOrderedMixedHandles(cache, mixMetaRows, mixKey) {
+  const productCount = mixMetaRows.length;
+
+  if (typeof cache.getMixedHandleOrder === 'function') {
+    const cached = await cache.getMixedHandleOrder(productCount, mixKey);
+    if (Array.isArray(cached) && cached.length > 0) {
+      console.log('[NOOD catalog] mixed handle order cache hit');
+      return { handles: cached, cacheHit: true };
+    }
+  }
+
+  const built = getOrBuildMixedHandleOrder(mixMetaRows, mixKey);
+
+  if (built.cacheHit) {
+    console.log('[NOOD catalog] mixed handle order cache hit');
+  } else {
+    console.log('[NOOD catalog] mixed handle order cache built');
+    if (typeof cache.setMixedHandleOrder === 'function') {
+      await cache.setMixedHandleOrder(productCount, mixKey, built.handles);
+    }
+  }
+
+  return built;
+}
+
+async function loadMixedCatalogProductsPage(cache, { mixKey, limit, after }) {
+  const pageLimit = Math.max(1, Math.min(Number(limit) || 50, 250));
+  const start = Number(after) > 0 ? Number(after) : 0;
+
+  console.log(
+    `[NOOD catalog] mixed feed fast path mixKey=${mixKey} after=${after ?? 'null'} limit=${pageLimit}`
+  );
+
+  const mixMetaRows = await loadMixMetaIndex(cache);
+  const { handles: orderedHandles, cacheHit } = await getOrBuildOrderedMixedHandles(
+    cache,
+    mixMetaRows,
+    mixKey
+  );
+  const pageHandles = orderedHandles.slice(start, start + pageLimit);
+
+  console.log(`[NOOD catalog] mixed handles selected count=${pageHandles.length}`);
+
+  const fetchedProducts = await fetchProductsByHandles(cache, pageHandles);
+  const productsByHandle = new Map(
+    fetchedProducts.filter(isActiveCatalogProduct).map((product) => [product.handle, product])
+  );
+
+  let skippedMissing = 0;
+  const pageProducts = [];
+
+  for (const handle of pageHandles) {
+    const product = productsByHandle.get(safeString(handle));
+    if (!product) {
+      skippedMissing += 1;
+      continue;
+    }
+    pageProducts.push(product);
+  }
+
+  if (skippedMissing > 0) {
+    console.log(`[NOOD catalog] skipped missing mixed handles count=${skippedMissing}`);
+  }
+
+  const nextIndex = start + pageHandles.length;
+  const hasNextPage = nextIndex < orderedHandles.length;
+
+  console.log(
+    `[NOOD catalog] mixed products returned count=${pageProducts.length} nextCursor=${hasNextPage ? String(nextIndex) : 'null'} hasMore=${hasNextPage}`
+  );
+
+  return {
+    items: pageProducts,
+    total: orderedHandles.length,
+    cacheHit,
+    paginate: false,
+    hasNextPage,
+    endCursor: hasNextPage ? String(nextIndex) : null,
+  };
+}
+
 async function loadCatalogProductsForList(cache, { mixKey, sortKey, limit, after }) {
   const hasMixKey = mixKey !== undefined && mixKey !== null && String(mixKey).length > 0;
 
   if (hasMixKey) {
-    const allProducts =
-      typeof cache.readAllProductsSafe === 'function'
-        ? getActiveProducts(await cache.readAllProductsSafe())
-        : getActiveProducts(await cache.getAllProducts());
-    const mixed = getOrBuildMixedFeed(allProducts, mixKey);
-
-    return {
-      items: mixed.items,
-      total: allProducts.length,
-      cacheHit: mixed.cacheHit,
-      paginate: true,
-    };
+    return loadMixedCatalogProductsPage(cache, { mixKey, limit, after });
   }
 
   if (typeof cache.listProductsPage === 'function') {

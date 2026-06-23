@@ -1,7 +1,37 @@
 const fs = require('fs');
 const path = require('path');
+const { safeString } = require('../transform');
 
 const CACHE_FILE = path.join(__dirname, '..', '..', 'catalog-cache.json');
+const MIX_CACHE_TTL_MS = 60 * 60 * 24 * 1000;
+
+const jsonMixMetaIndexCache = new Map();
+const jsonMixedHandleOrderCache = new Map();
+
+function parseJsonProductMixMeta(product) {
+  if (!product?.handle || !product?.id) {
+    return null;
+  }
+
+  if (safeString(product.status).toUpperCase() === 'ARCHIVED') {
+    return null;
+  }
+
+  const collectionHandles = Array.isArray(product.collectionHandles) && product.collectionHandles.length
+    ? product.collectionHandles.map((value) => safeString(value)).filter(Boolean)
+    : (product.collections?.edges || [])
+        .map((edge) => safeString(edge?.node?.handle))
+        .filter(Boolean);
+
+  return {
+    handle: product.handle,
+    id: String(product.id),
+    collectionHandles,
+    tags: Array.isArray(product.tags) ? product.tags.slice(0, 12) : [],
+    productType: safeString(product.productType),
+    vendor: safeString(product.vendor),
+  };
+}
 
 function emptyState() {
   return {
@@ -142,6 +172,78 @@ class JsonCatalogCache {
 
   async getAllProducts() {
     return Object.values(this.state.products);
+  }
+
+  async getProductsByHandles(handles = []) {
+    const uniqueHandles = [...new Set(handles.map((handle) => safeString(handle)).filter(Boolean))];
+    const productsByHandle = new Map();
+
+    for (const handle of uniqueHandles) {
+      const product = this.state.products[handle];
+      if (product) {
+        productsByHandle.set(handle, product);
+      }
+    }
+
+    return handles
+      .map((handle) => productsByHandle.get(safeString(handle)))
+      .filter(Boolean);
+  }
+
+  async listProductMixMeta() {
+    return Object.values(this.state.products || {})
+      .map((product) => parseJsonProductMixMeta(product))
+      .filter(Boolean);
+  }
+
+  async getProductMixIndex() {
+    const productCount = await this.getProductCount();
+    const cacheKey = String(productCount);
+    const cached = jsonMixMetaIndexCache.get(cacheKey);
+
+    if (cached && Date.now() - cached.builtAt < MIX_CACHE_TTL_MS) {
+      return cached.rows;
+    }
+
+    const built = await this.listProductMixMeta();
+    if (built.length > 0) {
+      jsonMixMetaIndexCache.set(cacheKey, { rows: built, builtAt: Date.now() });
+    }
+
+    return built;
+  }
+
+  async getMixedHandleOrder(productCount, mixKey) {
+    const cacheKey = `${productCount}:${safeString(mixKey)}`;
+    const cached = jsonMixedHandleOrderCache.get(cacheKey);
+
+    if (cached && Date.now() - cached.builtAt < MIX_CACHE_TTL_MS) {
+      return cached.handles;
+    }
+
+    return null;
+  }
+
+  async setMixedHandleOrder(productCount, mixKey, handles = []) {
+    const cacheKey = `${productCount}:${safeString(mixKey)}`;
+    const normalizedHandles = Array.isArray(handles)
+      ? handles.map((handle) => safeString(handle)).filter(Boolean)
+      : [];
+
+    if (!normalizedHandles.length) {
+      return false;
+    }
+
+    jsonMixedHandleOrderCache.set(cacheKey, {
+      handles: normalizedHandles,
+      builtAt: Date.now(),
+    });
+    return true;
+  }
+
+  async clearMixedFeedCaches() {
+    jsonMixMetaIndexCache.clear();
+    jsonMixedHandleOrderCache.clear();
   }
 
   async getCollection(handle) {

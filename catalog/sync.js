@@ -799,6 +799,9 @@ async function runResumableCatalogSync(cache, options = {}) {
     });
 
     clearMixedFeedCache();
+    if (typeof cache.clearMixedFeedCaches === 'function') {
+      await cache.clearMixedFeedCaches();
+    }
     await checkpointCache(cache);
 
     console.log(
