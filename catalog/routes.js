@@ -4,6 +4,7 @@ const {
   paginateListProducts,
   searchProducts,
   safeString,
+  toStorefrontListProduct,
 } = require('./transform');
 const { getOrBuildMixedFeed } = require('./feed-mix');
 const { startBackgroundCatalogSync, getCatalogSyncStatus } = require('./sync');
@@ -25,7 +26,89 @@ function sendCatalogResponse(res, payload, source) {
 }
 
 function getActiveProducts(products) {
-  return products.filter((product) => safeString(product?.status).toUpperCase() !== 'ARCHIVED');
+  return (Array.isArray(products) ? products : []).filter((product) => {
+    if (!product || !product.id || !product.handle) {
+      return false;
+    }
+    return safeString(product?.status).toUpperCase() !== 'ARCHIVED';
+  });
+}
+
+function safeToStorefrontListProduct(product) {
+  if (!product?.id || !product?.handle) {
+    return null;
+  }
+
+  try {
+    return toStorefrontListProduct(product);
+  } catch (error) {
+    console.log(
+      `[NOOD catalog] skipped invalid redis product handle=${safeString(product?.handle, 'unknown')} reason=map_error`
+    );
+    return null;
+  }
+}
+
+function buildProductListPage(items, total, hasNextPage, endCursor) {
+  const edges = (Array.isArray(items) ? items : [])
+    .map((product) => {
+      const node = safeToStorefrontListProduct(product);
+      return node ? { node } : null;
+    })
+    .filter(Boolean);
+
+  return {
+    edges,
+    pageInfo: {
+      hasNextPage: Boolean(hasNextPage),
+      endCursor: hasNextPage ? endCursor : null,
+    },
+    total,
+  };
+}
+
+async function loadCatalogProductsForList(cache, { mixKey, sortKey, limit, after }) {
+  const hasMixKey = mixKey !== undefined && mixKey !== null && String(mixKey).length > 0;
+
+  if (hasMixKey) {
+    const allProducts =
+      typeof cache.readAllProductsSafe === 'function'
+        ? getActiveProducts(await cache.readAllProductsSafe())
+        : getActiveProducts(await cache.getAllProducts());
+    const mixed = getOrBuildMixedFeed(allProducts, mixKey);
+
+    return {
+      items: mixed.items,
+      total: allProducts.length,
+      cacheHit: mixed.cacheHit,
+      paginate: true,
+    };
+  }
+
+  if (typeof cache.listProductsPage === 'function') {
+    const pageResult = await cache.listProductsPage({
+      limit,
+      after,
+      sortKey,
+    });
+
+    return {
+      items: pageResult.items,
+      total: pageResult.total,
+      cacheHit: false,
+      paginate: false,
+      hasNextPage: pageResult.hasNextPage,
+      endCursor: pageResult.endCursor,
+    };
+  }
+
+  const allProducts = getActiveProducts(await cache.getAllProducts());
+  return {
+    items: sortProducts(allProducts, sortKey),
+    total: allProducts.length,
+    cacheHit: false,
+    paginate: true,
+  };
 }
 
 function sortProducts(products, sortKey = 'updated') {
@@ -88,37 +171,48 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
     const afterIndex = Number(after) > 0 ? Number(after) : 0;
     const pageNumber = Math.floor(afterIndex / Math.max(1, first)) + 1;
 
-    const allProducts = getActiveProducts(await cache.getAllProducts());
-    let items;
-    let cacheHit = false;
+    try {
+      const loaded = await loadCatalogProductsForList(cache, {
+        mixKey,
+        sortKey,
+        limit: first,
+        after,
+      });
 
-    if (mixKey !== undefined && mixKey !== null && String(mixKey).length > 0) {
-      const mixed = getOrBuildMixedFeed(allProducts, mixKey);
-      items = mixed.items;
-      cacheHit = mixed.cacheHit;
-    } else {
-      items = sortProducts(allProducts, sortKey);
-    }
+      const page = loaded.paginate
+        ? paginateListProducts(loaded.items, first, after)
+        : buildProductListPage(
+            loaded.items,
+            loaded.total,
+            loaded.hasNextPage,
+            loaded.endCursor
+          );
 
-    const page = paginateListProducts(items, first, after);
+      console.log(
+        `[NOOD catalog] products returned count=${page.edges.length} total=${loaded.total}`
+      );
+      console.log(
+        `[NOOD feed] mixed feed source=cache total=${loaded.total} returned=${page.edges.length} cacheHit=${loaded.cacheHit} slim=true`
+      );
+      console.log(`[NOOD feed] mixKey=${mixKey ?? 'none'} page=${pageNumber}`);
 
-    console.log(
-      `[NOOD catalog] products returned count=${page.edges.length} total=${allProducts.length}`
-    );
-    console.log(
-      `[NOOD feed] mixed feed source=cache total=${allProducts.length} returned=${page.edges.length} cacheHit=${cacheHit} slim=true`
-    );
-    console.log(`[NOOD feed] mixKey=${mixKey ?? 'none'} page=${pageNumber}`);
-
-    return sendCatalogResponse(
-      res,
-      {
-        data: {
-          products: page,
+      return sendCatalogResponse(
+        res,
+        {
+          data: {
+            products: page,
+          },
         },
-      },
-      'cache'
-    );
+        'cache'
+      );
+    } catch (error) {
+      console.error('[NOOD catalog] GET /products failed:', error.message);
+      return res.status(500).json({
+        success: false,
+        source: 'cache',
+        message: error.message || 'Could not read catalog products.',
+      });
+    }
   });
 
   router.get('/products/recommendations', async (req, res) => {

@@ -1,4 +1,8 @@
 const { JsonCatalogCache } = require('./json-cache');
+const { safeString } = require('../transform');
+
+const PRODUCT_SCAN_COUNT = 100;
+const PRODUCT_FETCH_BATCH = 50;
 
 const KEY_PREFIX = 'nood:catalog:';
 const META_KEY = `${KEY_PREFIX}meta`;
@@ -30,15 +34,66 @@ function defaultSyncState() {
 
 function parseHashValues(rawMap = {}) {
   const items = [];
-  for (const value of Object.values(rawMap)) {
-    if (!value) continue;
-    try {
-      items.push(JSON.parse(value));
-    } catch {
-      // skip invalid entries
+  for (const [handle, value] of Object.entries(rawMap || {})) {
+    const product = parseRedisProduct(handle, value);
+    if (product) {
+      items.push(product);
     }
   }
   return items;
+}
+
+function logSkippedRedisProduct(handle, reason = 'invalid') {
+  console.log(
+    `[NOOD catalog] skipped invalid redis product handle=${safeString(handle, 'unknown')} reason=${reason}`
+  );
+}
+
+function parseRedisProduct(handle, raw) {
+  if (!raw) {
+    logSkippedRedisProduct(handle, 'empty');
+    return null;
+  }
+
+  try {
+    const product = JSON.parse(raw);
+    if (!product || typeof product !== 'object') {
+      logSkippedRedisProduct(handle, 'not_object');
+      return null;
+    }
+
+    const productHandle = safeString(product.handle) || safeString(handle);
+    if (!productHandle || !product.id) {
+      logSkippedRedisProduct(handle, 'missing_handle_or_id');
+      return null;
+    }
+
+    if (!product.handle) {
+      product.handle = productHandle;
+    }
+
+    return product;
+  } catch {
+    logSkippedRedisProduct(handle, 'bad_json');
+    return null;
+  }
+}
+
+function parseProductSummary(handle, raw) {
+  const product = parseRedisProduct(handle, raw);
+  if (!product) {
+    return null;
+  }
+
+  if (safeString(product.status).toUpperCase() === 'ARCHIVED') {
+    return null;
+  }
+
+  return {
+    handle: product.handle,
+    id: product.id,
+    updatedAt: product.updatedAt || '',
+  };
 }
 
 async function createRedisCache(redisUrl) {
@@ -308,14 +363,65 @@ async function createRedisCache(redisUrl) {
       return legacy.map((product) => product.handle).filter(Boolean);
     }
 
-    async getAllProducts() {
+    async scanProductEntries(onEntry) {
+      await this.ensureLegacyMigrated();
+      let cursor = '0';
+
+      do {
+        const [nextCursor, chunk] = await this.client.hscan(
+          PRODUCTS_HASH_KEY,
+          cursor,
+          'COUNT',
+          PRODUCT_SCAN_COUNT
+        );
+        cursor = nextCursor;
+
+        for (let index = 0; index < chunk.length; index += 2) {
+          onEntry(chunk[index], chunk[index + 1]);
+        }
+      } while (cursor !== '0');
+    }
+
+    async getProductsByHandles(handles = []) {
+      await this.ensureLegacyMigrated();
+      const uniqueHandles = [...new Set(handles.map((handle) => safeString(handle)).filter(Boolean))];
+      if (!uniqueHandles.length) {
+        return [];
+      }
+
+      const productsByHandle = new Map();
+
+      for (let index = 0; index < uniqueHandles.length; index += PRODUCT_FETCH_BATCH) {
+        const batch = uniqueHandles.slice(index, index + PRODUCT_FETCH_BATCH);
+        const raws = await this.client.hmget(PRODUCTS_HASH_KEY, ...batch);
+
+        for (let batchIndex = 0; batchIndex < batch.length; batchIndex += 1) {
+          const product = parseRedisProduct(batch[batchIndex], raws[batchIndex]);
+          if (product) {
+            productsByHandle.set(product.handle, product);
+          }
+        }
+      }
+
+      return handles
+        .map((handle) => productsByHandle.get(safeString(handle)))
+        .filter(Boolean);
+    }
+
+    async readAllProductsSafe() {
       await this.ensureLegacyMigrated();
       const hashCount = Number(await this.client.hlen(PRODUCTS_HASH_KEY)) || 0;
       console.log(`[NOOD cache] redis product hash count=${hashCount}`);
 
       if (hashCount > 0) {
-        const raw = await this.client.hgetall(PRODUCTS_HASH_KEY);
-        return parseHashValues(raw);
+        const products = [];
+        await this.scanProductEntries((handle, raw) => {
+          const product = parseRedisProduct(handle, raw);
+          if (product) {
+            products.push(product);
+          }
+        });
+        return products;
       }
 
       const legacyProducts = await this.getLegacyProductsArray();
@@ -323,10 +429,55 @@ async function createRedisCache(redisUrl) {
         console.log(`[NOOD cache] redis legacy product blob count=${legacyProducts.length}`);
         await this.mergeProducts(legacyProducts);
         await this.client.del(LEGACY_PRODUCTS_KEY, LEGACY_PRODUCTS_BY_ID_KEY);
-        return legacyProducts;
+        return legacyProducts
+          .map((product) => parseRedisProduct(product?.handle, JSON.stringify(product)))
+          .filter(Boolean);
       }
 
       return [];
+    }
+
+    async listProductSummaries() {
+      const summaries = [];
+
+      await this.scanProductEntries((handle, raw) => {
+        const summary = parseProductSummary(handle, raw);
+        if (summary) {
+          summaries.push(summary);
+        }
+      });
+
+      return summaries;
+    }
+
+    async listProductsPage({ limit = 50, after = null, sortKey = 'updated' } = {}) {
+      const summaries = await this.listProductSummaries();
+      const pageLimit = Math.max(1, Math.min(Number(limit) || 50, 250));
+      const start = Number(after) > 0 ? Number(after) : 0;
+
+      if (sortKey === 'created') {
+        summaries.sort((left, right) => String(right.id).localeCompare(String(left.id)));
+      } else {
+        summaries.sort((left, right) =>
+          String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''))
+        );
+      }
+
+      const pageSummaries = summaries.slice(start, start + pageLimit);
+      const items = await this.getProductsByHandles(pageSummaries.map((summary) => summary.handle));
+      const nextIndex = start + pageSummaries.length;
+      const hasNextPage = nextIndex < summaries.length;
+
+      return {
+        items,
+        total: summaries.length,
+        hasNextPage,
+        endCursor: hasNextPage ? String(nextIndex) : null,
+      };
+    }
+
+    async getAllProducts() {
+      return this.readAllProductsSafe();
     }
 
     async getCollection(handle) {
