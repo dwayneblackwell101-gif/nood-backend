@@ -1269,11 +1269,8 @@ app.get('/auth/callback', (req, res) => {
   const querySuffix = query.toString() ? `?${query.toString()}` : '';
   const target = `${SHOPIFY_APP_AUTH_CALLBACK_URI}${querySuffix}`;
 
-  console.log('[AUTH] /auth/callback received', {
-    query: req.query,
-    queryString: query.toString(),
-    target,
-  });
+  console.log('[AUTH CALLBACK QUERY]', req.query);
+  console.log('[AUTH] /auth/callback bridge target', target);
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.status(200).send(`<!DOCTYPE html>
