@@ -232,8 +232,10 @@ async function createRedisCache(redisUrl) {
 
     async getProduct(handle) {
       await this.ensureLegacyMigrated();
-      const raw = await this.client.hget(PRODUCTS_HASH_KEY, String(handle || '').trim());
-      return raw ? JSON.parse(raw) : null;
+      const key = String(handle || '').trim();
+      if (!key) return null;
+      const raw = await this.client.hget(PRODUCTS_HASH_KEY, key);
+      return parseRedisProduct(key, raw);
     }
 
     async getProductById(id) {

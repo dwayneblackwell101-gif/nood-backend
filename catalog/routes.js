@@ -25,6 +25,27 @@ function sendCatalogResponse(res, payload, source) {
   });
 }
 
+function formatCachedProductDetail(product) {
+  return {
+    id: product.id,
+    title: product.title,
+    handle: product.handle,
+    descriptionHtml: product.descriptionHtml || product.description || '',
+    description: product.description || '',
+    vendor: product.vendor || '',
+    productType: product.productType || '',
+    tags: Array.isArray(product.tags) ? product.tags : [],
+    availableForSale: Boolean(product.availableForSale),
+    featuredImage: product.featuredImage || null,
+    images: product.images || { edges: [] },
+    media: product.media || { edges: [] },
+    priceRange: product.priceRange || null,
+    compareAtPriceRange: product.compareAtPriceRange || { maxVariantPrice: null },
+    variants: product.variants || { edges: [] },
+    collections: product.collections || { edges: [] },
+  };
+}
+
 function getActiveProducts(products) {
   return (Array.isArray(products) ? products : []).filter((product) => {
     if (!product || !product.id || !product.handle) {
@@ -238,65 +259,63 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
   });
 
   router.get('/products/:handle', async (req, res) => {
-    const handle = safeString(req.params.handle);
-    if (handle === 'recommendations') {
-      const productId = safeString(req.query.productId || req.query.product_id || req.query.id);
-      const result = await getProductRecommendations(cache, productId);
+    try {
+      const handle = safeString(req.params.handle);
+      if (handle === 'recommendations') {
+        const productId = safeString(req.query.productId || req.query.product_id || req.query.id);
+        const result = await getProductRecommendations(cache, productId);
+        return sendCatalogResponse(
+          res,
+          {
+            data: {
+              productRecommendations: result.items,
+            },
+          },
+          result.source
+        );
+      }
+
+      if (!handle) {
+        return res.status(404).json({
+          success: false,
+          error: true,
+          message: 'Product not found',
+        });
+      }
+
+      const product = await cache.getProduct(handle);
+
+      if (!product?.handle || !product?.id) {
+        console.log(`[NOOD product] cache miss handle=${handle}`);
+        return res.status(404).json({
+          success: false,
+          error: true,
+          message: 'Product not found',
+        });
+      }
+
+      console.log(`[NOOD product] cache hit handle=${handle}`);
+      const detail = formatCachedProductDetail(product);
+      console.log(`[NOOD product] detail returned handle=${handle}`);
+
       return sendCatalogResponse(
         res,
         {
           data: {
-            productRecommendations: result.items,
+            product: detail,
+            productByHandle: detail,
           },
         },
-        result.source
+        'cache'
       );
-    }
-    let product = await cache.getProduct(handle);
-    let source = 'cache';
-
-    if (!product) {
-      try {
-        const payload = await storefrontGraphql(STOREFRONT_PRODUCT_DETAIL_QUERY, { handle });
-        const storefrontProduct = payload?.data?.productByHandle;
-        if (storefrontProduct) {
-          source = 'shopify';
-          return sendCatalogResponse(res, payload, source);
-        }
-      } catch (error) {
-        console.warn('[NOOD catalog] product detail storefront fallback failed:', error.message);
-      }
-
-      return res.status(404).json({
+    } catch (error) {
+      console.error('[NOOD catalog] GET /products/:handle failed:', error.message);
+      return res.status(500).json({
         success: false,
-        source: 'cache',
-        message: 'Product not found in catalog cache.',
+        error: true,
+        message: error.message || 'Could not read product detail.',
       });
     }
-
-    console.log('[NOOD catalog] GET /products/:handle', { source, handle });
-
-    return sendCatalogResponse(
-      res,
-      {
-        data: {
-          productByHandle: {
-            id: product.id,
-            title: product.title,
-            handle: product.handle,
-            descriptionHtml: product.descriptionHtml,
-            vendor: product.vendor,
-            productType: product.productType,
-            featuredImage: product.featuredImage,
-            images: product.images,
-            media: product.media,
-            priceRange: product.priceRange,
-            variants: product.variants,
-          },
-        },
-      },
-      source
-    );
   });
 
   router.get('/products/:handle/recommendations', async (req, res) => {
