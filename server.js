@@ -1,4 +1,6 @@
-﻿require('dotenv').config();
+const path = require('path');
+
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const crypto = require('crypto');
 const os = require('os');
@@ -25,6 +27,10 @@ const LOCAL_IP = safeString(process.env.LOCAL_IP) || getLocalNetworkIp();
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PRODUCTION = NODE_ENV === 'production';
 const APP_DEEP_LINK_SCHEME = safeString(process.env.APP_DEEP_LINK_SCHEME, 'noodapp');
+const SHOPIFY_APP_AUTH_CALLBACK_URI = safeString(
+  process.env.SHOPIFY_APP_AUTH_CALLBACK_URI,
+  'shop.66320990292.nood://auth/callback'
+);
 const PAYPAL_CURRENCY = safeString(process.env.PAYPAL_CURRENCY, 'USD').toUpperCase();
 const SHOPIFY_CURRENCY = safeString(process.env.SHOPIFY_CURRENCY, 'TTD').toUpperCase();
 const PAYPAL_USD_TO_TTD_RATE = Number(process.env.PAYPAL_USD_TO_TTD_RATE || 6.8);
@@ -36,7 +42,17 @@ const WIPAY_ENVIRONMENT = process.env.WIPAY_ENVIRONMENT || 'sandbox';
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 const SHOPIFY_ADMIN_API_VERSION = safeString(process.env.SHOPIFY_ADMIN_API_VERSION, '2025-10');
-const ADMIN_API_KEY = safeString(process.env.ADMIN_API_KEY);
+function trimValue(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function getConfiguredAdminApiKey() {
+  const adminKey = trimValue(process.env.ADMIN_API_KEY);
+  const noodKey = trimValue(process.env.NOOD_ADMIN_API_KEY);
+  return adminKey || noodKey;
+}
+
+const ADMIN_API_KEY = getConfiguredAdminApiKey();
 
 assertProductionConfig();
 
@@ -166,22 +182,35 @@ function getCorsOrigin() {
   };
 }
 
+function getProvidedAdminApiKey(req) {
+  const headerKey = req.get('x-admin-api-key') || req.headers['x-admin-api-key'];
+  return trimValue(headerKey);
+}
+
 function requireAdminApiKey(req, res, next) {
-  if (!ADMIN_API_KEY) {
+  const configuredKey = getConfiguredAdminApiKey();
+  const providedKey = getProvidedAdminApiKey(req);
+  const configured = configuredKey.length > 0;
+  const headerProvided = providedKey.length > 0;
+  const match = configured && headerProvided && providedKey === configuredKey;
+
+  console.log(
+    `[NOOD admin] configured=${configured} headerProvided=${headerProvided} match=${match}`
+  );
+
+  if (!configured) {
     return res.status(503).json({
       success: false,
       error: true,
-      message: 'ADMIN_API_KEY is required before recovery records can be accessed.',
+      message: 'Admin API key missing in server .env',
     });
   }
 
-  const providedKey = safeString(req.get('x-admin-api-key') || req.query.admin_api_key);
-
-  if (providedKey !== ADMIN_API_KEY) {
+  if (!match) {
     return res.status(401).json({
       success: false,
       error: true,
-      message: 'Admin API key required.',
+      message: 'Admin API key required',
     });
   }
 
@@ -195,8 +224,8 @@ function assertProductionConfig() {
     throw new Error('NOOD_ALLOWED_ORIGINS is required in production.');
   }
 
-  if (!ADMIN_API_KEY) {
-    throw new Error('ADMIN_API_KEY is required in production.');
+  if (!getConfiguredAdminApiKey()) {
+    throw new Error('ADMIN_API_KEY or NOOD_ADMIN_API_KEY is required in production.');
   }
 }
 
@@ -1226,6 +1255,44 @@ setInterval(cleanupOldPendingOrders, 1000 * 60 * 30);
 
 app.get('/', (req, res) => {
   res.send(`Backend is running on ${BACKEND_BASE_URL}`);
+});
+
+app.get('/auth/callback', (req, res) => {
+  const query = new URLSearchParams();
+
+  Object.entries(req.query || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      query.append(key, String(value));
+    }
+  });
+
+  const querySuffix = query.toString() ? `?${query.toString()}` : '';
+  const target = `${SHOPIFY_APP_AUTH_CALLBACK_URI}${querySuffix}`;
+
+  console.log('[AUTH] /auth/callback received', {
+    query: req.query,
+    queryString: query.toString(),
+    target,
+  });
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.status(200).send(`<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Returning to NOOD</title>
+  </head>
+  <body>
+    <p>Returning to NOOD...</p>
+    <script>
+      (function () {
+        var target = ${JSON.stringify(target)};
+        window.location.replace(target);
+      })();
+    </script>
+  </body>
+</html>`);
 });
 
 app.get('/health', (req, res) => {
