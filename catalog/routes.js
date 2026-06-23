@@ -157,6 +157,102 @@ function buildCollectionStorefront(collection, productsByHandle, first, after) {
   };
 }
 
+const COLLECTION_PRODUCTS_BATCH_SIZE = 50;
+
+function isActiveCatalogProduct(product) {
+  if (!product?.id || !product?.handle) {
+    return false;
+  }
+  return safeString(product?.status).toUpperCase() !== 'ARCHIVED';
+}
+
+async function fetchProductsByHandles(cache, handles = []) {
+  const normalizedHandles = handles.map((handle) => safeString(handle)).filter(Boolean);
+  if (!normalizedHandles.length) {
+    return [];
+  }
+
+  if (typeof cache.getProductsByHandles === 'function') {
+    return cache.getProductsByHandles(normalizedHandles);
+  }
+
+  const products = getActiveProducts(await cache.getAllProducts());
+  const byHandle = Object.fromEntries(products.map((product) => [product.handle, product]));
+  return normalizedHandles.map((handle) => byHandle[handle]).filter(Boolean);
+}
+
+async function loadCollectionProductsPage(cache, collection, first, after) {
+  const handles = Array.isArray(collection?.productHandles)
+    ? collection.productHandles.map((handle) => safeString(handle)).filter(Boolean)
+    : [];
+  const limit = Math.max(1, Math.min(Number(first) || 50, 250));
+  const start = Number(after) > 0 ? Number(after) : 0;
+
+  let skippedMissing = 0;
+  let validIndex = 0;
+  const pageProducts = [];
+  let hasNextPage = false;
+
+  for (let batchStart = 0; batchStart < handles.length; batchStart += COLLECTION_PRODUCTS_BATCH_SIZE) {
+    const batchHandles = handles.slice(batchStart, batchStart + COLLECTION_PRODUCTS_BATCH_SIZE);
+    const fetchedProducts = await fetchProductsByHandles(cache, batchHandles);
+    const productsByHandle = new Map(
+      fetchedProducts.filter(isActiveCatalogProduct).map((product) => [product.handle, product])
+    );
+
+    for (const handle of batchHandles) {
+      const product = productsByHandle.get(handle);
+      if (!product) {
+        skippedMissing += 1;
+        continue;
+      }
+
+      if (validIndex < start) {
+        validIndex += 1;
+        continue;
+      }
+
+      if (pageProducts.length < limit) {
+        pageProducts.push(product);
+        validIndex += 1;
+        continue;
+      }
+
+      hasNextPage = true;
+      break;
+    }
+
+    if (hasNextPage) {
+      break;
+    }
+  }
+
+  const nextIndex = start + pageProducts.length;
+
+  return {
+    pageProducts,
+    skippedMissing,
+    pageInfo: {
+      hasNextPage,
+      endCursor: hasNextPage ? String(nextIndex) : null,
+    },
+  };
+}
+
+function buildCollectionProductsPayload(collection, pageProducts, pageInfo) {
+  return {
+    data: {
+      collectionByHandle: {
+        title: collection?.title || '',
+        products: {
+          edges: pageProducts.map((product) => ({ node: product })),
+          pageInfo,
+        },
+      },
+    },
+  };
+}
+
 function createCatalogRouter({ cache, requireAdminApiKey }) {
   const router = express.Router();
 
@@ -342,30 +438,43 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
 
   router.get('/collections/:handle/products', async (req, res) => {
     const handle = safeString(req.params.handle);
-    const first = Number(req.query.first || 250);
+    const first = Number(req.query.first || req.query.limit || 250);
     const after = req.query.after || null;
 
     const collection = await cache.getCollection(handle);
-    const products = await cache.getAllProducts();
-    const productsByHandle = Object.fromEntries(
-      products.map((product) => [product.handle, product])
-    );
 
-    if (collection) {
-      const payload = buildCollectionStorefront(collection, productsByHandle, first, after);
-      console.log('[NOOD catalog] GET /collections/:handle/products', {
+    if (!collection) {
+      return res.status(404).json({
+        success: false,
         source: 'cache',
-        handle,
-        returned: payload.data.collectionByHandle.products.edges.length,
+        message: 'Collection not found in catalog cache.',
       });
-      return sendCatalogResponse(res, payload, 'cache');
     }
 
-    return res.status(404).json({
-      success: false,
-      source: 'cache',
-      message: 'Collection not found in catalog cache.',
+    console.log('[NOOD catalog] collection products fast path', { handle });
+
+    const { pageProducts, skippedMissing, pageInfo } = await loadCollectionProductsPage(
+      cache,
+      collection,
+      first,
+      after
+    );
+    const payload = buildCollectionProductsPayload(collection, pageProducts, pageInfo);
+
+    console.log('[NOOD catalog] collection products handle=' + handle, {
+      requested: first,
+      returned: payload.data.collectionByHandle.products.edges.length,
+      cursor: pageInfo.endCursor,
+      hasNextPage: pageInfo.hasNextPage,
     });
+
+    if (skippedMissing > 0) {
+      console.log('[NOOD catalog] collection products skipped missing=' + skippedMissing, {
+        handle,
+      });
+    }
+
+    return sendCatalogResponse(res, payload, 'cache');
   });
 
   router.get('/collections', async (req, res) => {
