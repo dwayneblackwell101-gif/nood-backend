@@ -1,0 +1,66 @@
+{
+  "expo": {
+    "name": "NOOD Caribbean",
+    "slug": "nood-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/nood-brand-logo.png",
+    "scheme": "shop.66320990292.nood",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.noodcaribbean.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "NOOD Caribbean uses the camera for visual product search and scanning product photos."
+      }
+    },
+    "android": {
+      "predictiveBackGestureEnabled": false,
+      "package": "com.noodcaribbean.app",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": false,
+          "data": [
+            {
+              "scheme": "shop.66320990292.nood"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ],
+      "permissions": [
+        "CAMERA"
+      ]
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/nood-brand-splash.png",
+          "imageWidth": 260,
+          "resizeMode": "contain",
+          "backgroundColor": "#ffffff",
+          "dark": {
+            "backgroundColor": "#ffffff"
+          }
+        }
+      ],
+      "expo-localization",
+      "expo-video",
+      "expo-font",
+      "expo-web-browser"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
