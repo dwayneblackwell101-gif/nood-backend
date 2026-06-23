@@ -14,6 +14,7 @@ const SYNC_STATE_KEY = `${KEY_PREFIX}syncState`;
 const MIX_META_INDEX_PREFIX = `${KEY_PREFIX}mixMetaIndex`;
 const MIX_HANDLE_ORDER_PREFIX = `${KEY_PREFIX}mixedHandles`;
 const MIX_CACHE_TTL_SECONDS = 60 * 60 * 24;
+const mixMetaIndexL1 = new Map();
 
 const LEGACY_PRODUCTS_KEY = `${KEY_PREFIX}products`;
 const LEGACY_PRODUCTS_BY_ID_KEY = `${KEY_PREFIX}productsById`;
@@ -522,15 +523,23 @@ async function createRedisCache(redisUrl) {
 
     async getProductMixIndex() {
       const productCount = await this.getProductCount();
+      const l1 = mixMetaIndexL1.get(productCount);
+
+      if (l1 && Date.now() - l1.builtAt < MIX_CACHE_TTL_SECONDS * 1000) {
+        return l1.rows;
+      }
+
       const cacheKey = this.getMixMetaIndexKey(productCount);
       const cached = await this.getJson(cacheKey, null);
 
       if (Array.isArray(cached) && cached.length > 0) {
+        mixMetaIndexL1.set(productCount, { rows: cached, builtAt: Date.now() });
         return cached;
       }
 
       const built = await this.listProductMixMeta();
       if (built.length > 0) {
+        mixMetaIndexL1.set(productCount, { rows: built, builtAt: Date.now() });
         await this.setJsonWithTtl(cacheKey, built, MIX_CACHE_TTL_SECONDS);
       }
 
@@ -558,6 +567,7 @@ async function createRedisCache(redisUrl) {
     }
 
     async clearMixedFeedCaches() {
+      mixMetaIndexL1.clear();
       const patterns = [`${MIX_META_INDEX_PREFIX}:*`, `${MIX_HANDLE_ORDER_PREFIX}:*`];
 
       for (const pattern of patterns) {
