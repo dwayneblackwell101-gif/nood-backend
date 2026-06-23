@@ -387,12 +387,19 @@ function createCatalogSyncHandler(cache) {
         req.query.restart === '1' ||
         req.query.restart === 'true' ||
         req.body?.restart === true;
+      const forceResume =
+        req.query.forceResume === '1' ||
+        req.query.forceResume === 'true' ||
+        req.body?.forceResume === true ||
+        req.body?.forceResume === 1 ||
+        req.body?.forceResume === '1';
       const pages = parseSyncInt(req.query.pages ?? req.body?.pages, 10);
       const pageSize = parseSyncInt(req.query.pageSize ?? req.body?.pageSize, 25);
 
       const result = await startBackgroundCatalogSync(cache, {
         syncMenus: true,
         restart,
+        forceResume,
         pages,
         pageSize,
       });
@@ -403,6 +410,8 @@ function createCatalogSyncHandler(cache) {
         status: result.status,
         resume: Boolean(result.resume),
         restart: Boolean(result.restart),
+        forceResume: Boolean(result.forceResume),
+        stale: Boolean(result.stale),
         pages: result.pages ?? pages,
         pageSize: result.pageSize ?? pageSize,
         message:

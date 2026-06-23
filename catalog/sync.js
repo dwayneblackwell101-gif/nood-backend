@@ -68,7 +68,7 @@ const DEFAULT_MENU_HANDLES = [
   'mobile-menu',
 ];
 
-const SYNC_STALE_MS = 5 * 60 * 1000;
+const SYNC_STALE_MS = 3 * 60 * 1000;
 const INTER_PAGE_DELAY_MS = 400;
 const MAX_CHUNK_PAGES = 50;
 const MAX_PAGE_SIZE = 50;
@@ -117,8 +117,26 @@ function defaultSyncState() {
   };
 }
 
-function resolveSyncPhase(state, resume) {
+function parseForceResumeFlag(value) {
+  return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+function resolveSyncPhase(state, resume, options = {}) {
+  const productCount = Number(options.productCount || 0);
+  const productsAlreadySynced =
+    productCount > 0 ||
+    Number(state.syncedProductCount || 0) > 0 ||
+    Boolean(state.productCursor);
+
   if (!resume) {
+    if (state.phase === 'collections' || state.phase === 'menus') {
+      return 'collections';
+    }
+
+    if (productsAlreadySynced && !state.productCursor) {
+      return 'collections';
+    }
+
     return 'products';
   }
 
@@ -134,7 +152,7 @@ function resolveSyncPhase(state, resume) {
     return 'products';
   }
 
-  if (Number(state.syncedProductCount || 0) > 0 && !state.collectionCursor) {
+  if (productsAlreadySynced && !state.collectionCursor) {
     return 'collections';
   }
 
@@ -172,13 +190,29 @@ async function setSyncState(cache, patch) {
   return { ...defaultSyncState(), ...patch };
 }
 
-function isSyncStale(state) {
+function isOrphanedRunning(state) {
+  return state?.status === 'running' && !activeSyncPromise;
+}
+
+function isSyncStale(state, options = {}) {
   if (state?.status !== 'running') {
     return false;
   }
 
+  if (parseForceResumeFlag(options.forceResume)) {
+    return true;
+  }
+
+  if (isOrphanedRunning(state)) {
+    return true;
+  }
+
   const updatedAt = Date.parse(state.updatedAt || '');
   return !Number.isFinite(updatedAt) || Date.now() - updatedAt > SYNC_STALE_MS;
+}
+
+function clearActiveSyncLock() {
+  activeSyncPromise = null;
 }
 
 async function checkpointCache(cache) {
@@ -554,15 +588,22 @@ async function syncCollectionsPhase(cache, state, options = {}) {
         liveCollectionCount
       );
 
+      const liveProductCount =
+        typeof cache.getProductCount === 'function'
+          ? Number(await cache.getProductCount()) || 0
+          : Number(state.syncedProductCount || 0);
+
       await setSyncState(cache, {
         status: 'running',
         phase: 'collections',
         collectionCursor: after,
         syncedCollectionCount: totalSaved,
+        syncedProductCount: liveProductCount,
         lastError: null,
         message: null,
         chunkPages: maxPages,
         chunkPageSize: pageSize,
+        updatedAt: new Date().toISOString(),
       });
 
       await checkpointCache(cache);
@@ -648,7 +689,11 @@ async function runResumableCatalogSync(cache, options = {}) {
   const resume = Boolean(options.resume);
   const state = resume ? previousState : defaultSyncState();
   const chunk = resolveSyncChunkOptions(options);
-  const phase = resolveSyncPhase(state, resume);
+  const liveProductCount =
+    typeof cache.getProductCount === 'function'
+      ? Number(await cache.getProductCount()) || 0
+      : Number(state.syncedProductCount || 0);
+  const phase = resolveSyncPhase(state, resume, { productCount: liveProductCount });
 
   if (phase === 'completed') {
     const counts = await getCatalogCounts(cache, { phase: 'completed' });
@@ -781,28 +826,30 @@ async function runResumableCatalogSync(cache, options = {}) {
 async function startBackgroundCatalogSync(cache, options = {}) {
   const state = await getSyncState(cache);
   const restart = Boolean(options.restart);
-  const stale = isSyncStale(state);
+  const forceResume = parseForceResumeFlag(options.forceResume);
+  const stale = isSyncStale(state, { forceResume });
   const chunk = resolveSyncChunkOptions(options);
   const alreadyRunning = state.status === 'running' && !stale;
 
-  if (state.status === 'completed' && !restart) {
+  if (state.status === 'completed' && !restart && !forceResume) {
     return {
       status: 'already_completed',
       message: 'Catalog sync already completed.',
     };
   }
 
-  if (activeSyncPromise && alreadyRunning && !restart) {
-    return { status: 'already_running', message: 'Catalog sync chunk is already running.' };
-  }
-
   if (alreadyRunning && !restart) {
     return { status: 'already_running', message: 'Catalog sync chunk is already running.' };
   }
 
+  if (stale && activeSyncPromise) {
+    clearActiveSyncLock();
+  }
+
   const shouldResume =
     !restart &&
-    (state.status === 'paused' ||
+    (forceResume ||
+      state.status === 'paused' ||
       state.status === 'failed' ||
       (state.status === 'running' && stale)) &&
     state.status !== 'completed';
@@ -812,7 +859,7 @@ async function startBackgroundCatalogSync(cache, options = {}) {
   }
 
   console.log(
-    `[NOOD sync] started resume=${shouldResume} restart=${restart} pages=${chunk.pages} pageSize=${chunk.pageSize}`
+    `[NOOD sync] started resume=${shouldResume} restart=${restart} forceResume=${forceResume} stale=${stale} pages=${chunk.pages} pageSize=${chunk.pageSize}`
   );
 
   activeSyncPromise = runResumableCatalogSync(cache, {
@@ -832,9 +879,13 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     status: 'started',
     resume: shouldResume,
     restart,
+    forceResume,
+    stale,
     pages: chunk.pages,
     pageSize: chunk.pageSize,
-    message: 'Catalog sync chunk started in background.',
+    message: forceResume
+      ? 'Catalog sync resumed from saved phase/cursor.'
+      : 'Catalog sync chunk started in background.',
   };
 }
 
