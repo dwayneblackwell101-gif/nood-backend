@@ -41,6 +41,7 @@ const {
   validateShopifyOrderCreateAccess,
   assertShopifyOrderCreateAccess,
 } = require('./shopify-order-access');
+const { normalizeTrinidadPhoneForShopify } = require('./phone-normalize');
 const app = express();
 const storage = createStorage();
 const pendingOrders = storage.pendingOrders.items;
@@ -692,10 +693,14 @@ function buildShopifyAddress(address = {}, fallbackName = 'NOOD Customer', fallb
     return null;
   }
 
+  const shippingPhone =
+    normalizeTrinidadPhoneForShopify(safeString(address.phone), 'shipping_address') ||
+    normalizeTrinidadPhoneForShopify(safeString(fallbackPhone), 'shipping_fallback');
+
   return {
     firstName: firstName || 'NOOD',
     lastName,
-    phone: safeString(address.phone, fallbackPhone) || undefined,
+    phone: shippingPhone || undefined,
     address1,
     address2: safeString(address.address2) || undefined,
     city,
@@ -3558,10 +3563,11 @@ async function createShopifyOrder({
 
   const [firstName, ...rest] = safeString(name, 'NOOD Customer').split(' ');
   const lastName = rest.join(' ') || 'Customer';
+  const normalizedCustomerPhone = normalizeTrinidadPhoneForShopify(phone, 'customer');
   const normalizedShippingAddress = buildShopifyAddress(
     shippingAddress,
     safeString(name, 'NOOD Customer'),
-    phone
+    normalizedCustomerPhone || phone
   );
 
   const lineItems = (Array.isArray(cartItems) ? cartItems : []).map((item) => {
@@ -3612,13 +3618,13 @@ async function createShopifyOrder({
     order: {
       currency: orderCurrency,
       email: email || undefined,
-      phone: phone || undefined,
+      phone: normalizedCustomerPhone || undefined,
       tags: ['NOOD App', paymentMethod],
       note: `${paymentMethod} transaction: ${paymentTransactionId} | Client order: ${clientOrderId}`,
       billingAddress: {
         firstName: firstName || 'NOOD',
         lastName: lastName || 'Customer',
-        phone: phone || undefined,
+        phone: normalizedCustomerPhone || undefined,
       },
       shippingAddress: normalizedShippingAddress || undefined,
       lineItems,
@@ -3646,7 +3652,7 @@ async function createShopifyOrder({
     paymentMethod,
     clientOrderId,
     email: email || null,
-    phone: phone || null,
+    phone: normalizedCustomerPhone || null,
     lineItems: lineItems.map((item) => ({
       title: item.title,
       quantity: item.quantity,
