@@ -51,9 +51,18 @@ const walletTransactions = storage.walletTransactions.items;
 
 const { createReturnRequestHandlers } = require('./refunds/return-requests');
 const shopifyRefundSync = require('./refunds/shopify-refund-sync');
+const { createWalletRefundService } = require('./refunds/wallet-refund');
+const walletRefundService = createWalletRefundService({
+  walletTransactions,
+  persistWalletTransactions,
+  safeMoney,
+  safeString,
+  defaultCurrency: 'TTD',
+});
 const returnRequestHandlers = createReturnRequestHandlers({
   refundRequests: storage.refundRequests,
   shopifyRefundSync,
+  walletRefundService,
 });
 
 const PORT = Number(process.env.PORT || 3000);

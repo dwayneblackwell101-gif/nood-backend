@@ -27,7 +27,17 @@ function normalizeStatus(value) {
 }
 
 function normalizeRefundMethod(value) {
-  return safeString(value).toLowerCase() === 'wallet' ? 'wallet' : 'original_payment';
+  const normalized = safeString(value).toLowerCase();
+  if (normalized === 'wallet' || normalized === 'nood_wallet') {
+    return 'wallet';
+  }
+  return 'original_payment';
+}
+
+function getRefundDestinationLabel(refundMethod) {
+  return normalizeRefundMethod(refundMethod) === 'wallet'
+    ? 'NOOD Wallet'
+    : 'Original payment method';
 }
 
 function normalizeRequest(raw = {}) {
@@ -55,6 +65,12 @@ function normalizeRequest(raw = {}) {
     admin_note: safeString(raw.admin_note || raw.adminNote) || '',
     shopify_order_gid: safeString(raw.shopify_order_gid || raw.shopifyOrderGid) || null,
     shopify_synced_at: safeString(raw.shopify_synced_at || raw.shopifySyncedAt) || null,
+    refund_destination_label:
+      safeString(raw.refund_destination_label || raw.refundDestinationLabel) ||
+      getRefundDestinationLabel(raw.refund_method || raw.refundMethod),
+    wallet_credited: Boolean(raw.wallet_credited || raw.walletCredited),
+    wallet_transaction_id:
+      safeString(raw.wallet_transaction_id || raw.walletTransactionId) || null,
   };
 }
 
@@ -63,7 +79,7 @@ function resolveStatusFromAction(action, record) {
 
   switch (normalizedAction) {
     case 'approve':
-      return record.refund_method === 'original_payment' ? 'manual_refund_required' : 'approved';
+      return record.refund_method === 'wallet' ? 'refunded_to_wallet' : 'manual_refund_required';
     case 'reject':
       return 'rejected';
     case 'refund_to_wallet':
@@ -77,7 +93,48 @@ function resolveStatusFromAction(action, record) {
   }
 }
 
-function createReturnRequestHandlers({ refundRequests, shopifyRefundSync }) {
+async function applyPostApprovalEffects(record, walletRefundService) {
+  let nextRecord = normalizeRequest(record);
+
+  if (nextRecord.refund_method === 'wallet' && nextRecord.status === 'refunded_to_wallet') {
+    if (!walletRefundService?.creditWalletRefund) {
+      throw new Error('Wallet refund service is not configured.');
+    }
+
+    const credit = walletRefundService.creditWalletRefund({
+      requestId: nextRecord.request_id,
+      customerEmail: nextRecord.customer_email,
+      amount: nextRecord.amount,
+      currency: nextRecord.currency,
+      orderId: nextRecord.order_id,
+      orderNumber: nextRecord.order_number,
+    });
+
+    nextRecord = normalizeRequest({
+      ...nextRecord,
+      wallet_credited: credit.credited || credit.duplicate,
+      wallet_transaction_id: credit.walletTransactionId || nextRecord.wallet_transaction_id,
+    });
+  }
+
+  if (
+    nextRecord.refund_method === 'original_payment' &&
+    nextRecord.status === 'manual_refund_required'
+  ) {
+    console.log('[ORIGINAL PAYMENT MANUAL REQUIRED]', {
+      requestId: nextRecord.request_id,
+      orderNumber: nextRecord.order_number,
+      amount: nextRecord.amount,
+      currency: nextRecord.currency,
+      paymentProvider: nextRecord.payment_provider,
+      paymentTransactionId: nextRecord.payment_transaction_id,
+    });
+  }
+
+  return nextRecord;
+}
+
+function createReturnRequestHandlers({ refundRequests, shopifyRefundSync, walletRefundService }) {
   async function reconcileRequestWithShopify(record) {
     if (!shopifyRefundSync?.pullRefundStatusFromShopify) {
       return record;
@@ -260,6 +317,16 @@ function createReturnRequestHandlers({ refundRequests, shopifyRefundSync }) {
       updated_at: new Date().toISOString(),
     });
 
+    console.log('[REFUND DESTINATION SELECTED]', {
+      requestId: record.request_id,
+      orderId: record.order_id,
+      orderNumber: record.order_number,
+      refundMethod: record.refund_method,
+      refundDestinationLabel: record.refund_destination_label,
+      amount: record.amount,
+      currency: record.currency,
+    });
+
     console.log('[RETURN REQUEST CREATE]', {
       requestId: record.request_id,
       orderId: record.order_id,
@@ -327,8 +394,9 @@ function createReturnRequestHandlers({ refundRequests, shopifyRefundSync }) {
       resolvedStatus = resolveStatusFromAction(action, existing);
     } else if (explicitStatus) {
       resolvedStatus = normalizeStatus(explicitStatus);
-      if (resolvedStatus === 'approved' && existing.refund_method === 'original_payment') {
-        resolvedStatus = 'manual_refund_required';
+      if (resolvedStatus === 'approved') {
+        resolvedStatus =
+          existing.refund_method === 'wallet' ? 'refunded_to_wallet' : 'manual_refund_required';
       }
     }
 
@@ -347,6 +415,7 @@ function createReturnRequestHandlers({ refundRequests, shopifyRefundSync }) {
       admin_note: safeString(req.body?.admin_note || req.body?.adminNote) || existing.admin_note || '',
     });
 
+    updated = await applyPostApprovalEffects(updated, walletRefundService);
     refundRequests.set(requestId, updated);
 
     const shopifyResult = await pushRequestToShopify(updated);

@@ -1,0 +1,82 @@
+function createWalletRefundService({
+  walletTransactions,
+  persistWalletTransactions,
+  safeMoney,
+  safeString,
+  defaultCurrency = 'TTD',
+}) {
+  function creditWalletRefund({
+    requestId,
+    customerEmail,
+    amount,
+    currency,
+    orderId,
+    orderNumber,
+  }) {
+    const normalizedRequestId = safeString(requestId);
+    const normalizedEmail = safeString(customerEmail).toLowerCase();
+    const walletTransactionId = `refund_wallet_${normalizedRequestId}`;
+
+    const existing = walletTransactions.get(walletTransactionId);
+    if (existing) {
+      console.log('[WALLET REFUND CREDITED]', {
+        requestId: normalizedRequestId,
+        duplicate: true,
+        walletTransactionId,
+      });
+      return {
+        credited: false,
+        duplicate: true,
+        walletTransactionId,
+        balance: null,
+      };
+    }
+
+    const creditAmount = Number(safeMoney(amount));
+    if (!Number.isFinite(creditAmount) || creditAmount <= 0) {
+      throw new Error('Invalid wallet refund amount.');
+    }
+
+    const record = {
+      walletTransactionId,
+      provider: 'wallet_refund',
+      transactionId: normalizedRequestId,
+      orderId: safeString(orderId),
+      orderNumber: safeString(orderNumber),
+      customerId: normalizedEmail,
+      amount: safeMoney(creditAmount),
+      currency: safeString(currency, defaultCurrency).toUpperCase(),
+      status: 'confirmed',
+      type: 'refund_credit',
+      createdAt: new Date().toISOString(),
+    };
+
+    walletTransactions.set(walletTransactionId, record);
+    persistWalletTransactions();
+
+    console.log('[WALLET REFUND CREDITED]', {
+      requestId: normalizedRequestId,
+      orderId: record.orderId,
+      orderNumber: record.orderNumber,
+      customerEmail: normalizedEmail,
+      amount: record.amount,
+      currency: record.currency,
+      walletTransactionId,
+    });
+
+    return {
+      credited: true,
+      duplicate: false,
+      walletTransactionId,
+      record,
+    };
+  }
+
+  return {
+    creditWalletRefund,
+  };
+}
+
+module.exports = {
+  createWalletRefundService,
+};
