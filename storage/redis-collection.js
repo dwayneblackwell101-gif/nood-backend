@@ -1,6 +1,14 @@
 const fs = require('fs');
 const path = require('path');
-const Redis = require('ioredis');
+
+let Redis;
+try {
+  console.log('[REDIS LOAD 3] requiring ioredis');
+  Redis = require('ioredis');
+} catch (error) {
+  console.error('[REDIS LOAD 3] failed:', error.code || error.name, error.message);
+  throw error;
+}
 
 class RedisCollection {
   constructor({ name, keyPrefix, keyField, redis, migrateFileName = '' }) {

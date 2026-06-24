@@ -7,8 +7,24 @@ const os = require('os');
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { createStorage } = require('./storage');
-const { fetchShopifyCustomerOrders } = require('./shopify-customer-orders');
+
+let createStorage;
+try {
+  console.log('[REDIS LOAD 1] requiring ./storage');
+  ({ createStorage } = require('./storage'));
+} catch (error) {
+  console.error('[REDIS LOAD 1] failed:', error.code || error.name, error.message);
+  throw error;
+}
+
+let fetchShopifyCustomerOrders;
+try {
+  console.log('[SERVER LOAD] requiring ./shopify-customer-orders');
+  ({ fetchShopifyCustomerOrders } = require('./shopify-customer-orders'));
+} catch (error) {
+  console.error('[SERVER LOAD] failed:', error.code || error.name, error.message);
+  throw error;
+}
 const {
   getPayPalConfig,
   hasPayPalCredentials,

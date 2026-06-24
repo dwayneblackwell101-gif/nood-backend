@@ -1,6 +1,15 @@
 const fs = require('fs');
 const path = require('path');
-const { RedisCollection, createRedisClient } = require('./storage/redis-collection');
+
+let RedisCollection;
+let createRedisClient;
+try {
+  console.log('[REDIS LOAD 2] requiring ./storage/redis-collection');
+  ({ RedisCollection, createRedisClient } = require('./storage/redis-collection'));
+} catch (error) {
+  console.error('[REDIS LOAD 2] failed:', error.code || error.name, error.message);
+  throw error;
+}
 
 const STORAGE_DRIVER = String(process.env.STORAGE_DRIVER || 'json').trim().toLowerCase();
 const REDIS_URL = String(process.env.REDIS_URL || '').trim();
