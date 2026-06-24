@@ -147,12 +147,27 @@ function createStorage() {
         keyField: 'paymentKey',
       });
 
+  const refundRequests = redis
+    ? new RedisCollection({
+        name: 'refund requests',
+        keyPrefix: 'nood:storage:refundRequests:',
+        keyField: 'request_id',
+        redis,
+        migrateFileName: 'refund-requests.json',
+      })
+    : new JsonCollection({
+        name: 'refund requests',
+        fileName: 'refund-requests.json',
+        keyField: 'request_id',
+      });
+
   const ready = (async () => {
     if (redis) {
       await redis.connect();
       await redis.ping();
       await failedPaidOrders.init();
       await paymentRecords.init();
+      await refundRequests.init();
       storageState.paymentStorageRedisReady = true;
       console.log('[NOOD storage] payment recovery storage ready (redis)', {
         storageDriver: STORAGE_DRIVER,
@@ -167,6 +182,7 @@ function createStorage() {
       walletTransactions.ready,
       failedPaidOrders.ready,
       paymentRecords.ready,
+      refundRequests.ready,
     ]);
     console.log('[NOOD storage] payment recovery storage ready (json)', {
       storageDriver: STORAGE_DRIVER,
@@ -177,6 +193,7 @@ function createStorage() {
     pendingOrders,
     failedPaidOrders,
     paymentRecords,
+    refundRequests,
     walletTransactions,
     ready,
     storageDriver: STORAGE_DRIVER,

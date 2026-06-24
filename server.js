@@ -49,6 +49,13 @@ const failedPaidOrders = storage.failedPaidOrders.items;
 const paymentRecords = storage.paymentRecords.items;
 const walletTransactions = storage.walletTransactions.items;
 
+const { createReturnRequestHandlers } = require('./refunds/return-requests');
+const shopifyRefundSync = require('./refunds/shopify-refund-sync');
+const returnRequestHandlers = createReturnRequestHandlers({
+  refundRequests: storage.refundRequests,
+  shopifyRefundSync,
+});
+
 const PORT = Number(process.env.PORT || 3000);
 const LOCAL_IP = safeString(process.env.LOCAL_IP) || getLocalNetworkIp();
 const NODE_ENV = process.env.NODE_ENV || 'development';
@@ -2317,6 +2324,17 @@ app.get('/api/customer/orders', async (req, res) => {
       orders: [],
     });
   }
+});
+
+app.post('/api/refunds/requests', returnRequestHandlers.createRequest);
+app.get('/api/refunds/requests', returnRequestHandlers.listRequests);
+app.get('/api/refunds/requests/:id/status', returnRequestHandlers.getRequestStatus);
+app.patch('/api/refunds/requests/:id', requireAdminApiKey, returnRequestHandlers.patchRequest);
+console.log('[NOOD refunds] routes registered', {
+  create: 'POST /api/refunds/requests',
+  list: 'GET /api/refunds/requests',
+  status: 'GET /api/refunds/requests/:id/status',
+  patch: 'PATCH /api/refunds/requests/:id',
 });
 
 app.get('/api/failed-paid-orders', requireAdminApiKey, (req, res) => {
