@@ -58,6 +58,7 @@ let shopifyOrderAccessState = {
   tokenSource: getShopifyOrderTokenSource(),
   missingOrderScopes: ['write_orders'],
   hasShopifyOrderAdminAccessToken: hasShopifyOrderAdminAccessToken(),
+  tokenFingerprint: '',
 };
 function trimValue(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -1682,6 +1683,7 @@ app.get('/health', (req, res) => {
     shopify_order_create_ready: shopifyOrderAccessState.ok,
     missing_order_scopes: shopifyOrderAccessState.missingOrderScopes || [],
     shopify_order_token_source: shopifyOrderAccessState.tokenSource,
+    shopify_order_token_fingerprint: shopifyOrderAccessState.tokenFingerprint || null,
     shopify_order_access_scopes: shopifyOrderAccessState.scopes,
     shopify_order_access_message: shopifyOrderAccessState.message,
   });

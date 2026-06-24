@@ -18,6 +18,19 @@ function getShopifyOrderTokenSource() {
   return 'SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN';
 }
 
+function getShopifyOrderTokenFingerprint(accessToken = getShopifyOrderAccessToken()) {
+  const token = safeString(accessToken);
+  if (!token) {
+    return '';
+  }
+
+  if (token.length < 10) {
+    return `${token.slice(0, 2)}...`;
+  }
+
+  return `${token.slice(0, 6)}...${token.slice(-4)}`;
+}
+
 function getMissingOrderScopes(grantedScopes = []) {
   const granted = new Set(
     (Array.isArray(grantedScopes) ? grantedScopes : []).map((scope) => safeString(scope)).filter(Boolean)
@@ -60,15 +73,22 @@ async function validateShopifyOrderCreateAccess() {
   const storeDomain = safeString(process.env.SHOPIFY_STORE_DOMAIN);
   const accessToken = getShopifyOrderAccessToken();
   const tokenSource = getShopifyOrderTokenSource();
+  const tokenFingerprint = getShopifyOrderTokenFingerprint(accessToken);
 
   if (!storeDomain) {
     const message = 'Missing SHOPIFY_STORE_DOMAIN for order creation.';
-    console.error('[ORDER CREATE FAILED] startup validation', { message, tokenSource });
+    console.error('[ORDER CREATE FAILED] startup validation', {
+      message,
+      tokenSource,
+      tokenFingerprint: tokenFingerprint || null,
+      scopes: [],
+    });
     return {
       ok: false,
       message,
       scopes: [],
       tokenSource,
+      tokenFingerprint,
       missingOrderScopes: REQUIRED_ORDER_SCOPES,
       hasShopifyOrderAdminAccessToken: false,
     };
@@ -77,12 +97,19 @@ async function validateShopifyOrderCreateAccess() {
   if (!accessToken) {
     const message =
       'Missing SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN. Set a dedicated Shopify Admin API token with write_orders scope for paid checkout order creation.';
-    console.error('[ORDER CREATE FAILED] startup validation', { message, tokenSource, storeDomain });
+    console.error('[ORDER CREATE FAILED] startup validation', {
+      message,
+      tokenSource,
+      tokenFingerprint: null,
+      scopes: [],
+      storeDomain,
+    });
     return {
       ok: false,
       message,
       scopes: [],
       tokenSource,
+      tokenFingerprint,
       missingOrderScopes: REQUIRED_ORDER_SCOPES,
       hasShopifyOrderAdminAccessToken: false,
     };
@@ -98,6 +125,7 @@ async function validateShopifyOrderCreateAccess() {
     console.error('[ORDER CREATE FAILED] startup validation', {
       message,
       tokenSource,
+      tokenFingerprint,
       scopes,
       missingOrderScopes,
       storeDomain,
@@ -107,6 +135,7 @@ async function validateShopifyOrderCreateAccess() {
       message,
       scopes,
       tokenSource,
+      tokenFingerprint,
       missingOrderScopes,
       hasShopifyOrderAdminAccessToken: true,
     };
@@ -114,6 +143,7 @@ async function validateShopifyOrderCreateAccess() {
 
   console.log('[ORDER CREATE SUCCESS] startup validation passed', {
     tokenSource,
+    tokenFingerprint,
     scopes,
     storeDomain,
   });
@@ -123,6 +153,7 @@ async function validateShopifyOrderCreateAccess() {
     message: 'Shopify order creation access is configured.',
     scopes,
     tokenSource,
+    tokenFingerprint,
     missingOrderScopes: [],
     hasShopifyOrderAdminAccessToken: true,
   };
@@ -152,6 +183,7 @@ module.exports = {
   getShopifyOrderAccessToken,
   hasShopifyOrderAdminAccessToken,
   getShopifyOrderTokenSource,
+  getShopifyOrderTokenFingerprint,
   getMissingOrderScopes,
   fetchShopifyAdminScopes,
   validateShopifyOrderCreateAccess,
