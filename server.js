@@ -1240,6 +1240,10 @@ async function handleWalletCheckout(req, res) {
         paymentTransactionId: walletDebitId,
         paymentMethod: safeString(req.body?.paymentMethod, 'NOOD Wallet'),
         clientOrderId: checkoutSessionId || walletDebitId,
+        currency: SHOPIFY_CURRENCY,
+        paymentCurrency: SHOPIFY_CURRENCY,
+        paymentAmount: total,
+        pending: { currency: SHOPIFY_CURRENCY, cartItems },
       });
 
       savePaymentRecord({
@@ -1616,6 +1620,12 @@ async function createShopifyOrderFromPaidPayment(paymentData) {
       tokenSource: shopifyOrderAccessState.tokenSource,
     });
 
+    const paymentCurrency = resolveShopifyOrderCurrency({
+      pending,
+      cartItems: pending?.cartItems,
+    });
+    const paymentAmount = safeMoney(pending?.total || pending?.amount);
+
     const shopifyOrder = await createShopifyOrder({
       email: pending.email,
       phone: pending.phone,
@@ -1626,6 +1636,10 @@ async function createShopifyOrderFromPaidPayment(paymentData) {
       paymentTransactionId: transactionId,
       paymentMethod: normalizedMethod === 'paypal' ? 'PayPal' : 'WiPay',
       clientOrderId: pending?.clientOrderId || pending?.localOrderId || orderId,
+      currency: paymentCurrency,
+      paymentCurrency,
+      paymentAmount,
+      pending,
     });
 
     console.log('[ORDER CREATE SUCCESS]', {
@@ -2127,6 +2141,11 @@ app.post('/api/shopify/orders', async (req, res) => {
       shippingAddress,
     });
 
+    const retryCurrency = safeString(
+      req.body?.currency || recoveryRecord?.currency,
+      SHOPIFY_CURRENCY
+    ).toUpperCase();
+
     const shopifyOrder = await createShopifyOrder({
       email: customerEmail,
       phone: customerPhone,
@@ -2140,6 +2159,10 @@ app.post('/api/shopify/orders', async (req, res) => {
         req.body?.clientOrderId || req.body?.localOrderId || req.body?.pendingCheckoutId || req.body?.order_id,
         transactionId
       ),
+      currency: retryCurrency,
+      paymentCurrency: retryCurrency,
+      paymentAmount: total,
+      pending: { currency: retryCurrency, cartItems },
     });
 
     savePaymentRecord({
@@ -2251,6 +2274,8 @@ app.post('/api/failed-paid-orders/:recoveryId/retry', requireAdminApiKey, async 
   }
 
   try {
+    const recoveryCurrency = safeString(record?.currency, SHOPIFY_CURRENCY).toUpperCase();
+
     const shopifyOrder = await createShopifyOrder({
       email: record.customer?.email,
       phone: record.customer?.phone,
@@ -2261,6 +2286,10 @@ app.post('/api/failed-paid-orders/:recoveryId/retry', requireAdminApiKey, async 
       paymentTransactionId: record.transactionId,
       paymentMethod: record.provider === 'paypal' ? 'PayPal' : 'WiPay',
       clientOrderId: record.orderId,
+      currency: recoveryCurrency,
+      paymentCurrency: recoveryCurrency,
+      paymentAmount: record.amount,
+      pending: { currency: recoveryCurrency, cartItems: record.cartItems },
     });
 
     const updated = {
@@ -3346,6 +3375,78 @@ app.get('/payment-return', async (req, res) => {
   }
 });
 
+let cachedShopCurrencyCode = '';
+
+function getCartCurrency(cartItems) {
+  const items = Array.isArray(cartItems) ? cartItems : [];
+
+  for (const item of items) {
+    const code = safeString(item?.currency).toUpperCase();
+    if (code) {
+      return code;
+    }
+  }
+
+  return '';
+}
+
+function resolveShopifyOrderCurrency({ pending = null, cartItems = [], explicitCurrency = '' } = {}) {
+  const explicit = safeString(explicitCurrency).toUpperCase();
+  const pendingCurrency = safeString(pending?.currency).toUpperCase();
+  const cartCurrency = getCartCurrency(cartItems);
+
+  return explicit || pendingCurrency || cartCurrency || SHOPIFY_CURRENCY || 'TTD';
+}
+
+async function fetchShopCurrencyCode(accessToken) {
+  if (cachedShopCurrencyCode) {
+    return cachedShopCurrencyCode;
+  }
+
+  try {
+    const payload = await adminGraphql(
+      `query NoodShopCurrency { shop { currencyCode } }`,
+      {},
+      { accessToken, requestedQueryCost: 1 }
+    );
+    cachedShopCurrencyCode =
+      safeString(payload?.data?.shop?.currencyCode, '').toUpperCase() || 'UNKNOWN';
+  } catch (error) {
+    console.warn('[SHOP CURRENCY] failed to fetch shop currencyCode', error?.message || error);
+    cachedShopCurrencyCode = 'UNKNOWN';
+  }
+
+  return cachedShopCurrencyCode;
+}
+
+function logShopifyOrderCurrencyDiagnostics({
+  paymentCurrency,
+  paymentAmount,
+  pendingOrderCurrency,
+  cartCurrency,
+  shopCurrency,
+  orderCurrency,
+  orderPayloadCurrency,
+}) {
+  console.log('[PAYMENT CURRENCY]', paymentCurrency || 'n/a');
+  if (paymentAmount !== undefined && paymentAmount !== null && paymentAmount !== '') {
+    console.log('[PAYMENT AMOUNT]', paymentAmount);
+  }
+  console.log('[ORDER CURRENCY]', orderCurrency || 'n/a');
+  console.log('[SHOP CURRENCY]', shopCurrency || 'n/a');
+  console.log('[SHOPIFY ORDER PAYLOAD CURRENCY]', orderPayloadCurrency || 'n/a');
+  console.log('[NOOD order] currency diagnostics before Shopify orderCreate', {
+    paymentCurrency: paymentCurrency || null,
+    paymentAmount: paymentAmount ?? null,
+    pendingOrderCurrency: pendingOrderCurrency || null,
+    cartCurrency: cartCurrency || null,
+    shopCurrency: shopCurrency || null,
+    configuredShopifyCurrency: SHOPIFY_CURRENCY,
+    orderCurrency: orderCurrency || null,
+    orderPayloadCurrency: orderPayloadCurrency || null,
+  });
+}
+
 async function createShopifyOrder({
   email,
   phone,
@@ -3356,6 +3457,10 @@ async function createShopifyOrder({
   paymentTransactionId,
   paymentMethod = 'WiPay',
   clientOrderId,
+  currency: explicitCurrency = '',
+  paymentCurrency = '',
+  paymentAmount = null,
+  pending = null,
 }) {
   if (!SHOPIFY_STORE_DOMAIN) {
     throw new Error('Missing SHOPIFY_STORE_DOMAIN in .env');
@@ -3369,6 +3474,27 @@ async function createShopifyOrder({
   }
 
   assertShopifyOrderCreateAccess(shopifyOrderAccessState);
+
+  const pendingOrderCurrency = safeString(pending?.currency).toUpperCase();
+  const cartCurrency = getCartCurrency(cartItems);
+  const orderCurrency = resolveShopifyOrderCurrency({
+    pending,
+    cartItems,
+    explicitCurrency,
+  });
+  const shopCurrency = await fetchShopCurrencyCode(orderAccessToken);
+  const resolvedPaymentCurrency =
+    safeString(paymentCurrency).toUpperCase() || pendingOrderCurrency || orderCurrency;
+
+  logShopifyOrderCurrencyDiagnostics({
+    paymentCurrency: resolvedPaymentCurrency,
+    paymentAmount: paymentAmount ?? safeMoney(total),
+    pendingOrderCurrency: pendingOrderCurrency || null,
+    cartCurrency: cartCurrency || null,
+    shopCurrency,
+    orderCurrency,
+    orderPayloadCurrency: orderCurrency,
+  });
 
   const [firstName, ...rest] = safeString(name, 'NOOD Customer').split(' ');
   const lastName = rest.join(' ') || 'Customer';
@@ -3393,7 +3519,7 @@ async function createShopifyOrder({
       priceSet: {
         shopMoney: {
           amount: price,
-          currencyCode: SHOPIFY_CURRENCY,
+          currencyCode: orderCurrency,
         },
       },
     };
@@ -3424,6 +3550,7 @@ async function createShopifyOrder({
       inventoryBehaviour: 'DECREMENT_OBEYING_POLICY',
     },
     order: {
+      currency: orderCurrency,
       email: email || undefined,
       phone: phone || undefined,
       tags: ['NOOD App', paymentMethod],
@@ -3443,7 +3570,7 @@ async function createShopifyOrder({
           amountSet: {
             shopMoney: {
               amount: safeMoney(total),
-              currencyCode: SHOPIFY_CURRENCY,
+              currencyCode: orderCurrency,
             },
           },
         },
@@ -3465,8 +3592,28 @@ async function createShopifyOrder({
       quantity: item.quantity,
       variantId: item.variantId,
       amount: item.priceSet?.shopMoney?.amount || null,
+      currencyCode: item.priceSet?.shopMoney?.currencyCode || null,
     })),
     shippingAddress: normalizedShippingAddress,
+    paymentCurrency: resolvedPaymentCurrency,
+    pendingOrderCurrency: pendingOrderCurrency || null,
+    cartCurrency: cartCurrency || null,
+    shopCurrency,
+    orderCurrency,
+    orderPayloadCurrency: variables.order?.currency || null,
+    transactionCurrency:
+      variables.order?.transactions?.[0]?.amountSet?.shopMoney?.currencyCode || null,
+  });
+
+  console.log('[SHOPIFY ORDER PAYLOAD CURRENCY]', variables.order?.currency || 'n/a');
+  console.log('[ORDER CREATE] Shopify payload preview (non-secret)', {
+    currency: variables.order?.currency || null,
+    lineItemCurrencies: lineItems.map((item) => item.priceSet?.shopMoney?.currencyCode || null),
+    transactionAmount: variables.order?.transactions?.[0]?.amountSet?.shopMoney?.amount || null,
+    transactionCurrency:
+      variables.order?.transactions?.[0]?.amountSet?.shopMoney?.currencyCode || null,
+    shopCurrency,
+    orderCurrency,
   });
 
   let payload;
