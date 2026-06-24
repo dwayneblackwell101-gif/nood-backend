@@ -4,6 +4,7 @@ const VALID_STATUSES = new Set([
   'rejected',
   'refunded_to_wallet',
   'refunded_to_original',
+  'partially_refunded',
   'manual_refund_required',
   'failed',
   'cancelled',

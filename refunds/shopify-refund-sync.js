@@ -21,6 +21,7 @@ const REFUND_STATUS_TAGS = {
   rejected: 'refund-status-rejected',
   refunded_to_wallet: 'refund-status-refunded-to-wallet',
   refunded_to_original: 'refund-status-refunded-to-original',
+  partially_refunded: 'refund-status-partially-refunded',
   manual_refund_required: 'refund-status-manual-refund-required',
   failed: 'refund-status-failed',
   cancelled: 'refund-status-cancelled',
@@ -63,6 +64,8 @@ function getStatusLabel(status) {
       return 'Refunded to NOOD Wallet';
     case 'refunded_to_original':
       return 'Refunded to original payment';
+    case 'partially_refunded':
+      return 'Partially refunded';
     case 'manual_refund_required':
       return 'Manual refund required';
     case 'failed':

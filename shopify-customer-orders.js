@@ -59,6 +59,9 @@ const CUSTOMER_ORDERS_QUERY = `
               }
             }
           }
+          metafield(namespace: "nood", key: "refund_request") {
+            value
+          }
         }
       }
       pageInfo {
@@ -76,7 +79,10 @@ function safeString(value, fallback = '') {
 function mapFinancialStatus(status) {
   const normalized = safeString(status).toUpperCase();
 
-  if (normalized.includes('REFUND')) {
+  if (normalized === 'PARTIALLY_REFUNDED') {
+    return 'Partially refunded';
+  }
+  if (normalized === 'REFUNDED') {
     return 'Refunded';
   }
   if (normalized.includes('VOID') || normalized.includes('CANCEL')) {
@@ -108,6 +114,19 @@ function mapFulfillmentStatus(status, trackingNumber = '') {
   return status || 'Preparing shipment';
 }
 
+function parseRefundMetafield(rawValue) {
+  if (!rawValue) {
+    return null;
+  }
+
+  try {
+    const parsed = typeof rawValue === 'string' ? JSON.parse(rawValue) : rawValue;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function mapShopifyOrderNode(node) {
   const lineItems = (node?.lineItems?.edges || [])
     .map((edge) => edge?.node)
@@ -130,32 +149,67 @@ function mapShopifyOrderNode(node) {
     .find((entry) => safeString(entry?.number));
 
   const refunds = Array.isArray(node?.refunds) ? node.refunds : [];
-  const refundedAmount = refunds.reduce((sum, refund) => {
-    const amount = Number(refund?.totalRefundedSet?.shopMoney?.amount || 0);
+  const refundRecords = refunds.map((refund) => ({
+    createdAt: safeString(refund?.createdAt),
+    amount: Number(refund?.totalRefundedSet?.shopMoney?.amount || 0),
+    currency: safeString(refund?.totalRefundedSet?.shopMoney?.currencyCode, 'TTD'),
+  }));
+
+  const refundedAmount = refundRecords.reduce((sum, refund) => {
+    const amount = Number(refund?.amount || 0);
     return sum + (Number.isFinite(amount) ? amount : 0);
   }, 0);
 
-  const financialStatus = safeString(node?.displayFinancialStatus);
+  const displayFinancialStatus = safeString(node?.displayFinancialStatus);
+  const financialStatus = displayFinancialStatus;
   const fulfillmentStatus = safeString(node?.displayFulfillmentStatus);
   const trackingNumber = safeString(primaryTracking?.number);
   const cancelledAt = safeString(node?.cancelledAt);
+  const total = Number(node?.totalPriceSet?.shopMoney?.amount || 0);
+  const normalizedFinancialStatus = displayFinancialStatus.toUpperCase();
 
-  let status = mapFinancialStatus(financialStatus);
+  let status = mapFinancialStatus(displayFinancialStatus);
   if (cancelledAt) {
     status = 'Cancelled';
+  }
+
+  const shopifyRefundRequest = parseRefundMetafield(node?.metafield?.value);
+  const latestRefundDate = refundRecords
+    .map((entry) => safeString(entry.createdAt))
+    .filter(Boolean)
+    .sort()
+    .pop();
+
+  const isPartiallyRefunded =
+    normalizedFinancialStatus === 'PARTIALLY_REFUNDED' ||
+    (refundedAmount > 0 && total > 0 && refundedAmount < total);
+  const isFullyRefunded =
+    normalizedFinancialStatus === 'REFUNDED' || (total > 0 && refundedAmount >= total);
+
+  if (isPartiallyRefunded || isFullyRefunded) {
+    console.log('[SHOPIFY REFUND DETECTED]', {
+      orderName: safeString(node?.name),
+      displayFinancialStatus,
+      refundedAmount,
+      total,
+      isPartiallyRefunded,
+      isFullyRefunded,
+      latestRefundDate,
+    });
   }
 
   return {
     id: safeString(node?.name) || safeString(node?.id),
     date: safeString(node?.createdAt) || new Date().toISOString(),
-    total: Number(node?.totalPriceSet?.shopMoney?.amount || 0),
+    total,
     currency: safeString(node?.totalPriceSet?.shopMoney?.currencyCode, 'TTD'),
     status,
     paymentMethod: 'Shopify',
     shopifyOrderId: safeString(node?.id),
     shopifyOrderName: safeString(node?.name),
-    refunded: status === 'Refunded' || refundedAmount > 0,
+    refunded: isFullyRefunded || isPartiallyRefunded || refundedAmount > 0,
     financialStatus,
+    displayFinancialStatus,
     fulfillmentStatus: mapFulfillmentStatus(fulfillmentStatus, trackingNumber),
     trackingNumber,
     trackingUrl: safeString(primaryTracking?.url),
@@ -163,6 +217,10 @@ function mapShopifyOrderNode(node) {
     cancelledAt: cancelledAt || undefined,
     cancelReason: safeString(node?.cancelReason) || undefined,
     refundedAmount,
+    refundRecords,
+    shopifyRefundRequest: shopifyRefundRequest || undefined,
+    refundProcessedAt: latestRefundDate || undefined,
+    refundMethodLabel: shopifyRefundRequest?.refund_destination_label || undefined,
     fulfillments,
     items: lineItems,
     source: 'shopify',
