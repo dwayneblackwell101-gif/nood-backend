@@ -40,7 +40,7 @@ services:
       - key: PAYPAL_ENV
         sync: false
       - key: WIPAY_ACCOUNT_NUMBER
-        sync: false
+        value: "3815671283"
       - key: WIPAY_API_KEY
         sync: false
       - key: WIPAY_ENVIRONMENT

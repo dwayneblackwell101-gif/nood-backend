@@ -45,7 +45,11 @@ const SHOPIFY_CURRENCY = safeString(process.env.SHOPIFY_CURRENCY, 'TTD').toUpper
 const PAYPAL_USD_TO_TTD_RATE = Number(process.env.PAYPAL_USD_TO_TTD_RATE || 6.8);
 const BACKEND_BASE_URL = getBackendBaseUrl();
 
-const WIPAY_ACCOUNT_NUMBER = process.env.WIPAY_ACCOUNT_NUMBER;
+function normalizeWiPayAccountNumber(rawValue) {
+  return String(rawValue || '').replace(/\D/g, '');
+}
+
+const WIPAY_ACCOUNT_NUMBER = normalizeWiPayAccountNumber(process.env.WIPAY_ACCOUNT_NUMBER);
 const WIPAY_API_KEY = safeString(process.env.WIPAY_API_KEY);
 const WIPAY_ENVIRONMENT = process.env.WIPAY_ENVIRONMENT || 'sandbox';
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
@@ -1676,6 +1680,7 @@ app.get('/health', (req, res) => {
     port: PORT,
     redis_configured: Boolean(safeString(process.env.REDIS_URL)),
     has_wipay_account: Boolean(WIPAY_ACCOUNT_NUMBER),
+    wipay_account_suffix: WIPAY_ACCOUNT_NUMBER ? WIPAY_ACCOUNT_NUMBER.slice(-4) : null,
     has_shopify_domain: Boolean(SHOPIFY_STORE_DOMAIN),
     has_shopify_token: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
     has_shopify_order_admin_token: hasShopifyOrderAdminAccessToken(),
@@ -3442,6 +3447,10 @@ async function startServer() {
     console.log('[NOOD backend] Loopback: ' + loopbackUrl);
     console.log('[NOOD backend] Network:  ' + networkUrl);
     console.log('[NOOD backend] Base URL: ' + BACKEND_BASE_URL);
+    console.log(
+      '[NOOD backend] WiPay account configured suffix=' +
+        (WIPAY_ACCOUNT_NUMBER ? WIPAY_ACCOUNT_NUMBER.slice(-4) : 'missing')
+    );
   });
 }
 
