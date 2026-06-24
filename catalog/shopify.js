@@ -70,8 +70,9 @@ function getShopifyConfig() {
 
 async function adminGraphql(query, variables = {}, options = {}) {
   const config = getShopifyConfig();
-  if (!config.storeDomain || !config.adminToken) {
-    throw new Error('Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN.');
+  const adminToken = safeString(options.accessToken) || config.adminToken;
+  if (!config.storeDomain || !adminToken) {
+    throw new Error('Missing SHOPIFY_STORE_DOMAIN or Shopify Admin API access token.');
   }
 
   const maxAttempts = Number(options.maxAttempts || DEFAULT_MAX_GRAPHQL_ATTEMPTS);
@@ -96,7 +97,7 @@ async function adminGraphql(query, variables = {}, options = {}) {
         { query, variables },
         {
           headers: {
-            'X-Shopify-Access-Token': config.adminToken,
+            'X-Shopify-Access-Token': adminToken,
             'Content-Type': 'application/json',
           },
           timeout: 60000,

@@ -15,6 +15,15 @@ const {
   capturePayPalOrder,
 } = require('./paypal');
 const { mountCatalog, getCatalogReadiness, getCatalogCache } = require('./catalog');
+const { adminGraphql } = require('./catalog/shopify');
+const { createDiscountsHandler } = require('./catalog/discounts');
+const {
+  getShopifyOrderAccessToken,
+  hasShopifyOrderAdminAccessToken,
+  getShopifyOrderTokenSource,
+  validateShopifyOrderCreateAccess,
+  assertShopifyOrderCreateAccess,
+} = require('./shopify-order-access');
 const app = express();
 const storage = createStorage();
 const pendingOrders = storage.pendingOrders.items;
@@ -42,17 +51,33 @@ const WIPAY_ENVIRONMENT = process.env.WIPAY_ENVIRONMENT || 'sandbox';
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 const SHOPIFY_ADMIN_API_VERSION = safeString(process.env.SHOPIFY_ADMIN_API_VERSION, '2025-10');
+let shopifyOrderAccessState = {
+  ok: false,
+  message: 'Shopify order access has not been validated yet.',
+  scopes: [],
+  tokenSource: getShopifyOrderTokenSource(),
+  missingOrderScopes: ['write_orders'],
+  hasShopifyOrderAdminAccessToken: hasShopifyOrderAdminAccessToken(),
+};
 function trimValue(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function getConfiguredAdminApiKey() {
+function getConfiguredAdminApiKeys() {
+  const keys = [];
   const adminKey = trimValue(process.env.ADMIN_API_KEY);
   const noodKey = trimValue(process.env.NOOD_ADMIN_API_KEY);
-  return adminKey || noodKey;
+
+  if (adminKey) keys.push(adminKey);
+  if (noodKey && noodKey !== adminKey) keys.push(noodKey);
+
+  return keys;
 }
 
-const ADMIN_API_KEY = getConfiguredAdminApiKey();
+function getConfiguredAdminApiKey() {
+  const keys = getConfiguredAdminApiKeys();
+  return keys[0] || '';
+}
 
 assertProductionConfig();
 
@@ -183,20 +208,31 @@ function getCorsOrigin() {
 }
 
 function getProvidedAdminApiKey(req) {
-  const headerKey = req.get('x-admin-api-key') || req.headers['x-admin-api-key'];
-  return trimValue(headerKey);
+  const headerCandidates = [
+    req.get('x-nood-admin-api-key'),
+    req.headers['x-nood-admin-api-key'],
+    req.get('x-admin-key'),
+    req.headers['x-admin-key'],
+    req.get('x-admin-api-key'),
+    req.headers['x-admin-api-key'],
+  ];
+
+  for (const value of headerCandidates) {
+    const trimmed = trimValue(value);
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+
+  return '';
 }
 
 function requireAdminApiKey(req, res, next) {
-  const configuredKey = getConfiguredAdminApiKey();
+  const configuredKeys = getConfiguredAdminApiKeys();
   const providedKey = getProvidedAdminApiKey(req);
-  const configured = configuredKey.length > 0;
+  const configured = configuredKeys.length > 0;
   const headerProvided = providedKey.length > 0;
-  const match = configured && headerProvided && providedKey === configuredKey;
-
-  console.log(
-    `[NOOD admin] configured=${configured} headerProvided=${headerProvided} match=${match}`
-  );
+  const match = configured && headerProvided && configuredKeys.includes(providedKey);
 
   if (!configured) {
     return res.status(503).json({
@@ -211,6 +247,7 @@ function requireAdminApiKey(req, res, next) {
       success: false,
       error: true,
       message: 'Admin API key required',
+      hint: 'Send x-nood-admin-api-key or x-admin-key (or legacy x-admin-api-key).',
     });
   }
 
@@ -259,23 +296,18 @@ function normalizeShopifyVariantGid(rawVariantId) {
   return variantId ? `gid://shopify/ProductVariant/${variantId}` : '';
 }
 
-function getRequestTotal(body = {}) {
-  const directAmount =
-    body.total ??
-    body.amount ??
-    body?.purchase_units?.[0]?.amount?.value;
-
-  if (directAmount !== undefined && directAmount !== null && directAmount !== '') {
-    return safeMoney(directAmount);
-  }
-
-  const items = Array.isArray(body.cartItems)
+function getCartItemsFromBody(body = {}) {
+  return Array.isArray(body.cartItems)
     ? body.cartItems
     : Array.isArray(body.cart)
       ? body.cart
       : Array.isArray(body.items)
         ? body.items
         : [];
+}
+
+function getCartComputedTotal(body = {}) {
+  const items = getCartItemsFromBody(body);
 
   const total = items.reduce((sum, item) => {
     const quantity = Number(item?.quantity || 1);
@@ -293,6 +325,85 @@ function getRequestTotal(body = {}) {
   }, 0);
 
   return safeMoney(total);
+}
+
+function getRequestTotal(body = {}) {
+  const directAmount =
+    body.total ??
+    body.amount ??
+    body?.purchase_units?.[0]?.amount?.value;
+
+  if (directAmount !== undefined && directAmount !== null && directAmount !== '') {
+    return safeMoney(directAmount);
+  }
+
+  return getCartComputedTotal(body);
+}
+
+function assertCheckoutTotalMatches(body = {}) {
+  const computed = getCartComputedTotal(body);
+  const hasStatedTotal =
+    body.total !== undefined && body.total !== null && body.total !== '';
+
+  if (hasStatedTotal) {
+    const stated = safeMoney(body.total);
+    if (stated !== computed) {
+      const error = new Error(
+        `Checkout total mismatch. Cart totals ${computed} but request sent ${stated}.`
+      );
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+
+  if (!isValidPositiveMoney(computed)) {
+    const error = new Error('Invalid checkout total. Minimum is 1.00.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return computed;
+}
+
+function resolveCheckoutSessionId(body = {}) {
+  return safeString(
+    body.checkoutSessionId ||
+      body.clientOrderId ||
+      body.localOrderId ||
+      body.pendingCheckoutId
+  );
+}
+
+function findPendingByCheckoutSessionId(checkoutSessionId) {
+  const sessionId = safeString(checkoutSessionId);
+  if (!sessionId) return null;
+
+  for (const [orderId, pending] of pendingOrders.entries()) {
+    if (
+      safeString(pending?.checkoutSessionId) === sessionId ||
+      safeString(pending?.clientOrderId) === sessionId ||
+      safeString(pending?.localOrderId) === sessionId
+    ) {
+      return { orderId, pending };
+    }
+  }
+
+  return null;
+}
+
+function findWalletCheckoutPaymentRecord(checkoutSessionId) {
+  const sessionId = safeString(checkoutSessionId);
+  if (!sessionId) return null;
+
+  return (
+    Array.from(paymentRecords.values()).find((record) => {
+      return (
+        safeString(record?.provider).toLowerCase() === 'wallet' &&
+        (safeString(record?.orderId) === sessionId ||
+          safeString(record?.clientOrderId) === sessionId)
+      );
+    }) || null
+  );
 }
 
 function validateCheckoutData({
@@ -419,6 +530,20 @@ function sendPaymentResult(req, res, params = {}) {
     safeString(req.query.format).toLowerCase() === 'json' ||
     safeString(req.get('accept')).includes('application/json');
 
+  console.log('[PAYMENT RESULT REDIRECT]', {
+    status: params.status,
+    type: params.type || null,
+    method: params.method || null,
+    order_id: params.order_id || null,
+    transaction_id: params.transaction_id || null,
+    shopify_order_id: params.shopify_order_id || null,
+    shopify_order_name: params.shopify_order_name || null,
+    reason: params.reason || null,
+    recovery_id: params.recovery_id || null,
+    wantsJson,
+    redirect_url: redirectUrl,
+  });
+
   if (wantsJson) {
     return res.json({
       success: params.status === 'success',
@@ -544,6 +669,37 @@ function toMoneyNumber(value) {
 function convertUsdToTtd(usdAmount) {
   assertPayPalCurrency();
   return safeMoney(Number(usdAmount) * PAYPAL_USD_TO_TTD_RATE);
+}
+
+function convertTtdToUsd(ttdAmount) {
+  assertPayPalCurrency();
+  return safeMoney(Number(ttdAmount) / PAYPAL_USD_TO_TTD_RATE);
+}
+
+function getPayPalCheckoutAmountsFromTtd(body = {}) {
+  assertPayPalCurrency();
+  const shopifyTotalTtd = assertCheckoutTotalMatches(body);
+
+  if (!isValidPositiveMoney(shopifyTotalTtd)) {
+    const error = new Error('Invalid Shopify checkout total. Minimum is 1.00 TTD.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const paypalTotalUsd = convertTtdToUsd(shopifyTotalTtd);
+  if (!isValidPositiveMoney(paypalTotalUsd)) {
+    const error = new Error('Invalid PayPal USD total after conversion.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return {
+    shopifyTotalTtd,
+    paypalTotalUsd,
+    paypalCurrency: PAYPAL_CURRENCY,
+    shopifyCurrency: SHOPIFY_CURRENCY,
+    exchangeRate: PAYPAL_USD_TO_TTD_RATE,
+  };
 }
 
 function getPayPalAmounts(body = {}) {
@@ -763,10 +919,12 @@ function verifyWiPayReturn({ query, pending }) {
     };
   }
 
-  console.log('[NOOD order] WiPay payment verified', {
+  console.log('[WIPAY SUCCESS]', {
     transactionId,
     amount: expectedAmount,
     currency: 'TTD',
+    status: rawStatus,
+    orderId: returnedOrderId || pending?.orderId || null,
   });
 
   return {
@@ -828,6 +986,201 @@ function findWalletTransactionByProviderOrderId(provider, orderId) {
   return Array.from(walletTransactions.values()).find(
     (tx) => tx?.provider === provider && safeString(tx?.orderId) === safeString(orderId)
   );
+}
+
+function debitWalletForCheckout({ customerId, amount, checkoutSessionId, transactionId }) {
+  const normalizedCustomerId = safeString(customerId);
+  const walletTransactionId = `wallet_checkout_${safeString(checkoutSessionId, transactionId)}`;
+  const existing = walletTransactions.get(walletTransactionId);
+
+  if (existing) {
+    if (existing.status === 'rolled_back') {
+      const error = new Error(
+        'Previous wallet checkout attempt was rolled back. Start a new checkout session.'
+      );
+      error.statusCode = 409;
+      throw error;
+    }
+
+    return existing;
+  }
+
+  const balance = Number(getConfirmedWalletBalance(normalizedCustomerId));
+  const debitAmount = Number(safeMoney(amount));
+
+  if (!Number.isFinite(debitAmount) || debitAmount <= 0) {
+    const error = new Error('Invalid wallet debit amount.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (balance < debitAmount) {
+    const error = new Error('Insufficient wallet balance.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const record = {
+    walletTransactionId,
+    provider: 'wallet',
+    transactionId: safeString(transactionId, walletTransactionId),
+    orderId: safeString(checkoutSessionId),
+    customerId: normalizedCustomerId,
+    amount: safeMoney(-debitAmount),
+    currency: SHOPIFY_CURRENCY,
+    status: 'confirmed',
+    type: 'checkout_debit',
+    createdAt: new Date().toISOString(),
+  };
+
+  walletTransactions.set(walletTransactionId, record);
+  persistWalletTransactions();
+  return record;
+}
+
+function rollbackWalletDebit(walletTransactionId) {
+  const record = walletTransactions.get(walletTransactionId);
+  if (!record || record.status === 'rolled_back') {
+    return;
+  }
+
+  const rollbackId = `${walletTransactionId}_rollback`;
+  if (!walletTransactions.has(rollbackId)) {
+    walletTransactions.set(rollbackId, {
+      walletTransactionId: rollbackId,
+      provider: 'wallet',
+      transactionId: record.transactionId,
+      orderId: record.orderId,
+      customerId: record.customerId,
+      amount: safeMoney(Math.abs(Number(record.amount))),
+      currency: record.currency || SHOPIFY_CURRENCY,
+      status: 'confirmed',
+      type: 'checkout_rollback',
+      relatedTransactionId: walletTransactionId,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  walletTransactions.set(walletTransactionId, {
+    ...record,
+    status: 'rolled_back',
+  });
+  persistWalletTransactions();
+}
+
+async function handleWalletCheckout(req, res) {
+  try {
+    const checkoutSessionId = resolveCheckoutSessionId(req.body);
+    const cartItems = getCartItemsFromBody(req.body);
+    const total = assertCheckoutTotalMatches(req.body);
+    const shippingAddress = req.body?.shippingAddress || {};
+    const customerName = safeString(
+      req.body?.name || shippingAddress?.fullName || shippingAddress?.name
+    );
+    const customerEmail = safeString(req.body?.email || shippingAddress?.email);
+    const customerPhone = safeString(req.body?.phone || shippingAddress?.phone, '');
+    const customerId = safeString(req.body?.customerId || customerEmail || customerPhone);
+
+    const validationErrors = validateCheckoutData({
+      total,
+      cartItems,
+      name: customerName,
+      email: customerEmail,
+      phone: customerPhone,
+      shippingAddress,
+      requireEmail: true,
+    });
+
+    if (validationErrors.length) {
+      return res.status(400).json({
+        success: false,
+        error: true,
+        message: validationErrors[0],
+        validationErrors,
+      });
+    }
+
+    if (checkoutSessionId) {
+      const existingPayment = findWalletCheckoutPaymentRecord(checkoutSessionId);
+      if (existingPayment?.status === 'shopify_created' && existingPayment.shopifyOrder) {
+        return res.json({
+          success: true,
+          idempotent: true,
+          transaction_id: existingPayment.transactionId,
+          shopify_order_id: existingPayment.shopifyOrder?.id || '',
+          shopify_order_name: existingPayment.shopifyOrder?.name || '',
+          wallet_balance: getConfirmedWalletBalance(customerId),
+          shopifyOrder: existingPayment.shopifyOrder,
+        });
+      }
+    }
+
+    const walletDebitId = `wallet_${safeString(checkoutSessionId, Date.now())}`;
+    let debitRecord = null;
+
+    try {
+      debitRecord = debitWalletForCheckout({
+        customerId,
+        amount: total,
+        checkoutSessionId,
+        transactionId: walletDebitId,
+      });
+
+      const shopifyOrder = await createShopifyOrder({
+        email: customerEmail,
+        phone: customerPhone,
+        name: customerName,
+        total,
+        cartItems,
+        shippingAddress,
+        paymentTransactionId: walletDebitId,
+        paymentMethod: safeString(req.body?.paymentMethod, 'NOOD Wallet'),
+        clientOrderId: checkoutSessionId || walletDebitId,
+      });
+
+      savePaymentRecord({
+        provider: 'wallet',
+        transactionId: walletDebitId,
+        orderId: checkoutSessionId || walletDebitId,
+        clientOrderId: checkoutSessionId || walletDebitId,
+        status: 'shopify_created',
+        shopifyOrder,
+        amount: total,
+        currency: SHOPIFY_CURRENCY,
+      });
+
+      return res.json({
+        success: true,
+        transaction_id: walletDebitId,
+        shopify_order_id: shopifyOrder?.id || '',
+        shopify_order_name: shopifyOrder?.name || '',
+        wallet_balance: getConfirmedWalletBalance(customerId),
+        shopifyOrder,
+      });
+    } catch (shopifyError) {
+      if (debitRecord?.walletTransactionId) {
+        rollbackWalletDebit(debitRecord.walletTransactionId);
+      }
+
+      const shopifyErrorDetails = getShopifyErrorDetails(shopifyError);
+      console.error('[NOOD wallet] checkout failed; wallet debit rolled back', shopifyErrorDetails);
+
+      return res.status(shopifyError.statusCode || shopifyError.response?.status || 500).json({
+        success: false,
+        error: true,
+        message: shopifyError.message || 'Shopify order create failed. Wallet was not charged.',
+        shopifyError: shopifyErrorDetails,
+      });
+    }
+  } catch (error) {
+    console.error('[NOOD wallet] checkout error:', error.message || error);
+
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      error: true,
+      message: error.message || 'Wallet checkout failed.',
+    });
+  }
 }
 
 function validateWalletCustomer({ name, email, phone, customerId }) {
@@ -1150,6 +1503,15 @@ async function createShopifyOrderFromPaidPayment(paymentData) {
   }
 
   try {
+    console.log('[ORDER CREATE START]', {
+      method: normalizedMethod,
+      orderId,
+      transactionId,
+      lineItemCount: Array.isArray(pending?.cartItems) ? pending.cartItems.length : 0,
+      total: pending?.total || pending?.amount || null,
+      tokenSource: shopifyOrderAccessState.tokenSource,
+    });
+
     const shopifyOrder = await createShopifyOrder({
       email: pending.email,
       phone: pending.phone,
@@ -1160,6 +1522,14 @@ async function createShopifyOrderFromPaidPayment(paymentData) {
       paymentTransactionId: transactionId,
       paymentMethod: normalizedMethod === 'paypal' ? 'PayPal' : 'WiPay',
       clientOrderId: pending?.clientOrderId || pending?.localOrderId || orderId,
+    });
+
+    console.log('[ORDER CREATE SUCCESS]', {
+      method: normalizedMethod,
+      orderId,
+      transactionId,
+      shopify_order_id: shopifyOrder?.id || null,
+      shopify_order_name: shopifyOrder?.name || null,
     });
 
     savePaymentRecord({
@@ -1181,10 +1551,15 @@ async function createShopifyOrderFromPaidPayment(paymentData) {
     };
   } catch (shopifyError) {
     const shopifyErrorDetails = getShopifyErrorDetails(shopifyError);
-    console.error(
-      `[NOOD order] Shopify order create failed after ${normalizedMethod} payment`,
-      shopifyErrorDetails
-    );
+    console.error('[ORDER CREATE FAILED]', {
+      method: normalizedMethod,
+      orderId,
+      transactionId,
+      tokenSource: shopifyOrderAccessState.tokenSource,
+      scopes: shopifyOrderAccessState.scopes,
+      missingOrderScopes: shopifyOrderAccessState.missingOrderScopes,
+      shopifyError: shopifyErrorDetails,
+    });
 
     const recovery = saveFailedPaidOrder({
       provider: normalizedMethod,
@@ -1302,8 +1677,19 @@ app.get('/health', (req, res) => {
     has_wipay_account: Boolean(WIPAY_ACCOUNT_NUMBER),
     has_shopify_domain: Boolean(SHOPIFY_STORE_DOMAIN),
     has_shopify_token: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
+    has_shopify_order_admin_token: hasShopifyOrderAdminAccessToken(),
+    shopify_order_admin_token_env: 'SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN',
+    shopify_order_create_ready: shopifyOrderAccessState.ok,
+    missing_order_scopes: shopifyOrderAccessState.missingOrderScopes || [],
+    shopify_order_token_source: shopifyOrderAccessState.tokenSource,
+    shopify_order_access_scopes: shopifyOrderAccessState.scopes,
+    shopify_order_access_message: shopifyOrderAccessState.message,
   });
 });
+
+app.get('/api/discounts', createDiscountsHandler());
+app.get('/discounts', createDiscountsHandler());
+app.get('/shopify/discounts', createDiscountsHandler());
 
 app.get('/ready', async (req, res) => {
   try {
@@ -1331,22 +1717,10 @@ app.post('/api/orders', async (req, res) => {
       });
     }
 
-    const payPalAmounts = getPayPalAmounts(req.body);
+    const checkoutSessionId = resolveCheckoutSessionId(req.body);
+    const payPalAmounts = getPayPalCheckoutAmountsFromTtd(req.body);
     const total = payPalAmounts.shopifyTotalTtd;
-    const cartItems = Array.isArray(req.body?.cartItems)
-      ? req.body.cartItems
-      : Array.isArray(req.body?.cart)
-        ? req.body.cart
-        : Array.isArray(req.body?.items)
-          ? req.body.items
-          : [];
-
-    if (!isValidPositiveMoney(total)) {
-      return res.status(400).json({
-        error: true,
-        message: 'Invalid converted Shopify total. Minimum is 1.00 TTD.',
-      });
-    }
+    const cartItems = getCartItemsFromBody(req.body);
 
     if (!cartItems.length) {
       return res.status(400).json({
@@ -1355,7 +1729,22 @@ app.post('/api/orders', async (req, res) => {
       });
     }
 
-    const orderId = safeString(req.body?.order_id || req.body?.reference_id, `paypal_${Date.now()}`);
+    if (checkoutSessionId) {
+      const existingPending = findPendingByCheckoutSessionId(checkoutSessionId);
+      if (existingPending?.pending?.paypalOrderId) {
+        return res.status(201).json({
+          id: existingPending.pending.paypalOrderId,
+          status: 'CREATED',
+          idempotent: true,
+          links: [],
+        });
+      }
+    }
+
+    const orderId = safeString(
+      req.body?.order_id || req.body?.reference_id || checkoutSessionId,
+      `paypal_${Date.now()}`
+    );
     const shippingAddress = req.body?.shippingAddress || {};
     const customerName = safeString(
       req.body?.name || shippingAddress?.fullName || shippingAddress?.name
@@ -1370,7 +1759,7 @@ app.post('/api/orders', async (req, res) => {
       email: customerEmail,
       phone: customerPhone,
       shippingAddress,
-      requireEmail: false,
+      requireEmail: true,
     });
 
     if (validationErrors.length) {
@@ -1405,9 +1794,10 @@ app.post('/api/orders', async (req, res) => {
       type: 'checkout',
       provider: 'paypal',
       orderId: order.id,
-      clientOrderId: orderId,
-      localOrderId: safeString(req.body?.localOrderId || req.body?.pendingCheckoutId || orderId),
-      pendingCheckoutId: safeString(req.body?.pendingCheckoutId || req.body?.localOrderId || orderId),
+      clientOrderId: checkoutSessionId || orderId,
+      localOrderId: safeString(req.body?.localOrderId || req.body?.pendingCheckoutId || checkoutSessionId || orderId),
+      pendingCheckoutId: safeString(req.body?.pendingCheckoutId || req.body?.localOrderId || checkoutSessionId || orderId),
+      checkoutSessionId: checkoutSessionId || orderId,
       paypalOrderId: order.id,
       total,
       currency: payPalAmounts.shopifyCurrency,
@@ -1605,7 +1995,7 @@ app.post('/api/shopify/orders', async (req, res) => {
       email: customerEmail,
       phone: customerPhone,
       shippingAddress,
-      requireEmail: false,
+      requireEmail: true,
     });
 
     if (validationErrors.length) {
@@ -1818,7 +2208,9 @@ app.post('/api/failed-paid-orders/:recoveryId/retry', requireAdminApiKey, async 
 
 app.post('/create-wipay-payment', async (req, res) => {
   try {
-    const { total, name, email, phone, cartItems = [], shippingAddress = {}, localOrderId = '', pendingCheckoutId = '' } = req.body;
+    const { name, email, phone, shippingAddress = {} } = req.body;
+    const cartItems = getCartItemsFromBody(req.body);
+    const checkoutSessionId = resolveCheckoutSessionId(req.body);
 
     if (!WIPAY_ACCOUNT_NUMBER) {
       return res.status(500).json({
@@ -1834,14 +2226,19 @@ app.post('/create-wipay-payment', async (req, res) => {
       });
     }
 
+    const parsedTotal = assertCheckoutTotalMatches(req.body);
+    const customerName = safeString(name);
+    const customerEmail = safeString(email);
+    const customerPhone = safeString(phone);
+
     const validationErrors = validateCheckoutData({
-      total,
+      total: parsedTotal,
       cartItems,
-      name,
-      email,
-      phone,
+      name: customerName,
+      email: customerEmail,
+      phone: customerPhone,
       shippingAddress,
-      requireEmail: false,
+      requireEmail: true,
     });
 
     if (validationErrors.length) {
@@ -1853,13 +2250,27 @@ app.post('/create-wipay-payment', async (req, res) => {
       });
     }
 
-    const parsedTotal = safeMoney(total);
-    const customerName = safeString(name);
-    const customerEmail = safeString(email);
-    const customerPhone = safeString(phone);
+    if (checkoutSessionId) {
+      const existingPending = findPendingByCheckoutSessionId(checkoutSessionId);
+      if (existingPending?.pending?.paymentUrl) {
+        const existingReturnUrl = `${BACKEND_BASE_URL}/payment-return?order_id=${encodeURIComponent(existingPending.orderId)}&return_token=${encodeURIComponent(existingPending.pending.returnToken || '')}&status=success&transaction_id=${encodeURIComponent(existingPending.pending.wipayTransactionId || '')}&nood_webview_success=1&return_json=1`;
 
-    const orderId = safeString(req.body?.order_id || req.body?.backendOrderId, `order_${Date.now()}`);
-    const clientOrderId = safeString(localOrderId || pendingCheckoutId || orderId);
+        return res.json({
+          success: true,
+          idempotent: true,
+          url: existingPending.pending.paymentUrl,
+          payment_url: existingPending.pending.paymentUrl,
+          return_url: existingReturnUrl,
+          order_id: existingPending.orderId,
+        });
+      }
+    }
+
+    const orderId = safeString(
+      req.body?.order_id || req.body?.backendOrderId || checkoutSessionId,
+      `order_${Date.now()}`
+    );
+    const clientOrderId = safeString(checkoutSessionId || req.body?.localOrderId || req.body?.pendingCheckoutId || orderId);
 
     const returnToken = generateReturnToken();
 
@@ -1876,9 +2287,10 @@ app.post('/create-wipay-payment', async (req, res) => {
       clientOrderId,
       localOrderId: clientOrderId,
       pendingCheckoutId: clientOrderId,
+      checkoutSessionId: checkoutSessionId || clientOrderId,
       returnToken,
       total: parsedTotal,
-      currency: 'TTD',
+      currency: SHOPIFY_CURRENCY,
       name: customerName,
       email: customerEmail,
       phone: customerPhone,
@@ -1934,6 +2346,12 @@ app.post('/create-wipay-payment', async (req, res) => {
 
     const wipayTransactionId = response.data?.transaction_id || response.data?.transactionId || null;
     const appFallbackReturnUrl = `${responseUrl}&status=success&transaction_id=${encodeURIComponent(wipayTransactionId || '')}&nood_webview_success=1&return_json=1`;
+    const pendingRecord = pendingOrders.get(orderId) || {};
+    setPendingOrder(orderId, {
+      ...pendingRecord,
+      paymentUrl: safeString(paymentUrl),
+      wipayTransactionId,
+    });
 
     return res.json({
       success: true,
@@ -1943,6 +2361,7 @@ app.post('/create-wipay-payment', async (req, res) => {
       message: response.data?.message || 'OK',
       transaction_id: wipayTransactionId,
       order_id: orderId,
+      checkoutSessionId: checkoutSessionId || clientOrderId,
     });
   } catch (error) {
     const errorData = error.response?.data || error.message;
@@ -1961,7 +2380,7 @@ app.post('/create-wipay-payment', async (req, res) => {
 
 app.post('/create-paypal-payment', async (req, res) => {
   try {
-    const { total, name, email, phone, cartItems = [], shippingAddress = {}, localOrderId = '', pendingCheckoutId = '' } = req.body;
+    const { name, email, phone, shippingAddress = {} } = req.body;
 
     if (!hasPayPalCredentials()) {
       return res.status(500).json({
@@ -1970,14 +2389,18 @@ app.post('/create-paypal-payment', async (req, res) => {
       });
     }
 
+    const cartItems = getCartItemsFromBody(req.body);
+    const checkoutSessionId = resolveCheckoutSessionId(req.body);
+    const parsedTotal = assertCheckoutTotalMatches(req.body);
+
     const validationErrors = validateCheckoutData({
-      total,
+      total: parsedTotal,
       cartItems,
       name,
       email,
       phone,
       shippingAddress,
-      requireEmail: false,
+      requireEmail: true,
     });
 
     if (validationErrors.length) {
@@ -1989,21 +2412,37 @@ app.post('/create-paypal-payment', async (req, res) => {
       });
     }
 
-    const payPalAmounts = getPayPalAmounts({
+    const payPalAmounts = getPayPalCheckoutAmountsFromTtd({
       ...req.body,
-      total,
-      currency: req.body?.currency || req.body?.paypalCurrency,
+      total: parsedTotal,
+      currency: SHOPIFY_CURRENCY,
     });
-    const parsedTotal = payPalAmounts.shopifyTotalTtd;
     const customerName = safeString(name);
     const customerEmail = safeString(email);
     const customerPhone = safeString(phone);
-    const orderId = `paypal_${Date.now()}`;
+    if (checkoutSessionId) {
+      const existingPending = findPendingByCheckoutSessionId(checkoutSessionId);
+      if (existingPending?.pending?.returnToken) {
+        const checkoutUrl = `${BACKEND_BASE_URL}/paypal-checkout?order_id=${encodeURIComponent(existingPending.orderId)}&return_token=${encodeURIComponent(existingPending.pending.returnToken)}`;
+
+        return res.json({
+          success: true,
+          idempotent: true,
+          url: checkoutUrl,
+          payment_url: checkoutUrl,
+          order_id: existingPending.orderId,
+        });
+      }
+    }
+
+    const orderId = safeString(checkoutSessionId, `paypal_${Date.now()}`);
     const returnToken = generateReturnToken();
 
     setPendingOrder(orderId, {
       type: 'paypal_checkout',
       orderId,
+      clientOrderId: checkoutSessionId || orderId,
+      checkoutSessionId: checkoutSessionId || orderId,
       returnToken,
       total: parsedTotal,
       currency: payPalAmounts.shopifyCurrency,
@@ -2456,6 +2895,27 @@ const createWalletTopup = async (req, res) => {
 
 app.post('/create-wallet-topup', createWalletTopup);
 
+app.get('/api/wallet/balance', (req, res) => {
+  const customerId = safeString(req.query.customerId || req.query.email || req.query.customer_id);
+
+  if (!customerId) {
+    return res.status(400).json({
+      success: false,
+      error: true,
+      message: 'customerId is required.',
+    });
+  }
+
+  return res.json({
+    success: true,
+    customerId,
+    balance: getConfirmedWalletBalance(customerId),
+    currency: SHOPIFY_CURRENCY,
+  });
+});
+
+app.post('/api/wallet/checkout', handleWalletCheckout);
+
 app.post('/api/wallet/paypal/orders', createPayPalWalletTopup);
 app.post('/api/wallet/paypal/orders/:orderID/capture', capturePayPalWalletTopup);
 app.post('/wallet/topup/paypal/:orderID/capture', capturePayPalWalletTopup);
@@ -2600,6 +3060,14 @@ app.get('/payment-return', async (req, res) => {
     const transactionId = getReturnTransactionId(req.query);
     const returnToken = getReturnToken(req.query);
 
+    console.log('[WIPAY SUCCESS] payment-return callback received', {
+      rawStatus,
+      orderId,
+      transactionId,
+      hasReturnToken: Boolean(returnToken),
+      query: getSafeWiPayReturnLog(req.query),
+    });
+
     const isSuccess =
       rawStatus === 'success' ||
       rawStatus === 'approved' ||
@@ -2708,12 +3176,22 @@ app.get('/payment-return', async (req, res) => {
     });
 
     if (!shopifyResult.success) {
+      console.error('[ORDER CREATE FAILED] payment-return could not create Shopify order', {
+        orderId,
+        transactionId,
+        reason: 'shopify_order_create_failed',
+        recoveryId: shopifyResult.recovery?.recoveryId || '',
+        shopifyError: shopifyResult.shopifyError || null,
+      });
+
       return sendPaymentResult(req, res, {
           status: 'payment_received_order_review',
           type: 'checkout',
           order_id: orderId,
           transaction_id: transactionId,
-          reason: 'shopify_order_create_failed',
+          reason: shopifyResult.shopifyError?.shopifyDetails?.firstGraphQLError
+            ? 'shopify_order_create_failed'
+            : shopifyResult.shopifyError?.message || 'shopify_order_create_failed',
           recovery_id: shopifyResult.recovery?.recoveryId || '',
           amount: pending.total,
           method: 'wipay',
@@ -2721,6 +3199,13 @@ app.get('/payment-return', async (req, res) => {
     }
 
     const shopifyOrder = shopifyResult.shopifyOrder;
+
+    console.log('[ORDER CREATE SUCCESS] payment-return fulfilled checkout', {
+      orderId,
+      transactionId,
+      shopify_order_id: shopifyOrder?.id || null,
+      shopify_order_name: shopifyOrder?.name || null,
+    });
 
     removePendingOrder(orderId);
 
@@ -2760,9 +3245,14 @@ async function createShopifyOrder({
     throw new Error('Missing SHOPIFY_STORE_DOMAIN in .env');
   }
 
-  if (!SHOPIFY_ADMIN_ACCESS_TOKEN) {
-    throw new Error('Missing SHOPIFY_ADMIN_ACCESS_TOKEN in .env');
+  const orderAccessToken = getShopifyOrderAccessToken();
+  if (!orderAccessToken) {
+    throw new Error(
+      'Missing SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN. Set a dedicated Shopify Admin API token with write_orders scope for order creation.'
+    );
   }
+
+  assertShopifyOrderCreateAccess(shopifyOrderAccessState);
 
   const [firstName, ...rest] = safeString(name, 'NOOD Customer').split(' ');
   const lastName = rest.join(' ') || 'Customer';
@@ -2845,64 +3335,85 @@ async function createShopifyOrder({
     },
   };
 
-  console.log('[NOOD order] Shopify create request', {
+  console.log('[ORDER CREATE START] Shopify orderCreate request', {
     storeDomain: SHOPIFY_STORE_DOMAIN,
+    tokenSource: shopifyOrderAccessState.tokenSource,
     lineItemCount: variables.order?.lineItems?.length || 0,
-    financialStatus: variables.order?.financialStatus || null,
+    total: safeMoney(total),
+    paymentMethod,
+    clientOrderId,
+    email: email || null,
+    phone: phone || null,
+    lineItems: lineItems.map((item) => ({
+      title: item.title,
+      quantity: item.quantity,
+      variantId: item.variantId,
+      amount: item.priceSet?.shopMoney?.amount || null,
+    })),
+    shippingAddress: normalizedShippingAddress,
   });
 
-  const response = await axios.post(
-    `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_ADMIN_API_VERSION}/graphql.json`,
-    { query, variables },
-    {
-      headers: {
-        'X-Shopify-Access-Token': SHOPIFY_ADMIN_ACCESS_TOKEN,
-        'Content-Type': 'application/json',
-      },
-      timeout: 30000,
-    }
-  );
-
-  const payload = response.data;
+  let payload;
+  try {
+    payload = await adminGraphql(query, variables, {
+      accessToken: orderAccessToken,
+      requestedQueryCost: 20,
+    });
+  } catch (error) {
+    const shopifyDetails = {
+      statusCode: error?.response?.status || error?.statusCode || null,
+      graphQLErrorCount: Array.isArray(error?.shopifyErrors) ? error.shopifyErrors.length : 0,
+      firstGraphQLError:
+        error?.shopifyErrors?.[0]?.message ||
+        error?.response?.data?.errors?.[0]?.message ||
+        error?.message ||
+        null,
+      responseBody: error?.response?.data || null,
+    };
+    console.error('[ORDER CREATE FAILED] Shopify orderCreate transport error', shopifyDetails);
+    const wrapped = new Error(shopifyDetails.firstGraphQLError || 'Shopify order creation failed');
+    wrapped.shopifyDetails = shopifyDetails;
+    throw wrapped;
+  }
 
   const result = payload?.data?.orderCreate;
   const errors = result?.userErrors || [];
-  const topErrors = payload?.errors || [];
-
-  console.log('[NOOD order] Shopify response summary', {
-    orderId: result?.order?.id || null,
-    orderName: result?.order?.name || null,
-    userErrorCount: errors.length,
-    graphQLErrorCount: topErrors.length,
-  });
-
-  if (topErrors.length > 0) {
-    const error = new Error(topErrors[0]?.message || 'Shopify GraphQL error');
-    error.shopifyDetails = {
-      statusCode: response.status,
-      graphQLErrorCount: topErrors.length,
-      firstGraphQLError: topErrors[0]?.message || null,
-    };
-    console.error('[NOOD order] Shopify GraphQL error:', error.shopifyDetails);
-    throw error;
-  }
 
   if (!result?.order || errors.length > 0) {
     const error = new Error(errors[0]?.message || 'Failed to create Shopify order');
     error.shopifyDetails = {
-      statusCode: response.status,
       userErrorCount: errors.length,
       firstUserError: errors[0]?.message || null,
+      userErrors: errors,
     };
-    console.error('[NOOD order] Shopify order create error:', error.shopifyDetails);
+    console.error('[ORDER CREATE FAILED] Shopify orderCreate userErrors', error.shopifyDetails);
     throw error;
   }
+
+  console.log('[ORDER CREATE SUCCESS] Shopify orderCreate response', {
+    orderId: result?.order?.id || null,
+    orderName: result?.order?.name || null,
+  });
 
   return result.order;
 }
 
 async function startServer() {
   let cache = null;
+
+  try {
+    shopifyOrderAccessState = await validateShopifyOrderCreateAccess();
+  } catch (error) {
+    shopifyOrderAccessState = {
+      ok: false,
+      message: error?.message || 'Shopify order access validation failed.',
+      scopes: [],
+      tokenSource: getShopifyOrderTokenSource(),
+      missingOrderScopes: ['write_orders'],
+      hasShopifyOrderAdminAccessToken: hasShopifyOrderAdminAccessToken(),
+    };
+    console.error('[ORDER CREATE FAILED] startup validation threw', shopifyOrderAccessState);
+  }
 
   try {
     cache = await mountCatalog(app, { requireAdminApiKey });
