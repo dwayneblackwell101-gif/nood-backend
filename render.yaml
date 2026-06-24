@@ -14,7 +14,7 @@ services:
       - key: SHOPIFY_STOREFRONT_API_VERSION
         value: 2025-10
       - key: STORAGE_DRIVER
-        value: json
+        value: redis
       - key: REDIS_URL
         sync: false
       - key: BACKEND_BASE_URL

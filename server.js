@@ -8,6 +8,7 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const { createStorage } = require('./storage');
+const { fetchShopifyCustomerOrders } = require('./shopify-customer-orders');
 const {
   getPayPalConfig,
   hasPayPalCredentials,
@@ -1808,6 +1809,11 @@ app.get('/health', (req, res) => {
     shopify_order_token_fingerprint: shopifyOrderAccessState.tokenFingerprint || null,
     shopify_order_access_scopes: shopifyOrderAccessState.scopes,
     shopify_order_access_message: shopifyOrderAccessState.message,
+    storage_driver: storage.storageDriver || 'json',
+    payment_storage_driver: storage.paymentStorageDriver || 'json',
+    payment_storage_redis_ready: Boolean(storage.paymentStorageRedisReady),
+    failed_paid_orders_driver: storage.failedPaidOrdersDriver || 'json',
+    payment_records_driver: storage.paymentRecordsDriver || 'json',
   });
 });
 
@@ -2254,6 +2260,44 @@ app.post('/api/shopify/orders', async (req, res) => {
     });
   }
 });
+app.get('/api/customer/orders', async (req, res) => {
+  const email = safeString(req.query.email).toLowerCase();
+  const customerId = safeString(req.query.customerId || req.query.customer_id);
+  const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 50);
+
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({
+      ok: false,
+      success: false,
+      message: 'A valid customer email is required.',
+      orders: [],
+    });
+  }
+
+  try {
+    const orders = await fetchShopifyCustomerOrders({
+      email,
+      customerId,
+      limit,
+    });
+
+    return res.json({
+      ok: true,
+      success: true,
+      orders,
+      count: orders.length,
+    });
+  } catch (error) {
+    console.error('[NOOD orders] customer order sync failed:', error.message);
+    return res.status(error.statusCode || 500).json({
+      ok: false,
+      success: false,
+      message: error.message || 'Could not load Shopify customer orders.',
+      orders: [],
+    });
+  }
+});
+
 app.get('/api/failed-paid-orders', requireAdminApiKey, (req, res) => {
   res.json({
     success: true,
@@ -3663,6 +3707,13 @@ async function createShopifyOrder({
 
 async function startServer() {
   let cache = null;
+
+  try {
+    await storage.ready;
+  } catch (error) {
+    console.error('[NOOD storage] failed to initialize payment recovery storage:', error.message);
+    throw error;
+  }
 
   try {
     shopifyOrderAccessState = await validateShopifyOrderCreateAccess();

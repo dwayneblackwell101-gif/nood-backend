@@ -1,18 +1,20 @@
 const fs = require('fs');
 const path = require('path');
+const { RedisCollection, createRedisClient } = require('./storage/redis-collection');
 
 const STORAGE_DRIVER = String(process.env.STORAGE_DRIVER || 'json').trim().toLowerCase();
+const REDIS_URL = String(process.env.REDIS_URL || '').trim();
+const USE_REDIS_PAYMENT_STORAGE = STORAGE_DRIVER === 'redis' || Boolean(REDIS_URL);
 
 // Local development storage only. These JSON files are convenient for testing,
-// but production should use a database-backed implementation behind this same
-// collection interface so payment state survives deploys and concurrent writes.
+// but production should use Redis for payment recovery state so records survive deploys.
 class JsonCollection {
   constructor({ name, fileName, keyField }) {
     this.name = name;
     this.filePath = path.join(__dirname, fileName);
     this.keyField = keyField;
     this.items = new Map();
-    this.load();
+    this.ready = Promise.resolve(this.load());
   }
 
   load() {
@@ -67,41 +69,128 @@ class JsonCollection {
 }
 
 function createStorage() {
-  if (STORAGE_DRIVER !== 'json') {
+  let redis = null;
+  const storageState = {
+    paymentStorageDriver: 'json',
+    paymentStorageRedisReady: false,
+    redisConfigured: false,
+    failedPaidOrdersDriver: 'json',
+    paymentRecordsDriver: 'json',
+  };
+
+  if (STORAGE_DRIVER === 'redis' && !REDIS_URL) {
     throw new Error(
-      `Unsupported STORAGE_DRIVER "${STORAGE_DRIVER}". TODO: add a database driver that implements the JsonCollection interface.`
+      'STORAGE_DRIVER=redis requires REDIS_URL. Configure a Redis instance for payment recovery storage.'
     );
   }
 
+  if (USE_REDIS_PAYMENT_STORAGE) {
+    if (!REDIS_URL) {
+      throw new Error(
+        'Payment recovery Redis storage requires REDIS_URL. Configure a Redis instance on Render.'
+      );
+    }
+
+    redis = createRedisClient(REDIS_URL);
+    storageState.paymentStorageDriver = 'redis';
+    storageState.redisConfigured = true;
+    storageState.failedPaidOrdersDriver = 'redis';
+    storageState.paymentRecordsDriver = 'redis';
+  }
+
+  const pendingOrders = new JsonCollection({
+    name: 'pending orders',
+    fileName: 'pending-orders.json',
+    keyField: 'orderId',
+  });
+
+  const walletTransactions = new JsonCollection({
+    name: 'wallet transactions',
+    fileName: 'wallet-transactions.json',
+    keyField: 'walletTransactionId',
+  });
+
+  const failedPaidOrders = redis
+    ? new RedisCollection({
+        name: 'failed paid orders',
+        keyPrefix: 'nood:storage:failedPaidOrders:',
+        keyField: 'recoveryId',
+        redis,
+        migrateFileName: 'failed-paid-orders.json',
+      })
+    : new JsonCollection({
+        name: 'failed paid orders',
+        fileName: 'failed-paid-orders.json',
+        keyField: 'recoveryId',
+      });
+
+  const paymentRecords = redis
+    ? new RedisCollection({
+        name: 'payment records',
+        keyPrefix: 'nood:storage:paymentRecords:',
+        keyField: 'paymentKey',
+        redis,
+        migrateFileName: 'payment-records.json',
+      })
+    : new JsonCollection({
+        name: 'payment records',
+        fileName: 'payment-records.json',
+        keyField: 'paymentKey',
+      });
+
+  const ready = (async () => {
+    if (redis) {
+      await redis.connect();
+      await redis.ping();
+      await failedPaidOrders.init();
+      await paymentRecords.init();
+      storageState.paymentStorageRedisReady = true;
+      console.log('[NOOD storage] payment recovery storage ready (redis)', {
+        storageDriver: STORAGE_DRIVER,
+        failedPaidOrdersDriver: storageState.failedPaidOrdersDriver,
+        paymentRecordsDriver: storageState.paymentRecordsDriver,
+      });
+      return;
+    }
+
+    await Promise.all([
+      pendingOrders.ready,
+      walletTransactions.ready,
+      failedPaidOrders.ready,
+      paymentRecords.ready,
+    ]);
+    console.log('[NOOD storage] payment recovery storage ready (json)', {
+      storageDriver: STORAGE_DRIVER,
+    });
+  })();
+
   return {
-    pendingOrders: new JsonCollection({
-      name: 'pending orders',
-      // Local development only: pending-orders.json.
-      fileName: 'pending-orders.json',
-      keyField: 'orderId',
-    }),
-    failedPaidOrders: new JsonCollection({
-      name: 'failed paid orders',
-      // Local development only: failed-paid-orders.json.
-      fileName: 'failed-paid-orders.json',
-      keyField: 'recoveryId',
-    }),
-    paymentRecords: new JsonCollection({
-      name: 'payment records',
-      // Local development only: payment-records.json.
-      fileName: 'payment-records.json',
-      keyField: 'paymentKey',
-    }),
-    walletTransactions: new JsonCollection({
-      name: 'wallet transactions',
-      // Local development only: wallet-transactions.json.
-      fileName: 'wallet-transactions.json',
-      keyField: 'walletTransactionId',
-    }),
+    pendingOrders,
+    failedPaidOrders,
+    paymentRecords,
+    walletTransactions,
+    ready,
+    storageDriver: STORAGE_DRIVER,
+    get paymentStorageDriver() {
+      return storageState.paymentStorageDriver;
+    },
+    get paymentStorageRedisReady() {
+      return storageState.paymentStorageRedisReady;
+    },
+    get redisConfigured() {
+      return storageState.redisConfigured;
+    },
+    get failedPaidOrdersDriver() {
+      return storageState.failedPaidOrdersDriver;
+    },
+    get paymentRecordsDriver() {
+      return storageState.paymentRecordsDriver;
+    },
   };
 }
 
 module.exports = {
   createStorage,
   STORAGE_DRIVER,
+  USE_REDIS_PAYMENT_STORAGE,
 };
