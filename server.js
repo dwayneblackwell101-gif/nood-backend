@@ -45,11 +45,32 @@ const SHOPIFY_CURRENCY = safeString(process.env.SHOPIFY_CURRENCY, 'TTD').toUpper
 const PAYPAL_USD_TO_TTD_RATE = Number(process.env.PAYPAL_USD_TO_TTD_RATE || 6.8);
 const BACKEND_BASE_URL = getBackendBaseUrl();
 
+const WIPAY_ACCOUNT_NUMBER_DEFAULT = '3815671283';
+
 function normalizeWiPayAccountNumber(rawValue) {
   return String(rawValue || '').replace(/\D/g, '');
 }
 
-const WIPAY_ACCOUNT_NUMBER = normalizeWiPayAccountNumber(process.env.WIPAY_ACCOUNT_NUMBER);
+function resolveWiPayAccountNumber() {
+  const fromEnv = normalizeWiPayAccountNumber(process.env.WIPAY_ACCOUNT_NUMBER);
+  if (fromEnv) {
+    return fromEnv;
+  }
+
+  if (IS_PRODUCTION) {
+    const productionDefault = normalizeWiPayAccountNumber(WIPAY_ACCOUNT_NUMBER_DEFAULT);
+    if (productionDefault) {
+      console.warn(
+        '[NOOD backend] WIPAY_ACCOUNT_NUMBER missing or invalid in env; using digits-only production default'
+      );
+      return productionDefault;
+    }
+  }
+
+  return '';
+}
+
+const WIPAY_ACCOUNT_NUMBER = resolveWiPayAccountNumber();
 const WIPAY_API_KEY = safeString(process.env.WIPAY_API_KEY);
 const WIPAY_ENVIRONMENT = process.env.WIPAY_ENVIRONMENT || 'sandbox';
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
