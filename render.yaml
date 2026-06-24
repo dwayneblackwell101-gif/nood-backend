@@ -44,4 +44,4 @@ services:
       - key: WIPAY_API_KEY
         sync: false
       - key: WIPAY_ENVIRONMENT
-        sync: false
+        value: sandbox

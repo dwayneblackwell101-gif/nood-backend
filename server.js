@@ -72,7 +72,56 @@ function resolveWiPayAccountNumber() {
 
 const WIPAY_ACCOUNT_NUMBER = resolveWiPayAccountNumber();
 const WIPAY_API_KEY = safeString(process.env.WIPAY_API_KEY);
-const WIPAY_ENVIRONMENT = process.env.WIPAY_ENVIRONMENT || 'sandbox';
+
+function resolveWiPayEnvironmentConfig() {
+  const candidates = [
+    ['WIPAY_ENVIRONMENT', process.env.WIPAY_ENVIRONMENT],
+    ['WIPAY_ENV', process.env.WIPAY_ENV],
+    ['WIPAY_MODE', process.env.WIPAY_MODE],
+  ];
+
+  for (const [source, value] of candidates) {
+    const raw = safeString(value).toLowerCase();
+    if (!raw) continue;
+
+    if (['sandbox', 'test', 'staging', 'dev', 'development'].includes(raw)) {
+      return { environment: 'sandbox', source, raw };
+    }
+
+    if (['live', 'production', 'prod'].includes(raw)) {
+      return { environment: 'live', source, raw };
+    }
+
+    console.warn(`[WIPAY ENV] unrecognized value "${raw}" from ${source}; defaulting to sandbox`);
+    return { environment: 'sandbox', source, raw };
+  }
+
+  return { environment: 'sandbox', source: 'default', raw: '' };
+}
+
+function finalizeWiPayEnvironmentConfig(config) {
+  const allowLive = ['1', 'true', 'yes'].includes(
+    safeString(process.env.WIPAY_ALLOW_LIVE).toLowerCase()
+  );
+
+  if (IS_PRODUCTION && config.environment === 'live' && !allowLive) {
+    console.warn(
+      '[WIPAY ENV] live configured but WIPAY_ALLOW_LIVE is not enabled; forcing sandbox for test checkout'
+    );
+    return {
+      environment: 'sandbox',
+      source: `${config.source}+sandbox_override`,
+      raw: config.raw,
+    };
+  }
+
+  return config;
+}
+
+const wipayEnvironmentConfig = finalizeWiPayEnvironmentConfig(resolveWiPayEnvironmentConfig());
+const WIPAY_ENVIRONMENT = wipayEnvironmentConfig.environment;
+const WIPAY_ENVIRONMENT_SOURCE = wipayEnvironmentConfig.source;
+const WIPAY_ENVIRONMENT_RAW = wipayEnvironmentConfig.raw;
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 const SHOPIFY_ADMIN_API_VERSION = safeString(process.env.SHOPIFY_ADMIN_API_VERSION, '2025-10');
@@ -301,6 +350,35 @@ function getWiPayPaymentUrl(data) {
   if (!data || typeof data !== 'object') return null;
 
   return data.url || data.payment_url || data.redirect_url || data.link || null;
+}
+
+function logWiPayCreatePaymentRequest(payload, paymentUrl = '') {
+  console.log('[WIPAY ENV]', payload.get('environment') || WIPAY_ENVIRONMENT);
+  console.log('[WIPAY ACCOUNT]', payload.get('account_number') || WIPAY_ACCOUNT_NUMBER);
+  console.log('[WIPAY CURRENCY]', payload.get('currency') || 'TTD');
+  console.log('[WIPAY METHOD]', payload.get('method') || 'credit_card');
+  if (paymentUrl) {
+    console.log('[WIPAY PAYMENT URL]', paymentUrl);
+  }
+
+  let responseUrlHost = '';
+  try {
+    responseUrlHost = new URL(String(payload.get('response_url') || '')).host;
+  } catch {
+    responseUrlHost = '';
+  }
+
+  console.log('[WIPAY ENV] create-payment payload (non-secret)', {
+    environment: payload.get('environment') || WIPAY_ENVIRONMENT,
+    environment_source: WIPAY_ENVIRONMENT_SOURCE,
+    environment_raw: WIPAY_ENVIRONMENT_RAW || null,
+    country_code: payload.get('country_code'),
+    fee_structure: payload.get('fee_structure'),
+    order_id: payload.get('order_id'),
+    origin: payload.get('origin'),
+    total: payload.get('total'),
+    response_url_host: responseUrlHost,
+  });
 }
 
 function isHttpsPaymentUrl(value) {
@@ -1702,6 +1780,10 @@ app.get('/health', (req, res) => {
     redis_configured: Boolean(safeString(process.env.REDIS_URL)),
     has_wipay_account: Boolean(WIPAY_ACCOUNT_NUMBER),
     wipay_account_suffix: WIPAY_ACCOUNT_NUMBER ? WIPAY_ACCOUNT_NUMBER.slice(-4) : null,
+    wipay_environment: WIPAY_ENVIRONMENT,
+    wipay_environment_source: WIPAY_ENVIRONMENT_SOURCE,
+    wipay_environment_raw: WIPAY_ENVIRONMENT_RAW || null,
+    has_wipay_api_key: Boolean(WIPAY_API_KEY),
     has_shopify_domain: Boolean(SHOPIFY_STORE_DOMAIN),
     has_shopify_token: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
     has_shopify_order_admin_token: hasShopifyOrderAdminAccessToken(),
@@ -2345,6 +2427,8 @@ app.post('/create-wipay-payment', async (req, res) => {
       phone: customerPhone,
     });
 
+    logWiPayCreatePaymentRequest(payload);
+
     const response = await axios.post(
       'https://tt.wipayfinancial.com/plugins/payments/request',
       payload.toString(),
@@ -2358,6 +2442,7 @@ app.post('/create-wipay-payment', async (req, res) => {
     );
 
     const paymentUrl = getWiPayPaymentUrl(response.data);
+    logWiPayCreatePaymentRequest(payload, safeString(paymentUrl));
     console.log('[NOOD backend] WiPay create payment response', {
       status: response.data?.status,
       message: response.data?.message,
@@ -2871,6 +2956,8 @@ const createWalletTopup = async (req, res) => {
       phone: customerPhone,
     });
 
+    logWiPayCreatePaymentRequest(payload);
+
     const response = await axios.post(
       'https://tt.wipayfinancial.com/plugins/payments/request',
       payload.toString(),
@@ -2884,6 +2971,7 @@ const createWalletTopup = async (req, res) => {
     );
 
     const paymentUrl = getWiPayPaymentUrl(response.data);
+    logWiPayCreatePaymentRequest(payload, safeString(paymentUrl));
 
     if (!isHttpsPaymentUrl(paymentUrl)) {
       return res.status(500).json({
@@ -3472,6 +3560,11 @@ async function startServer() {
       '[NOOD backend] WiPay account configured suffix=' +
         (WIPAY_ACCOUNT_NUMBER ? WIPAY_ACCOUNT_NUMBER.slice(-4) : 'missing')
     );
+    console.log('[WIPAY ENV]', WIPAY_ENVIRONMENT);
+    console.log('[WIPAY ENV] source=' + WIPAY_ENVIRONMENT_SOURCE + (WIPAY_ENVIRONMENT_RAW ? ` raw=${WIPAY_ENVIRONMENT_RAW}` : ''));
+    if (WIPAY_ENVIRONMENT === 'live') {
+      console.warn('[WIPAY ENV] live mode active; sandbox test cards will not work');
+    }
   });
 }
 
