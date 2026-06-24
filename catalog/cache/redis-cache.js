@@ -245,6 +245,8 @@ async function createRedisCache(redisUrl) {
         collectionCount: 0,
         syncInProgress: false,
         source: null,
+        catalogVersion: 0,
+        catalogUpdatedAt: null,
       };
     }
 
@@ -315,6 +317,16 @@ async function createRedisCache(redisUrl) {
       return saved;
     }
 
+    async clearCollections() {
+      await this.ensureLegacyMigrated();
+      await this.client.del(COLLECTIONS_HASH_KEY, LEGACY_COLLECTIONS_KEY);
+    }
+
+    async clearMenus() {
+      await this.ensureLegacyMigrated();
+      await this.client.del(MENUS_HASH_KEY, LEGACY_MENUS_KEY);
+    }
+
     async mergeCollections(incomingCollections = []) {
       await this.ensureLegacyMigrated();
       if (!incomingCollections.length) {
@@ -333,6 +345,11 @@ async function createRedisCache(redisUrl) {
 
       await pipeline.exec();
       return saved;
+    }
+
+    async replaceCollections(incomingCollections = []) {
+      await this.clearCollections();
+      return this.mergeCollections(incomingCollections);
     }
 
     async setProduct(handle, product) {
@@ -618,6 +635,14 @@ async function createRedisCache(redisUrl) {
       await this.ensureLegacyMigrated();
       const raw = await this.client.hget(COLLECTIONS_HASH_KEY, String(handle || '').trim());
       return raw ? JSON.parse(raw) : null;
+    }
+
+    async deleteCollection(handle) {
+      await this.ensureLegacyMigrated();
+      const key = String(handle || '').trim();
+      if (!key) return false;
+      const removed = await this.client.hdel(COLLECTIONS_HASH_KEY, key);
+      return Number(removed) > 0;
     }
 
     async setCollection(handle, collection) {

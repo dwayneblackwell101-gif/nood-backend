@@ -40,6 +40,8 @@ function emptyState() {
       lastSyncAt: null,
       productCount: 0,
       collectionCount: 0,
+      catalogVersion: 0,
+      catalogUpdatedAt: null,
     },
     products: {},
     productsById: {},
@@ -126,6 +128,16 @@ class JsonCatalogCache {
     return saved;
   }
 
+  async clearCollections() {
+    this.state.collections = {};
+    await this.persist();
+  }
+
+  async clearMenus() {
+    this.state.menus = {};
+    await this.persist();
+  }
+
   async mergeCollections(incomingCollections = []) {
     let saved = 0;
 
@@ -140,6 +152,20 @@ class JsonCatalogCache {
     return saved;
   }
 
+  async replaceCollections(incomingCollections = []) {
+    const next = {};
+
+    for (const collection of incomingCollections || []) {
+      const key = String(collection?.handle || '').trim();
+      if (!key) continue;
+      next[key] = collection;
+    }
+
+    this.state.collections = next;
+    await this.persist();
+    return Object.keys(next).length;
+  }
+
   async setProduct(handle, product) {
     const key = String(handle || '').trim();
     if (!key) return null;
@@ -147,6 +173,7 @@ class JsonCatalogCache {
     if (product?.id) {
       this.state.productsById[String(product.id)] = key;
     }
+    await this.persist();
     return product;
   }
 
@@ -248,6 +275,16 @@ class JsonCatalogCache {
 
   async getCollection(handle) {
     return this.state.collections[String(handle || '').trim()] || null;
+  }
+
+  async deleteCollection(handle) {
+    const key = String(handle || '').trim();
+    if (!key || !this.state.collections[key]) {
+      return false;
+    }
+    delete this.state.collections[key];
+    await this.persist();
+    return true;
   }
 
   async setCollection(handle, collection) {

@@ -300,6 +300,38 @@ const ADMIN_PRODUCT_BY_ID_QUERY = `
   }
 `;
 
+const ADMIN_COLLECTION_BY_ID_QUERY = `
+  query CatalogCollectionById($id: ID!) {
+    collection(id: $id) {
+      id
+      title
+      handle
+      image {
+        url
+      }
+      products(first: 250) {
+        edges {
+          node {
+            handle
+          }
+        }
+      }
+    }
+  }
+`;
+
+const INVENTORY_ITEM_PRODUCT_QUERY = `
+  query CatalogInventoryItemProduct($id: ID!) {
+    inventoryItem(id: $id) {
+      variant {
+        product {
+          id
+        }
+      }
+    }
+  }
+`;
+
 const ADMIN_COLLECTIONS_PAGE_QUERY = `
   query CatalogCollectionsPage($first: Int!, $after: String) {
     collections(first: $first, after: $after, sortKey: UPDATED_AT, reverse: true) {
@@ -652,6 +684,24 @@ async function fetchAdminProductById(id) {
   return payload?.data?.product || null;
 }
 
+async function fetchAdminCollectionById(id) {
+  const payload = await adminGraphql(ADMIN_COLLECTION_BY_ID_QUERY, { id });
+  return payload?.data?.collection || null;
+}
+
+async function fetchProductGidByInventoryItemId(inventoryItemId) {
+  const raw = safeString(inventoryItemId);
+  if (!raw) {
+    return '';
+  }
+
+  const gid = raw.startsWith('gid://')
+    ? raw
+    : `gid://shopify/InventoryItem/${raw.replace(/\D/g, '')}`;
+  const payload = await adminGraphql(INVENTORY_ITEM_PRODUCT_QUERY, { id: gid });
+  return safeString(payload?.data?.inventoryItem?.variant?.product?.id);
+}
+
 async function fetchAllAdminCollections() {
   const collections = [];
   let after = null;
@@ -691,6 +741,8 @@ module.exports = {
   fetchAdminCollectionsPage,
   fetchAllAdminProducts,
   fetchAdminProductById,
+  fetchAdminCollectionById,
+  fetchProductGidByInventoryItemId,
   fetchAllAdminCollections,
   STOREFRONT_MENU_QUERY,
   STOREFRONT_COLLECTIONS_BROWSER_QUERY,

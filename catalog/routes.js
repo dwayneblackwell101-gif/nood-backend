@@ -15,6 +15,7 @@ const {
   STOREFRONT_PRODUCT_DETAIL_QUERY,
 } = require('./shopify');
 const { getProductRecommendations } = require('./recommendations');
+const { createDiscountsHandler } = require('./discounts');
 
 function sendCatalogResponse(res, payload, source) {
   res.setHeader('X-NOOD-Catalog-Source', source);
@@ -354,6 +355,9 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
   router.post('/sync/shopify/products', requireAdminApiKey, createCatalogSyncHandler(cache));
   console.log('[NOOD sync] status route mounted');
 
+  router.get('/discounts', createDiscountsHandler());
+  console.log('[NOOD routes] mounted GET /api/catalog/discounts');
+
   router.get('/health', async (req, res) => {
     const meta = await cache.getMeta();
     const productCount =
@@ -371,8 +375,28 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
       productCount,
       collectionCount,
       lastSyncAt: meta.lastSyncAt || null,
+      catalogVersion: Number(meta.catalogVersion) || 0,
+      catalogUpdatedAt: meta.catalogUpdatedAt || null,
     });
   });
+
+  router.get('/version', async (req, res) => {
+    try {
+      const meta = await cache.getMeta();
+
+      return res.json({
+        ok: true,
+        catalogVersion: Number(meta.catalogVersion) || 0,
+        catalogUpdatedAt: meta.catalogUpdatedAt || null,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        message: error.message || 'Could not read catalog version.',
+      });
+    }
+  });
+  console.log('[NOOD routes] mounted GET /api/catalog/version');
 
   router.get('/products', async (req, res) => {
     const first = Number(req.query.first || req.query.limit || 50);
@@ -484,9 +508,9 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
         });
       }
 
-      console.log(`[NOOD product] cache hit handle=${handle}`);
+      console.log(`[NOOD product] cache hit handle=${handle} title=${safeString(product.title)}`);
       const detail = formatCachedProductDetail(product);
-      console.log(`[NOOD product] detail returned handle=${handle}`);
+      console.log(`[NOOD product] detail returned handle=${handle} title=${safeString(detail.title)}`);
 
       return sendCatalogResponse(
         res,
@@ -607,10 +631,17 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
       })
     );
 
+    const meta = await cache.getMeta();
+    const lastSyncAt = meta?.lastSyncAt || null;
+    const cacheAgeMs = lastSyncAt ? Math.max(0, Date.now() - new Date(lastSyncAt).getTime()) : null;
+
     console.log('[NOOD catalog] GET /collections', {
       source: 'cache',
       returned: edges.length,
       total: collections.length,
+      lastSyncAt,
+      cacheAgeMs,
+      cacheAgeMinutes: cacheAgeMs === null ? null : Math.round(cacheAgeMs / 60000),
     });
 
     return sendCatalogResponse(
@@ -665,14 +696,29 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
         if (menu) {
           await cache.setMenu(handle, menu);
         }
-        console.log('[NOOD catalog] GET /menus/:handle from shopify', { handle });
+        const meta = await cache.getMeta();
+        const lastSyncAt = meta?.lastSyncAt || null;
+        const cacheAgeMs = lastSyncAt ? Math.max(0, Date.now() - new Date(lastSyncAt).getTime()) : null;
+        console.log('[NOOD catalog] GET /menus/:handle from shopify', {
+          handle,
+          lastSyncAt,
+          cacheAgeMs,
+        });
         return sendCatalogResponse(res, payload, source);
       } catch (error) {
         console.warn('[NOOD catalog] menu storefront fallback failed:', error.message);
       }
     }
 
-    console.log('[NOOD catalog] GET /menus/:handle from cache', { handle });
+    const meta = await cache.getMeta();
+    const lastSyncAt = meta?.lastSyncAt || null;
+    const cacheAgeMs = lastSyncAt ? Math.max(0, Date.now() - new Date(lastSyncAt).getTime()) : null;
+    console.log('[NOOD catalog] GET /menus/:handle from cache', {
+      handle,
+      lastSyncAt,
+      cacheAgeMs,
+      cacheAgeMinutes: cacheAgeMs === null ? null : Math.round(cacheAgeMs / 60000),
+    });
 
     return sendCatalogResponse(
       res,
@@ -754,6 +800,7 @@ function createCatalogSyncStatusHandler(cache) {
       return res.json({
         success: true,
         status: status.status,
+        syncInProgress: status.status === 'running',
         productCount: status.productCount,
         collectionCount: status.collectionCount,
         cursor: status.cursor,

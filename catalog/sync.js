@@ -53,6 +53,8 @@ async function fetchAdminCollectionsPage(after = null, options = {}) {
 
 const {
   fetchAdminProductById,
+  fetchAdminCollectionById,
+  fetchProductGidByInventoryItemId,
   storefrontGraphql,
   getShopifyConfig,
   STOREFRONT_MENU_QUERY,
@@ -402,8 +404,13 @@ async function saveCollectionPage(cache, adminCollections) {
   return saved;
 }
 
-async function syncMenus(cache, menuHandles = DEFAULT_MENU_HANDLES) {
+async function syncMenus(cache, menuHandles = DEFAULT_MENU_HANDLES, options = {}) {
   let saved = 0;
+
+  if (options.replaceExisting && typeof cache.clearMenus === 'function') {
+    await cache.clearMenus();
+    console.log('[NOOD sync] cleared menus cache before full menu sync');
+  }
 
   for (const handle of menuHandles) {
     try {
@@ -421,26 +428,221 @@ async function syncMenus(cache, menuHandles = DEFAULT_MENU_HANDLES) {
   return saved;
 }
 
-async function syncSingleProduct(cache, adminProduct) {
+function productCacheSnapshot(product) {
+  if (!product) {
+    return null;
+  }
+
+  const price =
+    product?.priceRange?.minVariantPrice?.amount ||
+    product?.variants?.edges?.[0]?.node?.price?.amount ||
+    null;
+  const image = product?.featuredImage?.url || null;
+
+  return {
+    title: safeString(product?.title),
+    price: price ? String(price) : null,
+    image: image ? String(image).slice(0, 160) : null,
+  };
+}
+
+function productCacheKey(handle) {
+  const key = safeString(handle);
+  return key ? `nood:catalog:products:h:${key}` : '';
+}
+
+async function invalidateDerivedCatalogCaches(cache) {
+  clearMixedFeedCache();
+  if (typeof cache.clearMixedFeedCaches === 'function') {
+    await cache.clearMixedFeedCaches();
+  }
+}
+
+async function bumpCatalogVersion(cache, reason = 'catalog-change') {
+  const current = (await cache.getMeta()) || {};
+  const nextVersion = (Number(current.catalogVersion) || 0) + 1;
+  const catalogUpdatedAt = new Date().toISOString();
+  const meta = await cache.setMeta({
+    catalogVersion: nextVersion,
+    catalogUpdatedAt,
+    lastCatalogChangeReason: safeString(reason),
+  });
+
+  console.log('[NOOD catalog version] bumped', {
+    catalogVersion: meta.catalogVersion ?? nextVersion,
+    catalogUpdatedAt,
+    reason,
+  });
+
+  return meta;
+}
+
+async function syncSingleProduct(cache, adminProduct, context = {}) {
   const config = getShopifyConfig();
   const product = transformAdminProduct(adminProduct, config.currencyCode);
-  if (!product.handle || product.status === 'ARCHIVED') {
-    if (product.handle) {
-      await cache.deleteProduct(product.handle);
+  const handle = safeString(product?.handle);
+  const productId = safeString(product?.id);
+  const reason = safeString(context?.reason) || 'product-sync';
+
+  let oldProduct = null;
+  if (handle && typeof cache.getProduct === 'function') {
+    oldProduct = await cache.getProduct(handle);
+  }
+  if (!oldProduct && productId && typeof cache.getProductById === 'function') {
+    oldProduct = await cache.getProductById(productId);
+  }
+
+  const oldSnapshot = productCacheSnapshot(oldProduct);
+  const newSnapshot = productCacheSnapshot(product);
+
+  if (!handle || product.status === 'ARCHIVED') {
+    if (handle) {
+      const removed = await cache.deleteProduct(handle);
+      await invalidateDerivedCatalogCaches(cache);
+      await bumpCatalogVersion(cache, reason || 'product-archived');
+      console.log('[NOOD cache] product updated', {
+        productId,
+        handle,
+        cacheKey: productCacheKey(handle),
+        action: 'removed',
+        old: oldSnapshot,
+        new: null,
+        writeSuccess: removed,
+      });
     }
     return null;
   }
 
-  await cache.setProduct(product.handle, product);
+  if (
+    oldProduct?.handle &&
+    oldProduct.handle !== handle &&
+    typeof cache.deleteProduct === 'function'
+  ) {
+    await cache.deleteProduct(oldProduct.handle);
+    console.log('[NOOD cache] product handle changed', {
+      productId,
+      oldHandle: oldProduct.handle,
+      newHandle: handle,
+    });
+  }
+
+  await cache.setProduct(handle, product);
+  if (typeof cache.persist === 'function') {
+    await cache.persist();
+  }
+
+  await invalidateDerivedCatalogCaches(cache);
+  await bumpCatalogVersion(cache, reason);
+
+  console.log('[NOOD cache] product updated', {
+    productId,
+    handle,
+    cacheKey: productCacheKey(handle),
+    action: oldProduct ? 'updated' : 'created',
+    old: oldSnapshot,
+    new: newSnapshot,
+    writeSuccess: true,
+  });
+
   return product;
 }
 
-async function syncProductByAdminId(cache, adminProductId) {
-  const adminProduct = await fetchAdminProductById(adminProductId);
+async function syncProductByAdminId(cache, adminProductId, context = {}) {
+  const lookupId = safeString(adminProductId);
+  console.log('[NOOD webhook] synced product', {
+    adminProductId: lookupId,
+    reason: safeString(context?.reason) || 'webhook',
+  });
+
+  const adminProduct = await fetchAdminProductById(lookupId);
   if (!adminProduct) {
+    console.warn('[NOOD webhook] synced product skipped: shopify product not found', {
+      adminProductId: lookupId,
+    });
     return null;
   }
-  return syncSingleProduct(cache, adminProduct);
+
+  return syncSingleProduct(cache, adminProduct, {
+    ...context,
+    reason: safeString(context?.reason) || 'webhook-product-sync',
+  });
+}
+
+async function deleteProductFromCache(cache, payload = {}) {
+  const handle = safeString(payload?.handle);
+  if (handle) {
+    const existing = typeof cache.getProduct === 'function' ? await cache.getProduct(handle) : null;
+    const removed = await cache.deleteProduct(handle);
+    await invalidateDerivedCatalogCaches(cache);
+    await bumpCatalogVersion(cache, 'product-delete');
+    console.log('[NOOD cache] product updated', {
+      productId: safeString(existing?.id) || safeString(payload?.id),
+      handle,
+      cacheKey: productCacheKey(handle),
+      action: 'deleted',
+      old: productCacheSnapshot(existing),
+      new: null,
+      writeSuccess: removed,
+    });
+    return { handle, removed };
+  }
+
+  const productGid = safeString(payload?.admin_graphql_api_id);
+  const numericId = safeString(payload?.id);
+  const lookupId = productGid || (numericId ? `gid://shopify/Product/${numericId}` : '');
+
+  if (lookupId && typeof cache.getProductById === 'function') {
+    const product = await cache.getProductById(lookupId);
+    if (product?.handle) {
+      const removed = await cache.deleteProduct(product.handle);
+      await invalidateDerivedCatalogCaches(cache);
+      await bumpCatalogVersion(cache, 'product-delete');
+      console.log('[NOOD cache] product updated', {
+        productId: lookupId,
+        handle: product.handle,
+        cacheKey: productCacheKey(product.handle),
+        action: 'deleted',
+        old: productCacheSnapshot(product),
+        new: null,
+        writeSuccess: removed,
+      });
+      return { handle: product.handle, removed };
+    }
+  }
+
+  return { handle: '', removed: false };
+}
+
+async function syncCollectionByAdminId(cache, adminCollectionId, context = {}) {
+  const adminCollection = await fetchAdminCollectionById(adminCollectionId);
+  if (!adminCollection) {
+    return null;
+  }
+
+  await saveCollectionPage(cache, [adminCollection]);
+  await invalidateDerivedCatalogCaches(cache);
+  await bumpCatalogVersion(cache, safeString(context?.reason) || 'collection-sync');
+  return normalizeCollection(adminCollection);
+}
+
+async function deleteCollectionFromCache(cache, payload = {}) {
+  const handle = safeString(payload?.handle);
+  if (!handle) {
+    return { handle: '', removed: false };
+  }
+
+  const removed =
+    typeof cache.deleteCollection === 'function' ? await cache.deleteCollection(handle) : false;
+  if (removed) {
+    await invalidateDerivedCatalogCaches(cache);
+    await bumpCatalogVersion(cache, 'collection-delete');
+  }
+  return { handle, removed };
+}
+
+async function syncCollectionsAndMenusLight(cache) {
+  const menuCount = await syncMenus(cache, DEFAULT_MENU_HANDLES, { replaceExisting: false });
+  return { menuCount };
 }
 
 async function syncProductsPhase(cache, config, state, options = {}) {
@@ -548,12 +750,18 @@ async function syncProductsPhase(cache, config, state, options = {}) {
 async function syncCollectionsPhase(cache, state, options = {}) {
   const maxPages = Math.max(1, Number(options.maxPages) || 10);
   const pageSize = Math.max(1, Number(options.pageSize) || 25);
-  let after =
-    options.resume && state.collectionCursor ? state.collectionCursor : null;
-  let totalSaved = options.resume ? Number(state.syncedCollectionCount || 0) : 0;
+  const resume = Boolean(options.resume);
+  let after = resume && state.collectionCursor ? state.collectionCursor : null;
+  let totalSaved = resume ? Number(state.syncedCollectionCount || 0) : 0;
   let hasMore = true;
   let pagesProcessed = 0;
   let pageAttempts = 0;
+  const syncedHandles = new Set();
+
+  if (!resume && typeof cache.clearCollections === 'function') {
+    await cache.clearCollections();
+    console.log('[NOOD sync] cleared collections cache before full collections sync');
+  }
 
   while (hasMore && pagesProcessed < maxPages) {
     let pageItems = null;
@@ -568,6 +776,12 @@ async function syncCollectionsPhase(cache, state, options = {}) {
       pageItems = page.items;
       pageInfo = page.pageInfo;
       const savedThisPage = await saveCollectionPage(cache, pageItems);
+      for (const adminCollection of pageItems || []) {
+        const handle = safeString(adminCollection?.handle);
+        if (handle) {
+          syncedHandles.add(handle);
+        }
+      }
       totalSaved += savedThisPage;
       after = pageInfo?.endCursor || null;
       hasMore = Boolean(pageInfo?.hasNextPage && after);
@@ -642,6 +856,16 @@ async function syncCollectionsPhase(cache, state, options = {}) {
       pageItems = null;
       pageInfo = null;
     }
+  }
+
+  if (!resume && !hasMore && typeof cache.replaceCollections === 'function') {
+    const syncedCollections = await cache.getAllCollections();
+    const replacedCount = await cache.replaceCollections(syncedCollections);
+    totalSaved = replacedCount;
+    console.log('[NOOD sync] replaced collections cache after full collections sync', {
+      replacedCount,
+      syncedHandleCount: syncedHandles.size,
+    });
   }
 
   return {
@@ -771,7 +995,7 @@ async function runResumableCatalogSync(cache, options = {}) {
         phase: 'menus',
         message: null,
       });
-      await syncMenus(cache);
+      await syncMenus(cache, DEFAULT_MENU_HANDLES, { replaceExisting: true });
     }
 
     const counts = await getCatalogCounts(cache, { phase: 'completed' });
@@ -782,6 +1006,14 @@ async function runResumableCatalogSync(cache, options = {}) {
       syncDurationMs: Date.now() - startedAt,
       source: 'shopify',
       syncInProgress: false,
+      catalogVersion: (Number((await cache.getMeta())?.catalogVersion) || 0) + 1,
+      catalogUpdatedAt: new Date().toISOString(),
+      lastCatalogChangeReason: 'full-sync',
+    });
+    console.log('[NOOD catalog version] bumped', {
+      catalogVersion: meta.catalogVersion,
+      catalogUpdatedAt: meta.catalogUpdatedAt,
+      reason: 'full-sync',
     });
     const productCount = metaCount(meta, 'productCount', counts.productCount);
     const collectionCount = metaCount(meta, 'collectionCount', counts.collectionCount);
@@ -929,6 +1161,10 @@ module.exports = {
   runResumableCatalogSync,
   syncSingleProduct,
   syncProductByAdminId,
+  deleteProductFromCache,
+  syncCollectionByAdminId,
+  deleteCollectionFromCache,
+  syncCollectionsAndMenusLight,
   syncMenus,
   ensureCatalogWarm,
   normalizeCollection,

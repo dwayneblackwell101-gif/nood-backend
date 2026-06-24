@@ -78,7 +78,9 @@ async function mountCatalog(app, { requireAdminApiKey }) {
     const webhookRouter = createWebhookRouter({ cache });
 
     app.use('/api/catalog', catalogRouter);
+    app.use('/webhooks', webhookRouter);
     app.use('/api/webhooks', webhookRouter);
+    console.log('[NOOD catalog] Shopify webhooks mounted at /webhooks/shopify and /api/webhooks/shopify');
     mountCatalogSyncRoutes(app, { cache, requireAdminApiKey });
 
     mountedCache = cache;
