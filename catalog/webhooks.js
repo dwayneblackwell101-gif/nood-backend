@@ -1,5 +1,8 @@
 const crypto = require('crypto');
+const express = require('express');
 const { safeString } = require('./transform');
+
+const WEBHOOK_BODY_LIMIT = '50mb';
 const {
   syncProductByAdminId,
   deleteProductFromCache,
@@ -53,6 +56,62 @@ function getAdminCollectionGid(payload) {
 function topicAction(topic) {
   const parts = String(topic || '').split('/');
   return parts[parts.length - 1] || 'unknown';
+}
+
+function isShopifyWebhookRequest(req) {
+  if (String(req.method || '').toUpperCase() !== 'POST') {
+    return false;
+  }
+
+  const path = String(req.originalUrl || req.url || '').split('?')[0];
+  return path === '/webhooks/shopify' || path === '/api/webhooks/shopify';
+}
+
+function mountShopifyWebhookBodyParser(app) {
+  const rawParser = express.raw({
+    type: 'application/json',
+    limit: WEBHOOK_BODY_LIMIT,
+  });
+
+  app.use((req, res, next) => {
+    if (!isShopifyWebhookRequest(req)) {
+      return next();
+    }
+
+    rawParser(req, res, (err) => {
+      if (err) {
+        if (err.type === 'entity.too.large' || err.status === 413) {
+          console.error('[NOOD webhook] payload too large', {
+            path: String(req.originalUrl || req.url || ''),
+            limit: WEBHOOK_BODY_LIMIT,
+            length: err.length,
+          });
+          return res.status(413).json({
+            success: false,
+            message: 'Webhook payload too large.',
+          });
+        }
+
+        console.error('[NOOD webhook] raw body parse failed', {
+          path: String(req.originalUrl || req.url || ''),
+          message: err.message,
+        });
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid webhook body.',
+        });
+      }
+
+      if (Buffer.isBuffer(req.body)) {
+        req.rawBody = req.body;
+        req._shopifyWebhookRawBody = true;
+      }
+
+      return next();
+    });
+  });
+
+  console.log(`[NOOD webhook] raw body parser mounted limit=${WEBHOOK_BODY_LIMIT}`);
 }
 
 function createWebhookQueue() {
@@ -208,31 +267,39 @@ function createWebhookHandler({ cache }) {
     const shop = safeString(req.get('X-Shopify-Shop-Domain'));
     const webhookId = safeString(req.get('X-Shopify-Webhook-Id'));
     const hmac = safeString(req.get('X-Shopify-Hmac-Sha256'));
-    const rawBody = req.rawBody;
+    const rawBody = Buffer.isBuffer(req.rawBody)
+      ? req.rawBody
+      : Buffer.isBuffer(req.body)
+        ? req.body
+        : null;
 
     if (!webhookSecret) {
-      console.error('[NOOD catalog] webhook rejected: missing SHOPIFY_WEBHOOK_SECRET');
+      console.error('[NOOD webhook] rejected: missing SHOPIFY_WEBHOOK_SECRET');
       return res.status(401).json({ success: false, message: 'Webhook secret is not configured.' });
     }
 
     if (!rawBody || !Buffer.isBuffer(rawBody)) {
-      console.warn('[NOOD catalog] webhook rejected: missing raw request body', { topic, shop, webhookId });
+      console.warn('[NOOD webhook] rejected: missing raw request body', { topic, shop, webhookId });
       return res.status(401).json({ success: false, message: 'Missing raw webhook body.' });
     }
 
     const valid = verifyShopifyWebhook(rawBody, hmac, webhookSecret);
     if (!valid) {
-      console.warn('[NOOD catalog] webhook rejected: invalid HMAC', { topic, shop, webhookId });
+      console.warn('[NOOD webhook] rejected: invalid HMAC', { topic, shop, webhookId });
       return res.status(401).json({ success: false, message: 'Invalid webhook signature.' });
     }
 
-    let payload = req.body;
-    if (!payload || typeof payload !== 'object') {
+    let payload = null;
+    if (rawBody) {
       try {
         payload = JSON.parse(rawBody.toString('utf8') || '{}');
       } catch {
         payload = {};
       }
+    } else if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+      payload = req.body;
+    } else {
+      payload = {};
     }
 
     const action = topicAction(topic);
@@ -362,4 +429,6 @@ function createWebhookRouter({ cache }) {
 module.exports = {
   createWebhookRouter,
   verifyShopifyWebhook,
+  mountShopifyWebhookBodyParser,
+  isShopifyWebhookRequest,
 };

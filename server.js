@@ -32,6 +32,7 @@ const {
   capturePayPalOrder,
 } = require('./paypal');
 const { mountCatalog, getCatalogReadiness, getCatalogCache } = require('./catalog');
+const { mountShopifyWebhookBodyParser } = require('./catalog/webhooks');
 const { adminGraphql } = require('./catalog/shopify');
 const { createDiscountsHandler } = require('./catalog/discounts');
 const {
@@ -196,7 +197,14 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json());
+mountShopifyWebhookBodyParser(app);
+
+app.use((req, res, next) => {
+  if (req._shopifyWebhookRawBody) {
+    return next();
+  }
+  return express.json()(req, res, next);
+});
 
 function safeString(value, fallback = '') {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
