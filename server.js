@@ -65,6 +65,10 @@ const returnRequestHandlers = createReturnRequestHandlers({
   shopifyRefundSync,
   walletRefundService,
 });
+const createNotificationsRouter = require('./notifications/push-notifications');
+const notificationsRouter = createNotificationsRouter({
+  pushTokens: storage.pushTokens,
+});
 
 const PORT = Number(process.env.PORT || 3000);
 const LOCAL_IP = safeString(process.env.LOCAL_IP) || getLocalNetworkIp();
@@ -1883,6 +1887,9 @@ app.get('/health', (req, res) => {
 app.get('/api/discounts', createDiscountsHandler());
 app.get('/discounts', createDiscountsHandler());
 app.get('/shopify/discounts', createDiscountsHandler());
+
+app.use('/api/notifications', notificationsRouter);
+console.log('[NOTIFICATIONS] routes mounted at /api/notifications');
 
 app.get('/ready', async (req, res) => {
   try {

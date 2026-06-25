@@ -150,8 +150,8 @@ function createStorage() {
   const refundRequests = redis
     ? new RedisCollection({
         name: 'refund requests',
-        keyPrefix: 'nood:storage:refundRequests:',
         keyField: 'request_id',
+        keyPrefix: 'nood:storage:refundRequests:',
         redis,
         migrateFileName: 'refund-requests.json',
       })
@@ -160,6 +160,12 @@ function createStorage() {
         fileName: 'refund-requests.json',
         keyField: 'request_id',
       });
+
+  const pushTokens = new JsonCollection({
+    name: 'push tokens',
+    fileName: 'push-tokens.json',
+    keyField: 'token',
+  });
 
   const ready = (async () => {
     if (redis) {
@@ -183,6 +189,7 @@ function createStorage() {
       failedPaidOrders.ready,
       paymentRecords.ready,
       refundRequests.ready,
+      pushTokens.ready,
     ]);
     console.log('[NOOD storage] payment recovery storage ready (json)', {
       storageDriver: STORAGE_DRIVER,
@@ -195,6 +202,7 @@ function createStorage() {
     paymentRecords,
     refundRequests,
     walletTransactions,
+    pushTokens,
     ready,
     storageDriver: STORAGE_DRIVER,
     get paymentStorageDriver() {
