@@ -3820,6 +3820,18 @@ async function startServer() {
     if (WIPAY_ENVIRONMENT === 'live') {
       console.warn('[WIPAY ENV] live mode active; sandbox test cards will not work');
     }
+    if (shopifyOrderAccessState.ok) {
+      console.log('[NOOD backend] Shopify order creation ready', {
+        tokenSource: shopifyOrderAccessState.tokenSource,
+        tokenFingerprint: shopifyOrderAccessState.tokenFingerprint || null,
+      });
+    } else {
+      console.error('[NOOD backend] Shopify order creation not ready', {
+        message: shopifyOrderAccessState.message,
+        tokenSource: shopifyOrderAccessState.tokenSource || null,
+        missingOrderScopes: shopifyOrderAccessState.missingOrderScopes || [],
+      });
+    }
   });
 }
 

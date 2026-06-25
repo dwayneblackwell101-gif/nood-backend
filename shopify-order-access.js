@@ -2,26 +2,61 @@ const axios = require('axios');
 
 const REQUIRED_ORDER_SCOPES = ['write_orders'];
 
+let resolvedOrderAccess = null;
+
 function safeString(value, fallback = '') {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 
-function getShopifyOrderAccessToken() {
+function getPrimaryOrderAccessToken() {
   return safeString(process.env.SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN);
 }
 
+function getFallbackAdminAccessToken() {
+  return safeString(process.env.SHOPIFY_ADMIN_ACCESS_TOKEN);
+}
+
+function getShopifyOrderAccessToken() {
+  if (resolvedOrderAccess?.accessToken) {
+    return resolvedOrderAccess.accessToken;
+  }
+
+  const primary = getPrimaryOrderAccessToken();
+  if (primary) {
+    return primary;
+  }
+
+  return getFallbackAdminAccessToken();
+}
+
 function hasShopifyOrderAdminAccessToken() {
-  return Boolean(getShopifyOrderAccessToken());
+  return Boolean(getPrimaryOrderAccessToken() || getFallbackAdminAccessToken());
 }
 
 function getShopifyOrderTokenSource() {
-  return 'SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN';
+  if (resolvedOrderAccess?.tokenSource) {
+    return resolvedOrderAccess.tokenSource;
+  }
+
+  if (getPrimaryOrderAccessToken()) {
+    return 'SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN';
+  }
+
+  if (getFallbackAdminAccessToken()) {
+    return 'SHOPIFY_ADMIN_ACCESS_TOKEN';
+  }
+
+  return '';
 }
 
 function getShopifyOrderTokenFingerprint(accessToken = getShopifyOrderAccessToken()) {
   const token = safeString(accessToken);
   if (!token) {
     return '';
+  }
+
+  if (token.startsWith('shpat_') && token.length > 10) {
+    return `shpat_...${token.slice(-4)}`;
   }
 
   if (token.length < 10) {
@@ -63,95 +98,151 @@ async function fetchShopifyAdminScopes(accessToken) {
     console.error('[ORDER CREATE FAILED] could not read Shopify access scopes', {
       status,
       body,
-      tokenSource: getShopifyOrderTokenSource(),
+      tokenFingerprint: getShopifyOrderTokenFingerprint(token),
     });
     return [];
   }
 }
 
-async function validateShopifyOrderCreateAccess() {
-  const storeDomain = safeString(process.env.SHOPIFY_STORE_DOMAIN);
-  const accessToken = getShopifyOrderAccessToken();
-  const tokenSource = getShopifyOrderTokenSource();
-  const tokenFingerprint = getShopifyOrderTokenFingerprint(accessToken);
+async function resolveShopifyOrderAccessToken() {
+  const primaryToken = getPrimaryOrderAccessToken();
 
-  if (!storeDomain) {
-    const message = 'Missing SHOPIFY_STORE_DOMAIN for order creation.';
-    console.error('[ORDER CREATE FAILED] startup validation', {
-      message,
-      tokenSource,
-      tokenFingerprint: tokenFingerprint || null,
-      scopes: [],
-    });
+  if (primaryToken) {
+    const scopes = await fetchShopifyAdminScopes(primaryToken);
+    const missingOrderScopes = getMissingOrderScopes(scopes);
+
     return {
-      ok: false,
-      message,
-      scopes: [],
-      tokenSource,
-      tokenFingerprint,
-      missingOrderScopes: REQUIRED_ORDER_SCOPES,
-      hasShopifyOrderAdminAccessToken: false,
-    };
-  }
-
-  if (!accessToken) {
-    const message =
-      'Missing SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN. Set a dedicated Shopify Admin API token with write_orders scope for paid checkout order creation.';
-    console.error('[ORDER CREATE FAILED] startup validation', {
-      message,
-      tokenSource,
-      tokenFingerprint: null,
-      scopes: [],
-      storeDomain,
-    });
-    return {
-      ok: false,
-      message,
-      scopes: [],
-      tokenSource,
-      tokenFingerprint,
-      missingOrderScopes: REQUIRED_ORDER_SCOPES,
-      hasShopifyOrderAdminAccessToken: false,
-    };
-  }
-
-  const scopes = await fetchShopifyAdminScopes(accessToken);
-  const missingOrderScopes = getMissingOrderScopes(scopes);
-
-  if (missingOrderScopes.length) {
-    const message =
-      `Shopify order creation requires ${missingOrderScopes.join(', ')} on SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN. ` +
-      'In Shopify Admin, open your custom app API credentials, enable write_orders, reinstall the app if prompted, regenerate the Admin API access token, then update SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN on Render.';
-    console.error('[ORDER CREATE FAILED] startup validation', {
-      message,
-      tokenSource,
-      tokenFingerprint,
+      accessToken: primaryToken,
+      tokenSource: 'SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN',
       scopes,
-      missingOrderScopes,
-      storeDomain,
-    });
-    return {
-      ok: false,
-      message,
-      scopes,
-      tokenSource,
-      tokenFingerprint,
       missingOrderScopes,
       hasShopifyOrderAdminAccessToken: true,
     };
   }
 
-  console.log('[ORDER CREATE SUCCESS] startup validation passed', {
+  const fallbackToken = getFallbackAdminAccessToken();
+  if (!fallbackToken) {
+    return {
+      accessToken: '',
+      tokenSource: '',
+      scopes: [],
+      missingOrderScopes: REQUIRED_ORDER_SCOPES,
+      hasShopifyOrderAdminAccessToken: false,
+    };
+  }
+
+  const scopes = await fetchShopifyAdminScopes(fallbackToken);
+  const missingOrderScopes = getMissingOrderScopes(scopes);
+
+  if (!missingOrderScopes.length) {
+    return {
+      accessToken: fallbackToken,
+      tokenSource: 'SHOPIFY_ADMIN_ACCESS_TOKEN',
+      scopes,
+      missingOrderScopes: [],
+      hasShopifyOrderAdminAccessToken: true,
+    };
+  }
+
+  return {
+    accessToken: '',
+    tokenSource: 'SHOPIFY_ADMIN_ACCESS_TOKEN',
+    scopes,
+    missingOrderScopes,
+    hasShopifyOrderAdminAccessToken: true,
+  };
+}
+
+async function validateShopifyOrderCreateAccess() {
+  const storeDomain = safeString(process.env.SHOPIFY_STORE_DOMAIN);
+  const resolved = await resolveShopifyOrderAccessToken();
+  const accessToken = resolved.accessToken;
+  const tokenSource = resolved.tokenSource || getShopifyOrderTokenSource();
+  const tokenFingerprint = getShopifyOrderTokenFingerprint(accessToken);
+
+  resolvedOrderAccess = resolved.accessToken
+    ? {
+        accessToken: resolved.accessToken,
+        tokenSource: resolved.tokenSource,
+      }
+    : null;
+
+  if (!storeDomain) {
+    const message = 'Missing SHOPIFY_STORE_DOMAIN for order creation.';
+    console.error('[ORDER CREATE FAILED] startup validation', {
+      message,
+      tokenSource: tokenSource || null,
+      tokenFingerprint: tokenFingerprint || null,
+      scopes: resolved.scopes,
+    });
+    return {
+      ok: false,
+      message,
+      scopes: resolved.scopes,
+      tokenSource,
+      tokenFingerprint,
+      missingOrderScopes: REQUIRED_ORDER_SCOPES,
+      hasShopifyOrderAdminAccessToken: resolved.hasShopifyOrderAdminAccessToken,
+    };
+  }
+
+  if (!accessToken) {
+    const message = resolved.tokenSource
+      ? `Shopify order creation requires ${resolved.missingOrderScopes.join(', ')} on ${resolved.tokenSource}.`
+      : 'Missing SHOPIFY_ORDER_ADMIN_ACCESS_TOKEN. Set a dedicated Shopify Admin API token with write_orders scope for paid checkout order creation.';
+    console.error('[ORDER CREATE FAILED] startup validation', {
+      message,
+      tokenSource: tokenSource || null,
+      tokenFingerprint: null,
+      scopes: resolved.scopes,
+      storeDomain,
+      missingOrderScopes: resolved.missingOrderScopes,
+    });
+    return {
+      ok: false,
+      message,
+      scopes: resolved.scopes,
+      tokenSource,
+      tokenFingerprint,
+      missingOrderScopes: resolved.missingOrderScopes,
+      hasShopifyOrderAdminAccessToken: resolved.hasShopifyOrderAdminAccessToken,
+    };
+  }
+
+  if (resolved.missingOrderScopes.length) {
+    const message =
+      `Shopify order creation requires ${resolved.missingOrderScopes.join(', ')} on ${tokenSource}. ` +
+      'In Shopify Admin, open your custom app API credentials, enable write_orders, reinstall the app if prompted, regenerate the Admin API access token, then update the order token env var.';
+    console.error('[ORDER CREATE FAILED] startup validation', {
+      message,
+      tokenSource,
+      tokenFingerprint,
+      scopes: resolved.scopes,
+      missingOrderScopes: resolved.missingOrderScopes,
+      storeDomain,
+    });
+    return {
+      ok: false,
+      message,
+      scopes: resolved.scopes,
+      tokenSource,
+      tokenFingerprint,
+      missingOrderScopes: resolved.missingOrderScopes,
+      hasShopifyOrderAdminAccessToken: true,
+    };
+  }
+
+  console.log('[NOOD backend] Shopify order creation ready', {
     tokenSource,
     tokenFingerprint,
-    scopes,
+    scopes: resolved.scopes,
     storeDomain,
   });
 
   return {
     ok: true,
-    message: 'Shopify order creation access is configured.',
-    scopes,
+    message: 'Shopify order creation ready.',
+    scopes: resolved.scopes,
     tokenSource,
     tokenFingerprint,
     missingOrderScopes: [],
@@ -171,7 +262,7 @@ function assertShopifyOrderCreateAccess(orderAccessState) {
   error.code = 'SHOPIFY_ORDER_ACCESS_DENIED';
   error.shopifyDetails = {
     missingOrderScopes: orderAccessState?.missingOrderScopes || REQUIRED_ORDER_SCOPES,
-    tokenSource: getShopifyOrderTokenSource(),
+    tokenSource: orderAccessState?.tokenSource || getShopifyOrderTokenSource(),
     scopes: orderAccessState?.scopes || [],
     hasShopifyOrderAdminAccessToken: Boolean(orderAccessState?.hasShopifyOrderAdminAccessToken),
   };
@@ -186,6 +277,7 @@ module.exports = {
   getShopifyOrderTokenFingerprint,
   getMissingOrderScopes,
   fetchShopifyAdminScopes,
+  resolveShopifyOrderAccessToken,
   validateShopifyOrderCreateAccess,
   assertShopifyOrderCreateAccess,
 };
