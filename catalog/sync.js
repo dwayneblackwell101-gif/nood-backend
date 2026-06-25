@@ -319,7 +319,10 @@ async function saveProductPage(cache, adminProducts, config) {
   let saved = 0;
 
   for (const adminProduct of adminProducts) {
-    const product = transformAdminProduct(adminProduct, config.currencyCode);
+    const product = transformAdminProduct(
+      adminProduct,
+      config.catalogCurrencyCode || config.currencyCode
+    );
     if (!product.handle) {
       continue;
     }
@@ -479,7 +482,10 @@ async function bumpCatalogVersion(cache, reason = 'catalog-change') {
 
 async function syncSingleProduct(cache, adminProduct, context = {}) {
   const config = getShopifyConfig();
-  const product = transformAdminProduct(adminProduct, config.currencyCode);
+  const product = transformAdminProduct(
+    adminProduct,
+    config.catalogCurrencyCode || config.currencyCode
+  );
   const handle = safeString(product?.handle);
   const productId = safeString(product?.id);
   const reason = safeString(context?.reason) || 'product-sync';

@@ -54,6 +54,8 @@ function getLowBucketWaitMs(throttleStatus, requestedQueryCost = 50) {
   return Math.ceil((deficit / restoreRate) * 1000) + 150;
 }
 
+const CATALOG_PRICE_CURRENCY = 'USD';
+
 function getShopifyConfig() {
   return {
     storeDomain: safeString(process.env.SHOPIFY_STORE_DOMAIN),
@@ -65,6 +67,7 @@ function getShopifyConfig() {
       process.env.SHOPIFY_ADMIN_API_VERSION || '2025-10'
     ),
     currencyCode: safeString(process.env.SHOPIFY_CURRENCY, 'USD'),
+    catalogCurrencyCode: CATALOG_PRICE_CURRENCY,
   };
 }
 
@@ -734,6 +737,7 @@ async function fetchAllAdminCollections() {
 }
 
 module.exports = {
+  CATALOG_PRICE_CURRENCY,
   getShopifyConfig,
   adminGraphql,
   storefrontGraphql,
