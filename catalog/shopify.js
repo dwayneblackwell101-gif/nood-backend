@@ -64,7 +64,7 @@ function getShopifyConfig() {
       process.env.SHOPIFY_STOREFRONT_API_VERSION,
       process.env.SHOPIFY_ADMIN_API_VERSION || '2025-10'
     ),
-    currencyCode: safeString(process.env.SHOPIFY_CURRENCY, 'TTD'),
+    currencyCode: safeString(process.env.SHOPIFY_CURRENCY, 'USD'),
   };
 }
 

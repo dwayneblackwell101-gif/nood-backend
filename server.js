@@ -76,7 +76,7 @@ const SHOPIFY_APP_AUTH_CALLBACK_URI = safeString(
   'shop.66320990292.nood://auth/callback'
 );
 const PAYPAL_CURRENCY = safeString(process.env.PAYPAL_CURRENCY, 'USD').toUpperCase();
-const SHOPIFY_CURRENCY = safeString(process.env.SHOPIFY_CURRENCY, 'TTD').toUpperCase();
+const SHOPIFY_CURRENCY = safeString(process.env.SHOPIFY_CURRENCY, 'USD').toUpperCase();
 const PAYPAL_USD_TO_TTD_RATE = Number(process.env.PAYPAL_USD_TO_TTD_RATE || 6.8);
 const BACKEND_BASE_URL = getBackendBaseUrl();
 
@@ -787,21 +787,19 @@ function savePaymentRecord(record) {
   return nextRecord;
 }
 
+function getUsdToTtdRate() {
+  if (!Number.isFinite(PAYPAL_USD_TO_TTD_RATE) || PAYPAL_USD_TO_TTD_RATE <= 0) {
+    const error = new Error('PAYPAL_USD_TO_TTD_RATE must be a positive number.');
+    error.statusCode = 500;
+    throw error;
+  }
+
+  return PAYPAL_USD_TO_TTD_RATE;
+}
+
 function assertPayPalCurrency() {
   if (PAYPAL_CURRENCY !== 'USD') {
     const error = new Error('PayPal checkout is configured for USD only right now.');
-    error.statusCode = 500;
-    throw error;
-  }
-
-  if (SHOPIFY_CURRENCY !== 'TTD') {
-    const error = new Error('Shopify order currency is configured for TTD only right now.');
-    error.statusCode = 500;
-    throw error;
-  }
-
-  if (!Number.isFinite(PAYPAL_USD_TO_TTD_RATE) || PAYPAL_USD_TO_TTD_RATE <= 0) {
-    const error = new Error('PAYPAL_USD_TO_TTD_RATE must be a positive number.');
     error.statusCode = 500;
     throw error;
   }
@@ -817,26 +815,40 @@ function toMoneyNumber(value) {
 }
 
 function convertUsdToTtd(usdAmount) {
-  assertPayPalCurrency();
-  return safeMoney(Number(usdAmount) * PAYPAL_USD_TO_TTD_RATE);
+  return safeMoney(Number(usdAmount) * getUsdToTtdRate());
 }
 
 function convertTtdToUsd(ttdAmount) {
-  assertPayPalCurrency();
-  return safeMoney(Number(ttdAmount) / PAYPAL_USD_TO_TTD_RATE);
+  return safeMoney(Number(ttdAmount) / getUsdToTtdRate());
 }
 
-function getPayPalCheckoutAmountsFromTtd(body = {}) {
+function getPayPalCheckoutAmounts(body = {}) {
   assertPayPalCurrency();
-  const shopifyTotalTtd = assertCheckoutTotalMatches(body);
+  const shopifyTotal = assertCheckoutTotalMatches(body);
 
-  if (!isValidPositiveMoney(shopifyTotalTtd)) {
-    const error = new Error('Invalid Shopify checkout total. Minimum is 1.00 TTD.');
+  if (!isValidPositiveMoney(shopifyTotal)) {
+    const error = new Error(
+      SHOPIFY_CURRENCY === 'USD'
+        ? 'Invalid Shopify checkout total. Minimum is 1.00 USD.'
+        : 'Invalid Shopify checkout total. Minimum is 1.00 TTD.'
+    );
     error.statusCode = 400;
     throw error;
   }
 
-  const paypalTotalUsd = convertTtdToUsd(shopifyTotalTtd);
+  if (SHOPIFY_CURRENCY === 'USD') {
+    return {
+      shopifyTotal,
+      shopifyTotalUsd: shopifyTotal,
+      shopifyTotalTtd: convertUsdToTtd(shopifyTotal),
+      paypalTotalUsd: shopifyTotal,
+      paypalCurrency: PAYPAL_CURRENCY,
+      shopifyCurrency: SHOPIFY_CURRENCY,
+      exchangeRate: getUsdToTtdRate(),
+    };
+  }
+
+  const paypalTotalUsd = convertTtdToUsd(shopifyTotal);
   if (!isValidPositiveMoney(paypalTotalUsd)) {
     const error = new Error('Invalid PayPal USD total after conversion.');
     error.statusCode = 400;
@@ -844,12 +856,18 @@ function getPayPalCheckoutAmountsFromTtd(body = {}) {
   }
 
   return {
-    shopifyTotalTtd,
+    shopifyTotal,
+    shopifyTotalUsd: paypalTotalUsd,
+    shopifyTotalTtd: shopifyTotal,
     paypalTotalUsd,
     paypalCurrency: PAYPAL_CURRENCY,
     shopifyCurrency: SHOPIFY_CURRENCY,
-    exchangeRate: PAYPAL_USD_TO_TTD_RATE,
+    exchangeRate: getUsdToTtdRate(),
   };
+}
+
+function getPayPalCheckoutAmountsFromTtd(body = {}) {
+  return getPayPalCheckoutAmounts(body);
 }
 
 function getPayPalAmounts(body = {}) {
@@ -1893,8 +1911,8 @@ app.post('/api/orders', async (req, res) => {
     }
 
     const checkoutSessionId = resolveCheckoutSessionId(req.body);
-    const payPalAmounts = getPayPalCheckoutAmountsFromTtd(req.body);
-    const total = payPalAmounts.shopifyTotalTtd;
+    const payPalAmounts = getPayPalCheckoutAmounts(req.body);
+    const total = payPalAmounts.shopifyTotal;
     const cartItems = getCartItemsFromBody(req.body);
 
     if (!cartItems.length) {
@@ -2465,13 +2483,15 @@ app.post('/create-wipay-payment', async (req, res) => {
       });
     }
 
-    const parsedTotal = assertCheckoutTotalMatches(req.body);
+    const parsedTotalUsd = assertCheckoutTotalMatches(req.body);
+    const wipayTotalTtd =
+      SHOPIFY_CURRENCY === 'USD' ? convertUsdToTtd(parsedTotalUsd) : parsedTotalUsd;
     const customerName = safeString(name);
     const customerEmail = safeString(email);
     const customerPhone = safeString(phone);
 
     const validationErrors = validateCheckoutData({
-      total: parsedTotal,
+      total: parsedTotalUsd,
       cartItems,
       name: customerName,
       email: customerEmail,
@@ -2514,7 +2534,8 @@ app.post('/create-wipay-payment', async (req, res) => {
     const returnToken = generateReturnToken();
 
     console.log('[NOOD backend] WiPay create payment request', {
-      total: parsedTotal,
+      totalUsd: parsedTotalUsd,
+      totalTtd: wipayTotalTtd,
       cartItems,
       shippingAddress,
     });
@@ -2528,7 +2549,8 @@ app.post('/create-wipay-payment', async (req, res) => {
       pendingCheckoutId: clientOrderId,
       checkoutSessionId: checkoutSessionId || clientOrderId,
       returnToken,
-      total: parsedTotal,
+      total: parsedTotalUsd,
+      wipayTotalTtd,
       currency: SHOPIFY_CURRENCY,
       name: customerName,
       email: customerEmail,
@@ -2550,7 +2572,7 @@ app.post('/create-wipay-payment', async (req, res) => {
       order_id: orderId,
       origin: 'nood_app',
       response_url: responseUrl,
-      total: parsedTotal,
+      total: wipayTotalTtd,
       name: customerName,
       email: customerEmail,
       phone: customerPhone,

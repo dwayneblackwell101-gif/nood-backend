@@ -9,10 +9,10 @@ function stripHtml(html) {
     .trim();
 }
 
-function toStorefrontMoney(amount, currencyCode = 'TTD') {
+function toStorefrontMoney(amount, currencyCode = 'USD') {
   const num = Number(amount);
   const safeAmount = Number.isFinite(num) ? num.toFixed(2) : '0.00';
-  return { amount: safeAmount, currencyCode: safeString(currencyCode, 'TTD') };
+  return { amount: safeAmount, currencyCode: safeString(currencyCode, 'USD') };
 }
 
 function variantAvailable(variant) {
@@ -39,7 +39,7 @@ function transformAdminVariant(variant, currencyCode) {
   };
 }
 
-function transformAdminProduct(adminProduct, currencyCode = 'TTD') {
+function transformAdminProduct(adminProduct, currencyCode = 'USD') {
   const variants = (adminProduct?.variants?.edges || []).map((edge) =>
     transformAdminVariant(edge?.node, currencyCode)
   );
@@ -127,7 +127,7 @@ function transformAdminProduct(adminProduct, currencyCode = 'TTD') {
   };
 }
 
-function transformStorefrontProduct(node, currencyCode = 'TTD') {
+function transformStorefrontProduct(node, currencyCode = 'USD') {
   if (!node) return null;
   const variants = (node?.variants?.edges || []).map((edge) => ({
     node: {
@@ -215,7 +215,7 @@ function toStorefrontListProduct(product) {
     availableForSale: Boolean(product.availableForSale),
     featuredImage,
     priceRange: product.priceRange || {
-      minVariantPrice: toStorefrontMoney(0, 'TTD'),
+      minVariantPrice: toStorefrontMoney(0, 'USD'),
     },
     compareAtPriceRange: product.compareAtPriceRange || { maxVariantPrice: null },
     collections: {
