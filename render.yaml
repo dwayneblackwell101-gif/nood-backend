@@ -23,6 +23,8 @@ services:
         sync: false
       - key: NOOD_ALLOWED_ORIGINS
         sync: false
+      - key: SHOPIFY_CURRENCY
+        value: USD
       - key: SHOPIFY_STORE_DOMAIN
         sync: false
       - key: SHOPIFY_ADMIN_ACCESS_TOKEN
