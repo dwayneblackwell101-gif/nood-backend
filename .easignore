@@ -4,16 +4,25 @@ node_modules/
 .expo-*/
 .chrome-check/
 .codex-remote-attachments/
+deploy/
 dist/
 preview/
 eas-inspect/
 eas-inspect2/
 eas-final-inspect/
 tmp-*.json
+.expo-backend-check
+.expo-crash-check
+.expo-fix-check
+.expo-gesture-check
+.expo-perf-check
 *.log
 *.sys
 *.dat
 netrtwlane601.*
+scripts/check-product-availability.mjs
+scripts/refresh-shopify-availability.mjs
+scripts/verify-auth-flow.mjs
 
 # Use EAS prebuild + config plugins instead of stale local native projects.
 android/
