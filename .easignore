@@ -1,0 +1,11 @@
+# Keep EAS archives small and avoid stale local artifacts in builds.
+node_modules/
+.expo/
+.expo-*/
+.chrome-check/
+.codex-remote-attachments/
+preview/
+tmp-*.json
+*.sys
+*.dat
+netrtwlane601.*
