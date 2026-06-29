@@ -1,8 +1,10 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useUser } from './UserContext';
+import { getCustomerProfile } from '../utils/customer-profile';
+import { getHistoryStorageKey } from '../utils/customer-storage';
 
-const HISTORY_STORAGE_KEY = 'NOOD_HISTORY_EVENTS_V1';
+const LEGACY_HISTORY_PREFIX = 'NOOD_HISTORY_EVENTS_V1';
 
 export type HistoryEventType =
   | 'order'
@@ -11,7 +13,8 @@ export type HistoryEventType =
   | 'address'
   | 'wishlist'
   | 'checkout'
-  | 'account';
+  | 'account'
+  | 'review';
 
 export type HistoryEvent = {
   id: string;
@@ -39,28 +42,76 @@ type HistoryContextValue = {
 
 const HistoryContext = createContext<HistoryContextValue | null>(null);
 
-const makeStorageKey = (profileId: string) => `${HISTORY_STORAGE_KEY}:${profileId || 'guest'}`;
+async function loadLegacyHistory(profileId: string): Promise<HistoryEvent[]> {
+  try {
+    const saved = await AsyncStorage.getItem(`${LEGACY_HISTORY_PREFIX}:${profileId || 'guest'}`);
+    if (!saved) {
+      return [];
+    }
+
+    const parsed = JSON.parse(saved);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
 
 export function HistoryProvider({ children }: { children: React.ReactNode }) {
-  const { profileId, isReady } = useUser();
+  const { profileId, isReady, isSignedIn } = useUser();
   const [historyEvents, setHistoryEvents] = useState<HistoryEvent[]>([]);
-  const storageKey = useMemo(() => makeStorageKey(profileId), [profileId]);
+  const [customerEmail, setCustomerEmail] = useState('');
+
+  const storageKey = useMemo(
+    () => (profileId ? getHistoryStorageKey(profileId, customerEmail, isSignedIn) : ''),
+    [customerEmail, isSignedIn, profileId]
+  );
+
+  useEffect(() => {
+    if (!isSignedIn) {
+      setCustomerEmail('');
+      return;
+    }
+
+    void getCustomerProfile().then((profile) => {
+      setCustomerEmail(profile?.email || '');
+    });
+  }, [isSignedIn]);
 
   useEffect(() => {
     let isMounted = true;
 
     const loadEvents = async () => {
-      if (!isReady) return;
+      if (!isReady || !profileId || !storageKey) {
+        return;
+      }
+
+      if (!isSignedIn) {
+        if (isMounted) {
+          setHistoryEvents([]);
+        }
+        return;
+      }
 
       try {
         const saved = await AsyncStorage.getItem(storageKey);
-        const parsed = saved ? JSON.parse(saved) : [];
+        let parsed: HistoryEvent[] = saved ? JSON.parse(saved) : [];
+
+        if (!Array.isArray(parsed) || !parsed.length) {
+          const legacy = await loadLegacyHistory(profileId);
+          if (legacy.length) {
+            parsed = legacy;
+            await AsyncStorage.setItem(storageKey, JSON.stringify(legacy.slice(0, 250)));
+          }
+        }
+
         if (isMounted) {
           setHistoryEvents(Array.isArray(parsed) ? parsed : []);
         }
       } catch (error) {
         console.log('History load error:', error);
-        if (isMounted) setHistoryEvents([]);
+        if (isMounted) {
+          setHistoryEvents([]);
+        }
       }
     };
 
@@ -69,10 +120,14 @@ export function HistoryProvider({ children }: { children: React.ReactNode }) {
     return () => {
       isMounted = false;
     };
-  }, [isReady, storageKey]);
+  }, [isReady, isSignedIn, profileId, storageKey]);
 
   const persist = useCallback(
     async (nextEvents: HistoryEvent[]) => {
+      if (!storageKey) {
+        return;
+      }
+
       setHistoryEvents(nextEvents);
       await AsyncStorage.setItem(storageKey, JSON.stringify(nextEvents.slice(0, 250)));
     },
@@ -81,6 +136,10 @@ export function HistoryProvider({ children }: { children: React.ReactNode }) {
 
   const addHistoryEvent = useCallback(
     async (event: HistoryEventInput) => {
+      if (!storageKey || !isSignedIn) {
+        return;
+      }
+
       const nextEvent: HistoryEvent = {
         ...event,
         id: event.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -90,14 +149,16 @@ export function HistoryProvider({ children }: { children: React.ReactNode }) {
       setHistoryEvents((prev) => {
         const duplicateKey = `${nextEvent.type}:${nextEvent.relatedId || nextEvent.id}:${nextEvent.status || ''}:${nextEvent.title}`;
         const existing = prev.some(
-          (item) => `${item.type}:${item.relatedId || item.id}:${item.status || ''}:${item.title}` === duplicateKey
+          (item) =>
+            `${item.type}:${item.relatedId || item.id}:${item.status || ''}:${item.title}` ===
+            duplicateKey
         );
         const nextEvents = existing ? prev : [nextEvent, ...prev].slice(0, 250);
         void AsyncStorage.setItem(storageKey, JSON.stringify(nextEvents));
         return nextEvents;
       });
     },
-    [storageKey]
+    [isSignedIn, storageKey]
   );
 
   const clearHistoryEvents = useCallback(async () => {

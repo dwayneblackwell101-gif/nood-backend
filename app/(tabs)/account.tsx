@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  FlatList,
+  Platform,
   SafeAreaView,
   View,
   Text,
@@ -10,57 +11,96 @@ import {
   Image,
   useWindowDimensions,
 } from 'react-native';
+import { Image as ExpoImage } from 'expo-image';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import { useRouter } from 'expo-router';
+import * as ImagePicker from 'expo-image-picker';
+import { useFocusEffect, useNavigation, useRouter } from 'expo-router';
 import { useCart } from '../../context/CartContext';
-import { useUser } from '../../context/UserContext';
 import { useUpdates } from '../../context/UpdatesContext';
+import { useHistoryEvents } from '../../context/HistoryContext';
+import { useUser } from '../../context/UserContext';
+
 import NoodSpinner from '../../components/NoodSpinner';
+import * as WebBrowser from 'expo-web-browser';
+import { logAuthRestartCheck } from '../../utils/auth-restart-debug';
+import { isAppBootstrapComplete } from '../../utils/app-bootstrap';
+import { handleShopifyAuthRedirectUrl } from '../../utils/shopify-auth-handlers';
+import { launchShopifyAuthSession } from '../../utils/shopify-auth-launcher';
+
+WebBrowser.maybeCompleteAuthSession();
+import { loadAccountRecommendations } from '../../utils/account-recommendations';
+import { buildProductRouteParams } from '../../utils/product-navigation';
+import type { CatalogListProduct } from '../../utils/catalog-product-mapper';
 import { BASE_CURRENCY } from '../../utils/currency';
-import { catalogFetch } from '../../utils/catalog';
+import { getProfilePictureUri, saveProfilePicture } from '../../utils/profile-avatar';
+import { getWalletTransactionDisplay } from '../../utils/wallet-display';
+import { noodAlert } from '../../utils/nood-alert';
+import { SIGN_IN_ENABLED } from '../../utils/payment-testing';
+import { useScreenPerfReporter } from '../../utils/screen-perf';
+import { fetchShopifyDiscounts, type NoodDiscount } from '../../utils/shopify-discounts';
+import {
+  buildCustomerDisplayName,
+  getCustomerProfile,
+  type CustomerProfile,
+} from '../../utils/customer-profile';
 
 const GOOGLE_LOGO_URL =
   'https://cdn.shopify.com/s/files/1/0663/2099/0292/files/2a5758d6-4edb-4047-87bb-e6b94dbbbab0-cover.png?v=1781936734';
+const NOOD_LOGO_SOURCE = require('../../assets/images/nood-brand-logo.png');
+
+function getProfileInitials(name: string): string {
+  const parts = String(name || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (!parts.length) {
+    return '';
+  }
+
+  if (parts.length === 1) {
+    return parts[0].slice(0, 2).toUpperCase();
+  }
+
+  return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+}
 
 type RowIconName = React.ComponentProps<typeof Ionicons>['name'];
 
-type ShopifyProduct = {
-  id: string;
-  title: string;
-  handle: string;
-  image: string;
-  priceAmount: number;
-  currencyCode: string;
-};
+type AccountProduct = CatalogListProduct;
+
+const PRODUCT_IMAGE_PLACEHOLDER = 'https://via.placeholder.com/600x600.png?text=No+Image';
+const ACCOUNT_MENU_ROW_COUNT = 10;
+const ACCOUNT_FOCUS_REFRESH_MS = 60000;
 
 let accountScrollOffsetSnapshot = 0;
-let accountRecommendedProductsSnapshot: ShopifyProduct[] = [];
-const ACCOUNT_RECOMMENDATIONS_CACHE_KEY = 'NOOD_ACCOUNT_RECOMMENDATIONS_CACHE_V1';
+let accountRecommendedProductsSnapshot: AccountProduct[] = [];
 
-const ACCOUNT_PRODUCTS_QUERY = `
-  query GetAccountRecommendedProducts($first: Int!) {
-    products(first: $first, sortKey: CREATED_AT, reverse: true) {
-      edges {
-        node {
-          id
-          title
-          handle
-          featuredImage {
-            url
-          }
-          priceRange {
-            minVariantPrice {
-              amount
-              currencyCode
-            }
-          }
-        }
-      }
-    }
-  }
-`;
+const WalletActivityRow = React.memo(function WalletActivityRow({
+  note,
+  createdAt,
+  amountLabel,
+  amountColor,
+}: {
+  note: string;
+  createdAt?: string;
+  amountLabel: string;
+  amountColor: string;
+}) {
+  return (
+    <View style={styles.walletRow}>
+      <View style={styles.walletLeft}>
+        <Text style={styles.walletNote}>{note}</Text>
+        <Text style={styles.walletDate}>
+          {createdAt ? new Date(createdAt).toLocaleDateString() : 'Recent'}
+        </Text>
+      </View>
+      <Text style={[styles.walletAmount, { color: amountColor }]}>{amountLabel}</Text>
+    </View>
+  );
+});
 
-function MenuRow({
+const MenuRow = React.memo(function MenuRow({
   icon,
   title,
   subtitle,
@@ -87,152 +127,376 @@ function MenuRow({
       <Ionicons name="chevron-forward" size={20} color="#999" />
     </TouchableOpacity>
   );
-}
+});
 
-function QuickAction({
+const QuickAction = React.memo(function QuickAction({
   icon,
   label,
+  subtitle,
   onPress,
 }: {
   icon: RowIconName;
   label: string;
+  subtitle: string;
   onPress: () => void;
 }) {
   return (
     <TouchableOpacity style={styles.quickItem} activeOpacity={0.88} onPress={onPress}>
-      <View style={styles.quickIconWrap}>
-        <Ionicons name={icon} size={22} color="#ff6a00" />
+      <View style={styles.quickMiniCard}>
+        <View style={styles.quickIconWrap}>
+          <Ionicons name={icon} size={20} color="#ff6a00" />
+        </View>
+        <Text style={styles.quickText} numberOfLines={1}>
+          {label}
+        </Text>
+        <Text style={styles.quickSubtitle} numberOfLines={2}>
+          {subtitle}
+        </Text>
       </View>
-      <Text style={styles.quickText}>{label}</Text>
     </TouchableOpacity>
+  );
+});
+
+function ProductSkeletonCard() {
+  return (
+    <View style={styles.productCard}>
+      <View style={[styles.productImage, styles.skeletonBlock]} />
+      <View style={styles.productBody}>
+        <View style={[styles.skeletonLine, styles.skeletonLineWide]} />
+        <View style={[styles.skeletonLine, styles.skeletonLineMedium]} />
+        <View style={styles.productBottomRow}>
+          <View style={[styles.skeletonLine, styles.skeletonLinePrice]} />
+          <View style={[styles.smallCartBtn, styles.skeletonBlock]} />
+        </View>
+      </View>
+    </View>
   );
 }
 
-function ProductCard({
+const ProductCard = React.memo(function ProductCard({
   image,
   title,
   price,
   onPress,
+  onAddToCart,
 }: {
   image: string;
   title: string;
   price: string;
   onPress: () => void;
+  onAddToCart?: () => void;
 }) {
   return (
     <TouchableOpacity style={styles.productCard} activeOpacity={0.9} onPress={onPress}>
-      <Image source={{ uri: image }} style={styles.productImage} resizeMode="cover" />
+      <ExpoImage
+        source={{ uri: image || PRODUCT_IMAGE_PLACEHOLDER }}
+        style={styles.productImage}
+        contentFit="cover"
+        cachePolicy="memory-disk"
+        recyclingKey={image || PRODUCT_IMAGE_PLACEHOLDER}
+        transition={0}
+      />
 
       <View style={styles.productBody}>
         <Text numberOfLines={2} style={styles.productTitle}>
           {title}
         </Text>
 
-        <View style={styles.ratingRow}>
-          <Text style={styles.stars}>★★★★★</Text>
-          <Text style={styles.soldLabel}>Store pick</Text>
-        </View>
-
         <View style={styles.productBottomRow}>
           <Text style={styles.productPrice}>{price}</Text>
 
-          <View style={styles.smallCartBtn}>
+          <TouchableOpacity
+            style={styles.smallCartBtn}
+            activeOpacity={0.88}
+            onPress={(event) => {
+              event.stopPropagation();
+              onAddToCart?.();
+            }}
+          >
             <Ionicons name="cart-outline" size={18} color="#ff6a00" />
-          </View>
+          </TouchableOpacity>
         </View>
       </View>
     </TouchableOpacity>
   );
-}
+});
 
 export default function AccountScreen() {
   const router = useRouter();
+  const navigation = useNavigation();
   const { width } = useWindowDimensions();
-  const { settings, isReady, isSignedIn, displayName } = useUser();
-  const { unreadCount } = useUpdates();
+  const { settings, isReady, isSignedIn, displayName, profileId, markSignedIn } = useUser();
+  const { addHistoryEvent } = useHistoryEvents();
+  const [openingSignInProvider, setOpeningSignInProvider] = useState<string | null>(null);
+  const { unreadCount = 0 } = useUpdates();
   const isCompact = width < 430;
 
   const {
     balanceConverted = 0,
     walletHistory = [],
     orders = [],
+    cartItems = [],
     selectedCurrency = settings?.currency || BASE_CURRENCY,
     convertPrice,
     formatMoney,
+    addToCart,
+    refreshOrdersFromShopify,
   } = (useCart() as any) || {};
 
-  const [recommendedProducts, setRecommendedProducts] = useState<ShopifyProduct[]>(
+  const [recommendedProducts, setRecommendedProducts] = useState<AccountProduct[]>(
     () => accountRecommendedProductsSnapshot
   );
   const [loadingProducts, setLoadingProducts] = useState(!accountRecommendedProductsSnapshot.length);
+  const [recommendationsStatus, setRecommendationsStatus] = useState<
+    'loading' | 'ready' | 'cached' | 'error'
+  >(accountRecommendedProductsSnapshot.length ? 'ready' : 'loading');
+  const [activeShippingDeal, setActiveShippingDeal] = useState<NoodDiscount | null>(null);
+  const [profilePictureUri, setProfilePictureUri] = useState<string | null>(null);
+  const [shopifyProfile, setShopifyProfile] = useState<CustomerProfile | null>(null);
   const scrollRef = useRef<ScrollView | null>(null);
   const restoredScrollRef = useRef(false);
+  const lastAccountFocusLoadRef = useRef(0);
+  const recommendationsLoadedFingerprintRef = useRef('');
 
   const currentCurrency = selectedCurrency || settings?.currency || BASE_CURRENCY;
-  const shownName = isSignedIn ? displayName || 'NOOD Shopper' : 'Guest';
-  const memberLabel = isSignedIn ? 'NOOD Member' : 'Sign in to view your customer account';
+
+  const loadShopifyProfile = useCallback(async () => {
+    if (!isSignedIn) {
+      setShopifyProfile(null);
+      return;
+    }
+
+    const profile = await getCustomerProfile();
+    setShopifyProfile(profile);
+  }, [isSignedIn]);
+
+  const shownName = useMemo(() => {
+    if (!isSignedIn) {
+      return 'Guest';
+    }
+
+    const fromProfile = shopifyProfile
+      ? buildCustomerDisplayName(shopifyProfile) || shopifyProfile.displayName
+      : '';
+    if (fromProfile) {
+      return fromProfile;
+    }
+
+    const fromContext = String(displayName || '').trim();
+    if (fromContext && fromContext !== 'NOOD Shopper') {
+      return fromContext;
+    }
+
+    return 'NOOD Member';
+  }, [displayName, isSignedIn, shopifyProfile]);
+
+  const openSignIn = useCallback(
+    async (provider?: 'google' | 'facebook' | 'shop') => {
+      if (!provider) {
+        router.push('/sign-in' as any);
+        return;
+      }
+
+      if (openingSignInProvider) return;
+
+      setOpeningSignInProvider(provider);
+      logAuthRestartCheck({
+        step: 'account-open-sign-in',
+        isAppBootstrapping: !isAppBootstrapComplete(),
+        isAuthLoading: true,
+        detail: { provider },
+      });
+
+      await launchShopifyAuthSession({
+        provider,
+        onRedirectUrl: async (url) => {
+          await handleShopifyAuthRedirectUrl(url, {
+            markSignedIn,
+            addHistoryEvent,
+          });
+        },
+        onError: (message) => {
+          noodAlert('Sign-in unavailable', message);
+        },
+      });
+
+      setOpeningSignInProvider(null);
+    },
+    [addHistoryEvent, markSignedIn, openingSignInProvider, router]
+  );
+
+  const memberLabel = useMemo(() => {
+    if (!isSignedIn) {
+      return 'Sign in to view your customer account';
+    }
+
+    const email = String(shopifyProfile?.email || '').trim();
+    if (email) {
+      return email;
+    }
+
+    return 'NOOD Member';
+  }, [isSignedIn, shopifyProfile]);
+
+  const profileInitials = useMemo(() => {
+    if (!isSignedIn) {
+      return '';
+    }
+
+    const normalizedName = String(shownName || '').trim();
+    if (!normalizedName || normalizedName === 'NOOD Member') {
+      return '';
+    }
+
+    return getProfileInitials(normalizedName);
+  }, [isSignedIn, shownName]);
+
+  const loadProfilePicture = useCallback(async () => {
+    if (!isSignedIn || !profileId) {
+      setProfilePictureUri(null);
+      return;
+    }
+
+    const savedUri = await getProfilePictureUri(profileId);
+    setProfilePictureUri(savedUri);
+  }, [isSignedIn, profileId]);
+
+  useFocusEffect(
+    useCallback(() => {
+      void loadProfilePicture();
+      void loadShopifyProfile();
+
+      const now = Date.now();
+      if (now - lastAccountFocusLoadRef.current < ACCOUNT_FOCUS_REFRESH_MS) {
+        return;
+      }
+      lastAccountFocusLoadRef.current = now;
+
+      void fetchShopifyDiscounts().then((response) => {
+        const firstShippingDeal = response.shipping.find((deal) => deal.isActive) || null;
+        setActiveShippingDeal(firstShippingDeal);
+      });
+
+      if (isSignedIn) {
+        void refreshOrdersFromShopify?.();
+      }
+    }, [isSignedIn, loadProfilePicture, loadShopifyProfile, refreshOrdersFromShopify])
+  );
+
+  const handleEditProfilePicture = useCallback(async () => {
+    if (!isSignedIn || !profileId) {
+      return;
+    }
+
+    if (Platform.OS === 'web') {
+      noodAlert('Profile picture', 'Choose a profile picture from the NOOD mobile app.');
+      return;
+    }
+
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        noodAlert(
+          'Photo access needed',
+          'Allow photo library access to choose a profile picture.'
+        );
+        return;
+      }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images'],
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.85,
+      });
+
+      if (result.canceled || !result.assets?.[0]?.uri) {
+        return;
+      }
+
+      const savedUri = await saveProfilePicture(profileId, result.assets[0].uri);
+      setProfilePictureUri(savedUri);
+    } catch (error) {
+      console.log('Profile picture picker error:', error);
+      noodAlert('Profile picture', 'Could not update your profile picture. Please try again.');
+    }
+  }, [isSignedIn, profileId]);
+
+  const recommendationFingerprint = useMemo(
+    () =>
+      [
+        profileId || 'guest',
+        isSignedIn ? '1' : '0',
+        (cartItems || [])
+          .map((item: any) => String(item?.handle || item?.id || ''))
+          .sort()
+          .join('|'),
+        (orders || [])
+          .map((order: any) => String(order?.id || ''))
+          .sort()
+          .join('|'),
+      ].join('::'),
+    [cartItems, isSignedIn, orders, profileId]
+  );
+
+  const loadRecommendedProducts = useCallback(async () => {
+    if (!isReady) return;
+
+    const hasSnapshot = accountRecommendedProductsSnapshot.length > 0;
+    if (!hasSnapshot) {
+      setLoadingProducts(true);
+    }
+    setRecommendationsStatus('loading');
+
+    try {
+      const result = await loadAccountRecommendations({
+        profileId: profileId || 'guest',
+        isSignedIn,
+        cartItems,
+        orders,
+      });
+
+      accountRecommendedProductsSnapshot = result.products;
+      setRecommendedProducts(result.products);
+      setRecommendationsStatus(
+        result.products.length ? result.status : 'error'
+      );
+    } catch (error) {
+      console.log('Account recommended products error:', error);
+      setRecommendationsStatus(hasSnapshot ? 'cached' : 'error');
+    } finally {
+      setLoadingProducts(false);
+    }
+  }, [cartItems, isReady, isSignedIn, orders, profileId]);
 
   useEffect(() => {
-    const mapAccountProducts = (edges: any[]): ShopifyProduct[] =>
-      (edges || []).map((edge: any) => ({
-        id: String(edge?.node?.id),
-        title: edge?.node?.title || 'Untitled Product',
-        handle: edge?.node?.handle || '',
-        image:
-          edge?.node?.featuredImage?.url ||
-          'https://via.placeholder.com/600x600.png?text=No+Image',
-        priceAmount: Number(edge?.node?.priceRange?.minVariantPrice?.amount || 0),
-        currencyCode:
-          edge?.node?.priceRange?.minVariantPrice?.currencyCode || BASE_CURRENCY,
-      }));
+    if (!isReady) return;
+    if (recommendationsLoadedFingerprintRef.current === recommendationFingerprint) return;
 
-    const loadProducts = async () => {
-      let showedCache = accountRecommendedProductsSnapshot.length > 0;
+    recommendationsLoadedFingerprintRef.current = recommendationFingerprint;
 
-      if (showedCache) {
-        setRecommendedProducts(accountRecommendedProductsSnapshot);
-        setLoadingProducts(false);
-      } else {
-        try {
-          const cachedRaw = await AsyncStorage.getItem(ACCOUNT_RECOMMENDATIONS_CACHE_KEY);
-          if (cachedRaw) {
-            const parsed = JSON.parse(cachedRaw) as { products?: ShopifyProduct[] };
-            if (Array.isArray(parsed.products) && parsed.products.length) {
-              setRecommendedProducts(parsed.products);
-              setLoadingProducts(false);
-              showedCache = true;
-            }
-          }
-        } catch (error) {
-          console.log('Account recommendations cache read error:', error);
-        }
-      }
+    if (accountRecommendedProductsSnapshot.length) {
+      setRecommendedProducts(accountRecommendedProductsSnapshot);
+      setLoadingProducts(false);
+    }
 
-      try {
-        const json = await catalogFetch(ACCOUNT_PRODUCTS_QUERY, { first: 4 });
-        const mapped = mapAccountProducts(json?.data?.products?.edges || []);
+    void loadRecommendedProducts();
+  }, [isReady, recommendationFingerprint, loadRecommendedProducts]);
 
-        accountRecommendedProductsSnapshot = mapped;
-        setRecommendedProducts(mapped);
-        await AsyncStorage.setItem(
-          ACCOUNT_RECOMMENDATIONS_CACHE_KEY,
-          JSON.stringify({
-            products: mapped,
-            savedAt: new Date().toISOString(),
-          })
-        );
-      } catch (error) {
-        console.log('Account recommended products error:', error);
-        if (!showedCache) {
-          setRecommendedProducts([]);
-        }
-      } finally {
-        setLoadingProducts(false);
-      }
-    };
-
-    loadProducts();
+  const scrollToTop = useCallback(() => {
+    accountScrollOffsetSnapshot = 0;
+    restoredScrollRef.current = true;
+    scrollRef.current?.scrollTo({ y: 0, animated: true });
   }, []);
+
+  useEffect(() => {
+    const unsubscribe = (navigation as any).addListener('tabPress', () => {
+      if (!navigation.isFocused()) return;
+      scrollToTop();
+    });
+
+    return unsubscribe;
+  }, [navigation, scrollToTop]);
 
   useEffect(() => {
     if (restoredScrollRef.current || accountScrollOffsetSnapshot <= 0) return;
@@ -246,54 +510,113 @@ export default function AccountScreen() {
     });
   }, []);
 
-  const ordersCount = Array.isArray(orders) ? orders.length : 0;
-  const offersCount = useMemo(() => 5, []);
+  const ordersCount =
+    isSignedIn && Array.isArray(orders) ? orders.length : 0;
 
   const recentWalletHistory = useMemo(() => {
-    if (!Array.isArray(walletHistory)) return [];
-    return walletHistory.slice(0, 5);
-  }, [walletHistory]);
+    if (!isSignedIn || !Array.isArray(walletHistory)) {
+      return [];
+    }
 
-  const goToProduct = (handle: string) => {
-    if (!handle) return;
+    return walletHistory.slice(0, 5);
+  }, [isSignedIn, walletHistory]);
+
+  const goToProduct = useCallback((product: AccountProduct) => {
+    if (!product?.handle) return;
 
     router.push({
       pathname: '/product/[handle]',
-      params: { handle, from: 'account' },
+      params: buildProductRouteParams(product, { from: 'account' }) as any,
     });
-  };
+  }, [router]);
 
-  const getWalletDisplay = (item: any) => {
-    const type = String(item?.type || '').toLowerCase();
-    const amount = Math.abs(Number(item?.amount || 0));
+  const handleAddRecommendedToCart = useCallback((product: AccountProduct) => {
+    const added = addToCart?.({
+      ...product,
+      price: product.priceAmount,
+      baseCurrency: product.currencyCode || BASE_CURRENCY,
+    });
 
-    const isPositive = type === 'credit' || type === 'refund';
-    const color = isPositive ? '#5c31ff' : '#ff3b30';
-    const sign = isPositive ? '+' : '-';
+    if (added) {
+      noodAlert('Added to cart', `${product.title} is ready in your cart.`);
+      return;
+    }
 
+    goToProduct(product);
+  }, [addToCart, goToProduct]);
+
+  const getWalletDisplay = useCallback((item: any) => {
+    const display = getWalletTransactionDisplay(String(item?.type || ''));
     return {
-      color,
-      sign,
-      amount,
+      color: display.color,
+      sign: display.sign,
+      amount: Math.abs(Number(item?.amount || 0)),
     };
-  };
+  }, []);
 
-  const displayMoney = (amount: number, fromCurrency = BASE_CURRENCY) =>
-    formatMoney(
-      convertPrice(Number(amount || 0), fromCurrency || BASE_CURRENCY, currentCurrency),
-      currentCurrency
-    );
+  const displayMoney = useCallback(
+    (amount: number, fromCurrency = BASE_CURRENCY) =>
+      formatMoney(
+        convertPrice(Number(amount || 0), fromCurrency || BASE_CURRENCY, currentCurrency),
+        currentCurrency
+      ),
+    [convertPrice, currentCurrency, formatMoney]
+  );
+
+  const recommendationPriceById = useMemo(() => {
+    const map = new Map<string, string>();
+    recommendedProducts.forEach((product) => {
+      const key = `${product.id}-${product.handle}`;
+      map.set(key, displayMoney(product.priceAmount, product.currencyCode));
+    });
+    return map;
+  }, [displayMoney, recommendedProducts]);
+
+  const recommendationKeyExtractor = useCallback(
+    (item: AccountProduct) => `${item.id}-${item.handle}`,
+    []
+  );
+
+  const renderRecommendationItem = useCallback(
+    ({ item }: { item: AccountProduct }) => {
+      const itemKey = `${item.id}-${item.handle}`;
+      return (
+        <ProductCard
+          image={item.image}
+          title={item.title}
+          price={recommendationPriceById.get(itemKey) || displayMoney(item.priceAmount, item.currencyCode)}
+          onPress={() => goToProduct(item)}
+          onAddToCart={() => handleAddRecommendedToCart(item)}
+        />
+      );
+    },
+    [displayMoney, goToProduct, handleAddRecommendedToCart, recommendationPriceById]
+  );
+
+  const handleAccountScroll = useCallback((event: any) => {
+    accountScrollOffsetSnapshot = event.nativeEvent.contentOffset.y;
+  }, []);
+
+  useScreenPerfReporter(
+    'account',
+    {
+      itemCount: recommendedProducts.length,
+      isFetching: loadingProducts,
+      isRefreshing: false,
+    },
+    [loadingProducts, recommendedProducts.length]
+  );
 
   return (
     <SafeAreaView style={styles.container}>
       <ScrollView
         ref={scrollRef}
         showsVerticalScrollIndicator={false}
+        nestedScrollEnabled
         contentContainerStyle={[styles.scrollContent, isCompact && styles.scrollContentCompact]}
-        scrollEventThrottle={16}
-        onScroll={(event) => {
-          accountScrollOffsetSnapshot = event.nativeEvent.contentOffset.y;
-        }}
+        scrollEventThrottle={32}
+        removeClippedSubviews={Platform.OS === 'android'}
+        onScroll={handleAccountScroll}
       >
         <View style={styles.topSpace} />
 
@@ -307,29 +630,91 @@ export default function AccountScreen() {
 
         {!isReady ? (
           <View style={styles.accountLoadingCard}>
-            <NoodSpinner size={58} />
+            <NoodSpinner size={58} reason="account-user-settings-bootstrap" />
           </View>
         ) : (
         <View style={[styles.heroCard, isCompact && styles.heroCardCompact]}>
           <View style={[styles.heroGlow, isCompact && styles.heroGlowCompact]} />
 
           <View style={styles.heroTopRow}>
-            <View style={[styles.googleAvatar, isCompact && styles.googleAvatarCompact]}>
-              <Image
-                source={{ uri: GOOGLE_LOGO_URL }}
-                style={[styles.googleAvatarLogo, isCompact && styles.googleAvatarLogoCompact]}
-                resizeMode="contain"
-              />
+            <View style={styles.profileAvatarShell}>
+              <TouchableOpacity
+                style={[
+                  styles.profileAvatarBubble,
+                  isCompact && styles.profileAvatarBubbleCompact,
+                  isSignedIn && profilePictureUri ? styles.profileAvatarBubblePhoto : null,
+                  isSignedIn && !profilePictureUri && profileInitials ? styles.profileAvatarBubbleInitials : null,
+                ]}
+                activeOpacity={isSignedIn ? 0.88 : 1}
+                disabled={!isSignedIn}
+                onPress={() => {
+                  void handleEditProfilePicture();
+                }}
+              >
+                {isSignedIn && profilePictureUri ? (
+                  <Image
+                    source={{ uri: profilePictureUri }}
+                    style={styles.profileAvatarImage}
+                    resizeMode="cover"
+                  />
+                ) : isSignedIn && profileInitials ? (
+                  <Text
+                    style={[
+                      styles.profileAvatarInitialsText,
+                      isCompact && styles.profileAvatarInitialsTextCompact,
+                    ]}
+                  >
+                    {profileInitials}
+                  </Text>
+                ) : (
+                  <Image
+                    source={NOOD_LOGO_SOURCE}
+                    style={[
+                      styles.profileAvatarLogo,
+                      isCompact && styles.profileAvatarLogoCompact,
+                    ]}
+                    resizeMode="contain"
+                  />
+                )}
+              </TouchableOpacity>
+
+              {isSignedIn ? (
+                <TouchableOpacity
+                  style={[styles.profileAvatarEditBtn, isCompact && styles.profileAvatarEditBtnCompact]}
+                  activeOpacity={0.88}
+                  onPress={() => {
+                    void handleEditProfilePicture();
+                  }}
+                >
+                  <Ionicons name="camera" size={11} color="#fff" />
+                </TouchableOpacity>
+              ) : null}
             </View>
 
             <View style={[styles.heroTextWrap, isCompact && styles.heroTextWrapCompact]}>
               <Text style={[styles.name, isCompact && styles.nameCompact]}>{shownName}</Text>
-              <Text
-                style={[styles.memberText, isCompact && styles.memberTextCompact]}
-                numberOfLines={2}
-              >
-                {memberLabel}
-              </Text>
+              {!isSignedIn && SIGN_IN_ENABLED ? (
+                <TouchableOpacity
+                  activeOpacity={0.82}
+                  onPress={() => void openSignIn()}
+                  accessibilityRole="button"
+                  accessibilityLabel="Sign in to view your customer account"
+                >
+                  <Text
+                    style={[styles.memberText, isCompact && styles.memberTextCompact]}
+                    numberOfLines={2}
+                  >
+                    {memberLabel}
+                  </Text>
+                </TouchableOpacity>
+              ) : (
+                <Text
+                  style={[styles.memberText, isCompact && styles.memberTextCompact]}
+                  numberOfLines={2}
+                >
+                  {memberLabel}
+                </Text>
+              )}
               <Text style={[styles.regionText, isCompact && styles.regionTextCompact]}>
                 {settings.country} • {settings.currency}
               </Text>
@@ -344,48 +729,36 @@ export default function AccountScreen() {
             </TouchableOpacity>
           </View>
 
-          <View style={[styles.statsRow, isCompact && styles.statsRowCompact]}>
-            <TouchableOpacity
-              style={[styles.statCard, isCompact && styles.statCardCompact]}
-              activeOpacity={0.9}
-              onPress={() => router.push('/account/wallet' as any)}
-            >
-              <Text style={[styles.statValue, isCompact && styles.statValueCompact]} numberOfLines={1}>
-                {formatMoney(Number(balanceConverted || 0), currentCurrency)}
-              </Text>
-              <Text style={[styles.statLabel, isCompact && styles.statLabelCompact]}>Balance</Text>
-            </TouchableOpacity>
+          {isSignedIn ? (
+            <View style={[styles.statsRow, isCompact && styles.statsRowCompact]}>
+              <TouchableOpacity
+                style={[styles.statCard, isCompact && styles.statCardCompact]}
+                activeOpacity={0.9}
+                onPress={() => router.push('/account/wallet' as any)}
+              >
+                <Text style={[styles.statValue, isCompact && styles.statValueCompact]} numberOfLines={1}>
+                  {formatMoney(Number(balanceConverted || 0), currentCurrency)}
+                </Text>
+                <Text style={[styles.statLabel, isCompact && styles.statLabelCompact]}>Balance</Text>
+              </TouchableOpacity>
 
-            <TouchableOpacity
-              style={[styles.statCard, isCompact && styles.statCardCompact]}
-              activeOpacity={0.9}
-              onPress={() => router.push('/account/deals' as any)}
-            >
-              <Text style={[styles.statValue, isCompact && styles.statValueCompact]}>{offersCount}</Text>
-              <Text style={[styles.statLabel, isCompact && styles.statLabelCompact]}>Offers</Text>
-            </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.statCard, isCompact && styles.statCardCompact]}
+                activeOpacity={0.9}
+                onPress={() => router.push('/account/orders' as any)}
+              >
+                <Text style={[styles.statValue, isCompact && styles.statValueCompact]}>{ordersCount}</Text>
+                <Text style={[styles.statLabel, isCompact && styles.statLabelCompact]}>Orders</Text>
+              </TouchableOpacity>
+            </View>
+          ) : null}
 
-            <TouchableOpacity
-              style={[styles.statCard, isCompact && styles.statCardCompact]}
-              activeOpacity={0.9}
-              onPress={() => router.push('/account/orders' as any)}
-            >
-              <Text style={[styles.statValue, isCompact && styles.statValueCompact]}>{ordersCount}</Text>
-              <Text style={[styles.statLabel, isCompact && styles.statLabelCompact]}>Orders</Text>
-            </TouchableOpacity>
-          </View>
-
-          {!isSignedIn ? (
+          {SIGN_IN_ENABLED && !isSignedIn ? (
             <View style={[styles.signInActions, isCompact && styles.signInActionsCompact]}>
               <TouchableOpacity
                 style={[styles.googleSignInButton, isCompact && styles.googleSignInButtonCompact]}
                 activeOpacity={0.9}
-                onPress={() =>
-                  router.push({
-                    pathname: '/account/auth',
-                    params: { provider: 'google' },
-                  } as any)
-                }
+                onPress={() => void openSignIn('google')}
               >
                 <View style={[styles.googleSignInIconWrap, isCompact && styles.googleSignInIconWrapCompact]}>
                   <Image
@@ -406,13 +779,39 @@ export default function AccountScreen() {
               </TouchableOpacity>
 
               <TouchableOpacity
-                style={[styles.signInButton, isCompact && styles.signInButtonCompact]}
+                style={[styles.facebookSignInButton, isCompact && styles.facebookSignInButtonCompact]}
                 activeOpacity={0.9}
-                onPress={() => router.push('/account/auth' as any)}
+                onPress={() => void openSignIn('facebook')}
               >
-                <Ionicons name="log-in-outline" size={18} color="#fff" />
-                <Text style={[styles.signInButtonText, isCompact && styles.signInButtonTextCompact]}>
-                  Sign in
+                <View
+                  style={[styles.facebookSignInIconWrap, isCompact && styles.facebookSignInIconWrapCompact]}
+                >
+                  <Text style={styles.facebookSignInIconText}>f</Text>
+                </View>
+                <Text
+                  style={[
+                    styles.facebookSignInButtonText,
+                    isCompact && styles.facebookSignInButtonTextCompact,
+                  ]}
+                  numberOfLines={1}
+                >
+                  Continue with Facebook
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.shopSignInButton, isCompact && styles.shopSignInButtonCompact]}
+                activeOpacity={0.9}
+                onPress={() => void openSignIn('shop')}
+              >
+                <View style={[styles.shopSignInIconWrap, isCompact && styles.shopSignInIconWrapCompact]}>
+                  <Ionicons name="bag-handle" size={18} color="#5433EB" />
+                </View>
+                <Text
+                  style={[styles.shopSignInButtonText, isCompact && styles.shopSignInButtonTextCompact]}
+                  numberOfLines={1}
+                >
+                  Continue with Shop
                 </Text>
               </TouchableOpacity>
             </View>
@@ -420,70 +819,94 @@ export default function AccountScreen() {
         </View>
         )}
 
-        <View style={styles.walletSection}>
-          <Text style={styles.sectionTitle}>Wallet Activity</Text>
+        {isSignedIn ? (
+          <View style={styles.walletSection}>
+            <Text style={styles.sectionTitle}>Wallet Activity</Text>
 
-          {recentWalletHistory.length === 0 ? (
-            <View style={styles.emptyProductsWrap}>
-              <Text style={styles.emptyProductsText}>No wallet activity yet</Text>
-            </View>
-          ) : (
-            recentWalletHistory.map((item: any, index: number) => {
-              const walletDisplay = getWalletDisplay(item);
+            {recentWalletHistory.length === 0 ? (
+              <View style={styles.emptyProductsWrap}>
+                <Text style={styles.emptyProductsText}>No wallet activity yet</Text>
+              </View>
+            ) : (
+              recentWalletHistory.map((item: any, index: number) => {
+                const walletDisplay = getWalletDisplay(item);
 
-              return (
-                <View
-                  key={item?.id ? String(item.id) : `wallet-${index}`}
-                  style={styles.walletRow}
-                >
-                  <View style={styles.walletLeft}>
-                    <Text style={styles.walletNote}>
-                      {item?.note || 'Wallet update'}
-                    </Text>
-                    <Text style={styles.walletDate}>
-                      {item?.createdAt
-                        ? new Date(item.createdAt).toLocaleDateString()
-                        : 'Recent'}
-                    </Text>
-                  </View>
+                return (
+                  <WalletActivityRow
+                    key={item?.id ? String(item.id) : `wallet-${index}`}
+                    note={item?.note || 'Wallet update'}
+                    createdAt={item?.createdAt}
+                    amountLabel={`${walletDisplay.sign}${displayMoney(walletDisplay.amount)}`}
+                    amountColor={walletDisplay.color}
+                  />
+                );
+              })
+            )}
 
-                  <Text
-                    style={[
-                      styles.walletAmount,
-                      { color: walletDisplay.color },
-                    ]}
-                  >
-                    {walletDisplay.sign}
-                    {displayMoney(walletDisplay.amount)}
-                  </Text>
-                </View>
-              );
-            })
-          )}
-
-          <TouchableOpacity
-            style={styles.sectionFooterBtn}
-            activeOpacity={0.88}
-            onPress={() => router.push('/account/wallet' as any)}
-          >
-            <Text style={styles.sectionFooterBtnText}>Open wallet</Text>
-          </TouchableOpacity>
-        </View>
+            <TouchableOpacity
+              style={styles.sectionFooterBtn}
+              activeOpacity={0.88}
+              onPress={() => router.push('/account/wallet' as any)}
+            >
+              <Text style={styles.sectionFooterBtnText}>Open wallet</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
 
         <View style={styles.menuCard}>
           <Text style={styles.sectionTitle}>Your account</Text>
 
           <MenuRow
-            icon="notifications-outline"
-            title="Updates"
-            subtitle={unreadCount > 0 ? `${unreadCount} unread updates` : 'Deals, rewards, shipping, and app news'}
-            onPress={() => router.push('/account/updates' as any)}
+            icon="person-circle-outline"
+            title="Profile"
+            subtitle="Name, email, phone, profile picture"
+            onPress={() => router.push('/account/profile' as any)}
           />
           <MenuRow
             icon="receipt-outline"
             title="Orders"
             subtitle="Track and manage purchases"
             onPress={() => router.push('/account/orders' as any)}
+          />
+          <MenuRow
+            icon="card-outline"
+            title="Payment methods"
+            subtitle="Cards, PayPal, Wallet, billing"
+            onPress={() => router.push('/account/payment-methods' as any)}
+          />
+          <MenuRow
+            icon="wallet-outline"
+            title="Wallet"
+            subtitle="Balance, top up, refunds, history"
+            onPress={() => router.push('/account/wallet' as any)}
+          />
+          <MenuRow
+            icon="location-outline"
+            title="Addresses"
+            subtitle="Shipping and billing addresses"
+            onPress={() => router.push('/account/address' as any)}
+          />
+          <MenuRow
+            icon="return-down-back-outline"
+            title="Returns & refunds"
+            subtitle="Request return or check refund status"
+            onPress={() => router.push('/account/returns' as any)}
+          />
+          <MenuRow
+            icon="shield-checkmark-outline"
+            title="Security"
+            subtitle="Sign-in methods and account protection"
+            onPress={() => router.push('/account/security' as any)}
+          />
+          <MenuRow
+            icon="notifications-outline"
+            title="Updates"
+            subtitle={
+              unreadCount > 0
+                ? `${unreadCount} new update${unreadCount === 1 ? '' : 's'}`
+                : 'Deals, rewards, shipping, and app news'
+            }
+            onPress={() => router.push('/account/updates' as any)}
           />
           <MenuRow
             icon="chatbubble-ellipses-outline"
@@ -512,68 +935,104 @@ export default function AccountScreen() {
             <QuickAction
               icon="time-outline"
               label="History"
+              subtitle="Recent activity"
               onPress={() => router.push('/account/history' as any)}
             />
             <QuickAction
               icon="location-outline"
               label="Address"
+              subtitle="Shipping info"
               onPress={() => router.push('/account/address' as any)}
             />
             <QuickAction
               icon="gift-outline"
               label="Rewards"
+              subtitle="Locked rewards"
               onPress={() => router.push('/account/rewards' as any)}
             />
             <QuickAction
               icon="heart-outline"
               label="Saved"
-              onPress={() => router.push('/account/saved' as any)}
+              subtitle="Wishlist items"
+              onPress={() => router.replace('/wishlist' as any)}
             />
           </View>
         </View>
 
-        <TouchableOpacity
-          style={styles.infoBar}
-          activeOpacity={0.9}
-          onPress={() => router.push('/account/deals' as any)}
-        >
-          <Ionicons name="checkmark-circle" size={18} color="#ff6a00" />
-          <Text style={styles.infoText}>Free Shipping</Text>
-          <View style={styles.infoDot} />
-          <Ionicons name="flash-outline" size={18} color="#ff6a00" />
-          <Text style={styles.infoText}>Fast Checkout</Text>
-        </TouchableOpacity>
+        {activeShippingDeal ? (
+          <TouchableOpacity
+            style={styles.infoBar}
+            activeOpacity={0.9}
+            onPress={() => router.push('/account/deals' as any)}
+          >
+            <Ionicons name="cube-outline" size={18} color="#ff6a00" />
+            <Text style={styles.infoText} numberOfLines={1}>
+              {activeShippingDeal.title || 'Free shipping offer'}
+            </Text>
+            <Text style={styles.infoLinkText}>View in Deals</Text>
+          </TouchableOpacity>
+        ) : null}
 
         <View style={styles.productsSection}>
           <View style={styles.productsHeader}>
             <Text style={styles.sectionTitleNoPad}>Recommended</Text>
             <TouchableOpacity
               activeOpacity={0.85}
-              onPress={() => router.push('/(tabs)/categories' as any)}
+              onPress={() => router.push('/search' as any)}
             >
               <Text style={styles.viewAllText}>View all</Text>
             </TouchableOpacity>
           </View>
 
           {loadingProducts ? (
-            <View style={styles.productsLoadingWrap}>
-              <NoodSpinner size={40} />
+            <View style={styles.productsGrid}>
+              {Array.from({ length: 8 }).map((_, index) => (
+                <ProductSkeletonCard key={`account-rec-skeleton-${index}`} />
+              ))}
             </View>
           ) : recommendedProducts.length === 0 ? (
             <View style={styles.emptyProductsWrap}>
-              <Text style={styles.emptyProductsText}>No products found</Text>
+              <Text style={styles.emptyProductsText}>
+                {recommendationsStatus === 'error'
+                  ? "We couldn't load recommendations right now."
+                  : 'No recommendations right now. Browse products to get personalized picks.'}
+              </Text>
+              {recommendationsStatus === 'error' ? (
+                <TouchableOpacity
+                  style={styles.retryRecommendationsBtn}
+                  activeOpacity={0.9}
+                  onPress={() => void loadRecommendedProducts()}
+                >
+                  <Text style={styles.retryRecommendationsText}>Try again</Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity
+                  style={styles.retryRecommendationsBtn}
+                  activeOpacity={0.9}
+                  onPress={() => router.push('/search' as any)}
+                >
+                  <Text style={styles.retryRecommendationsText}>Browse products</Text>
+                </TouchableOpacity>
+              )}
             </View>
           ) : (
-            <View style={styles.productsGrid}>
-              {recommendedProducts.map((product) => (
-                <ProductCard
-                  key={product.id}
-                  image={product.image}
-                  title={product.title}
-                  price={displayMoney(product.priceAmount, product.currencyCode)}
-                  onPress={() => goToProduct(product.handle)}
-                />
-              ))}
+            <View>
+              {recommendationsStatus === 'cached' ? (
+                <Text style={styles.cachedRecommendationsText}>
+                  Showing saved picks while recommendations refresh.
+                </Text>
+              ) : null}
+              <FlatList
+                data={recommendedProducts}
+                numColumns={2}
+                scrollEnabled={false}
+                keyExtractor={recommendationKeyExtractor}
+                renderItem={renderRecommendationItem}
+                columnWrapperStyle={styles.productsGrid}
+                initialNumToRender={8}
+                maxToRenderPerBatch={8}
+                windowSize={5}
+              />
             </View>
           )}
         </View>
@@ -615,22 +1074,23 @@ const styles = StyleSheet.create({
   },
 
   topSpace: {
-    height: 8,
+    height: 12,
   },
 
   logoWrap: {
     alignItems: 'center',
-    paddingVertical: 10,
+    paddingTop: 6,
+    paddingBottom: 8,
   },
 
   logo: {
-    width: 110,
-    height: 38,
+    width: 188,
+    height: 64,
   },
 
   logoCompact: {
-    width: 86,
-    height: 30,
+    width: 138,
+    height: 48,
   },
 
   accountLoadingCard: {
@@ -688,26 +1148,12 @@ const styles = StyleSheet.create({
     minWidth: 0,
   },
 
-  avatar: {
-    width: 62,
-    height: 62,
-    borderRadius: 31,
-    backgroundColor: '#ff6a00',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#ff6a00',
-    shadowOpacity: 0.18,
-    shadowRadius: 8,
-    elevation: 3,
+  profileAvatarShell: {
+    position: 'relative',
+    flexShrink: 0,
   },
 
-  avatarText: {
-    color: '#fff',
-    fontSize: 26,
-    fontWeight: '900',
-  },
-
-  googleAvatar: {
+  profileAvatarBubble: {
     width: 62,
     height: 62,
     borderRadius: 31,
@@ -720,22 +1166,70 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.08,
     shadowRadius: 8,
     elevation: 2,
+    overflow: 'hidden',
   },
 
-  googleAvatarCompact: {
+  profileAvatarBubbleCompact: {
     width: 52,
     height: 52,
     borderRadius: 26,
   },
 
-  googleAvatarLogo: {
-    width: 30,
-    height: 30,
+  profileAvatarBubblePhoto: {
+    padding: 0,
+    borderColor: '#ffe4d6',
   },
 
-  googleAvatarLogoCompact: {
-    width: 26,
-    height: 26,
+  profileAvatarBubbleInitials: {
+    backgroundColor: '#ff6a00',
+    borderColor: '#ff6a00',
+    shadowColor: '#ff6a00',
+    shadowOpacity: 0.18,
+  },
+
+  profileAvatarImage: {
+    width: '100%',
+    height: '100%',
+  },
+
+  profileAvatarLogo: {
+    width: 34,
+    height: 24,
+  },
+
+  profileAvatarLogoCompact: {
+    width: 30,
+    height: 21,
+  },
+
+  profileAvatarInitialsText: {
+    color: '#fff',
+    fontSize: 22,
+    fontWeight: '900',
+  },
+
+  profileAvatarInitialsTextCompact: {
+    fontSize: 18,
+  },
+
+  profileAvatarEditBtn: {
+    position: 'absolute',
+    right: -2,
+    bottom: -2,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#ff6a00',
+    borderWidth: 2,
+    borderColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  profileAvatarEditBtnCompact: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
   },
 
   heroTextWrap: {
@@ -827,10 +1321,10 @@ const styles = StyleSheet.create({
   googleSignInButton: {
     minHeight: 54,
     width: '100%',
-    backgroundColor: '#fff',
+    backgroundColor: '#34A853',
     borderRadius: 18,
     borderWidth: 1,
-    borderColor: '#e8ded8',
+    borderColor: '#34A853',
     paddingHorizontal: 14,
     flexDirection: 'row',
     alignItems: 'center',
@@ -871,7 +1365,7 @@ const styles = StyleSheet.create({
   },
 
   googleSignInButtonText: {
-    color: '#111',
+    color: '#fff',
     fontSize: 15,
     fontWeight: '900',
     flexShrink: 1,
@@ -881,30 +1375,106 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
 
-  signInButton: {
-    minHeight: 52,
+  facebookSignInButton: {
+    minHeight: 54,
     width: '100%',
-    backgroundColor: '#ff6a00',
+    backgroundColor: '#1877F2',
     borderRadius: 18,
-    paddingHorizontal: 18,
+    borderWidth: 1,
+    borderColor: '#1877F2',
+    paddingHorizontal: 14,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
   },
 
-  signInButtonCompact: {
-    minHeight: 50,
+  facebookSignInButtonCompact: {
+    minHeight: 48,
     borderRadius: 16,
+    paddingHorizontal: 10,
   },
 
-  signInButtonText: {
+  facebookSignInIconWrap: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+  },
+
+  facebookSignInIconWrapCompact: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    marginRight: 8,
+  },
+
+  facebookSignInIconText: {
+    color: '#1877F2',
+    fontSize: 22,
+    lineHeight: 24,
+    fontWeight: '900',
+    fontFamily: Platform.OS === 'ios' ? 'Helvetica Neue' : 'sans-serif',
+    marginTop: Platform.OS === 'ios' ? 1 : 0,
+  },
+
+  facebookSignInButtonText: {
     color: '#fff',
     fontSize: 15,
     fontWeight: '900',
-    marginLeft: 8,
+    flexShrink: 1,
   },
 
-  signInButtonTextCompact: {
+  facebookSignInButtonTextCompact: {
+    fontSize: 14,
+  },
+
+  shopSignInButton: {
+    minHeight: 54,
+    width: '100%',
+    backgroundColor: '#5433EB',
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#5433EB',
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  shopSignInButtonCompact: {
+    minHeight: 48,
+    borderRadius: 16,
+    paddingHorizontal: 10,
+  },
+
+  shopSignInIconWrap: {
+    width: 30,
+    height: 30,
+    borderRadius: 8,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+  },
+
+  shopSignInIconWrapCompact: {
+    width: 26,
+    height: 26,
+    borderRadius: 7,
+    marginRight: 8,
+  },
+
+  shopSignInButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '900',
+    flexShrink: 1,
+  },
+
+  shopSignInButtonTextCompact: {
     fontSize: 14,
   },
 
@@ -948,6 +1518,50 @@ const styles = StyleSheet.create({
 
   statLabelCompact: {
     fontSize: 11,
+  },
+
+  demoRewardCard: {
+    marginTop: 14,
+    backgroundColor: '#5c31ff',
+    borderRadius: 22,
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#7b57ff',
+  },
+
+  demoRewardTextWrap: {
+    flex: 1,
+    paddingRight: 10,
+  },
+
+  demoRewardTitle: {
+    color: '#fff',
+    fontSize: 17,
+    fontWeight: '900',
+  },
+
+  demoRewardSubtitle: {
+    color: 'rgba(255,255,255,0.86)',
+    fontSize: 12,
+    marginTop: 4,
+    fontWeight: '600',
+  },
+
+  demoRewardBtn: {
+    backgroundColor: '#fff',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 999,
+  },
+
+  demoRewardBtnText: {
+    color: '#5c31ff',
+    fontWeight: '900',
+    fontSize: 14,
   },
 
   promoCard: {
@@ -1149,20 +1763,38 @@ const styles = StyleSheet.create({
 
   quickRow: {
     flexDirection: 'row',
-    justifyContent: 'space-around',
-    marginTop: 6,
+    justifyContent: 'space-between',
+    gap: 8,
+    marginTop: 8,
+    paddingHorizontal: 10,
   },
 
   quickItem: {
+    flex: 1,
+    minWidth: 0,
+  },
+
+  quickMiniCard: {
+    backgroundColor: '#fff7f2',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#ffe4d6',
+    paddingVertical: 12,
+    paddingHorizontal: 6,
     alignItems: 'center',
-    width: '22%',
+    shadowColor: '#ff6a00',
+    shadowOpacity: 0.06,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
+    minHeight: 108,
   },
 
   quickIconWrap: {
-    width: 52,
-    height: 52,
-    borderRadius: 18,
-    backgroundColor: '#fff7f2',
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    backgroundColor: '#fff',
     borderWidth: 1,
     borderColor: '#ffe4d6',
     alignItems: 'center',
@@ -1172,9 +1804,19 @@ const styles = StyleSheet.create({
   quickText: {
     marginTop: 8,
     fontSize: 12,
-    color: '#333',
-    fontWeight: '700',
+    color: '#111',
+    fontWeight: '900',
     textAlign: 'center',
+  },
+
+  quickSubtitle: {
+    marginTop: 3,
+    fontSize: 10,
+    color: '#8a7a70',
+    fontWeight: '600',
+    textAlign: 'center',
+    lineHeight: 13,
+    paddingHorizontal: 2,
   },
 
   infoBar: {
@@ -1185,24 +1827,30 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
+    gap: 8,
     borderWidth: 1,
     borderColor: '#ffe1d1',
   },
 
   infoText: {
+    flex: 1,
     color: '#ff6a00',
     fontSize: 14,
     fontWeight: '900',
-    marginLeft: 6,
   },
 
-  infoDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: '#ffb184',
-    marginHorizontal: 12,
+  infoLinkText: {
+    color: '#8d5a2b',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  cachedRecommendationsText: {
+    marginBottom: 8,
+    paddingHorizontal: 2,
+    fontSize: 12,
+    color: '#8d7a6f',
+    fontWeight: '700',
   },
 
   productsSection: {
@@ -1223,21 +1871,58 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
 
-  productsLoadingWrap: {
-    paddingVertical: 30,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
   emptyProductsWrap: {
     paddingVertical: 24,
     alignItems: 'center',
+    paddingHorizontal: 12,
   },
 
   emptyProductsText: {
     fontSize: 14,
     color: '#666',
     fontWeight: '600',
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+
+  retryRecommendationsBtn: {
+    marginTop: 12,
+    minHeight: 40,
+    paddingHorizontal: 18,
+    borderRadius: 12,
+    backgroundColor: '#ff6a00',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  retryRecommendationsText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+
+  skeletonBlock: {
+    backgroundColor: '#f1e4d8',
+  },
+
+  skeletonLine: {
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#f1e4d8',
+    marginBottom: 8,
+  },
+
+  skeletonLineWide: {
+    width: '92%',
+  },
+
+  skeletonLineMedium: {
+    width: '68%',
+  },
+
+  skeletonLinePrice: {
+    width: 72,
+    marginBottom: 0,
   },
 
   productsGrid: {
@@ -1262,7 +1947,7 @@ const styles = StyleSheet.create({
 
   productImage: {
     width: '100%',
-    height: 180,
+    height: 148,
     backgroundColor: '#eee',
   },
 
@@ -1274,26 +1959,7 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#333',
     fontWeight: '700',
-    minHeight: 36,
-  },
-
-  ratingRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginTop: 6,
-  },
-
-  stars: {
-    fontSize: 13,
-    color: '#111',
-    letterSpacing: 1,
-  },
-
-  soldLabel: {
-    marginLeft: 8,
-    fontSize: 11,
-    color: '#888',
-    fontWeight: '700',
+    minHeight: 34,
   },
 
   productBottomRow: {

@@ -1,8 +1,7 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View,
   StyleSheet,
-  Alert,
   Platform,
   SafeAreaView,
   TouchableOpacity,
@@ -15,8 +14,19 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import { useCart } from '../context/CartContext';
 import { useHistoryEvents } from '../context/HistoryContext';
 import { useAddressBook } from '../context/AddressContext';
+import { getCustomerProfile } from '../utils/customer-profile';
 import { BASE_CURRENCY } from '../utils/currency';
-import { getBackendJsonFromUrl } from '../utils/backend';
+import { SHOPIFY_CHECKOUT_CURRENCY } from '../utils/checkout-totals';
+import { resetCheckoutSessionId } from '../utils/checkout-session';
+import { PAYMENT_REVIEW_MESSAGE } from '../utils/checkout-validation';
+import { noodAlert } from '../utils/nood-alert';
+import {
+  getBackendJsonFromUrl,
+  getPaymentReturnHost,
+  isBlockedLocalPaymentHost,
+  logPaymentBackendDiagnostics,
+  resolvePaymentReturnUrl,
+} from '../utils/backend';
 import NoodSpinner from '../components/NoodSpinner';
 
 export default function PaymentScreen() {
@@ -28,7 +38,13 @@ export default function PaymentScreen() {
   }>();
 
   const router = useRouter();
-  const { addOrder, clearCart, cartItems = [], selectedCurrency = BASE_CURRENCY, formatMoney } = useCart();
+  const {
+    saveOrderAfterPayment,
+    clearCart,
+    cartItems = [],
+    selectedCurrency = BASE_CURRENCY,
+    formatMoney,
+  } = useCart();
   const { defaultAddress } = useAddressBook();
   const { addHistoryEvent } = useHistoryEvents();
   const handledRef = useRef(false);
@@ -36,80 +52,191 @@ export default function PaymentScreen() {
   const paymentCurrency = String(currency || selectedCurrency || BASE_CURRENCY);
   const paymentUrl = String(url || '').trim();
   const backendReturnUrl = String(returnUrl || '').trim();
+  const resolvedBackendReturnUrl = resolvePaymentReturnUrl(backendReturnUrl);
   const isValidPaymentUrl = paymentUrl.startsWith('https://');
   const didTriggerBackendReturnRef = useRef(false);
+  const paymentReturnInFlightRef = useRef(false);
+  const handledOrderIdsRef = useRef(new Set<string>());
+  const handledReturnKeysRef = useRef(new Set<string>());
+  const orderSaveInFlightRef = useRef(false);
+  const [webViewEnabled, setWebViewEnabled] = useState(true);
+
+  const getReturnIdentifiers = useCallback((targetUrl: string) => {
+    try {
+      const parsed = new URL(targetUrl);
+      const orderId = String(
+        parsed.searchParams.get('order_id') ||
+          parsed.searchParams.get('orderId') ||
+          parsed.searchParams.get('orderid') ||
+          ''
+      ).trim();
+      const returnToken = String(
+        parsed.searchParams.get('return_token') || parsed.searchParams.get('token') || ''
+      ).trim();
+      const returnKey = orderId && returnToken ? `${orderId}:${returnToken}` : orderId;
+
+      return { orderId, returnToken, returnKey };
+    } catch {
+      return { orderId: '', returnToken: '', returnKey: '' };
+    }
+  }, []);
+
+  const stopWebViewNavigation = useCallback(() => {
+    setWebViewEnabled(false);
+    try {
+      webViewRef.current?.stopLoading();
+    } catch (error) {
+      console.log('[NOOD payment] WebView stopLoading failed', error);
+    }
+  }, []);
+
+  const markReturnHandled = useCallback(
+    (identifiers?: { orderId?: string; returnKey?: string; transactionId?: string }) => {
+      handledRef.current = true;
+
+      const orderId = String(identifiers?.orderId || '').trim();
+      const returnKey = String(identifiers?.returnKey || '').trim();
+      const transactionId = String(identifiers?.transactionId || '').trim();
+
+      if (orderId) {
+        handledOrderIdsRef.current.add(orderId);
+      }
+      if (returnKey) {
+        handledReturnKeysRef.current.add(returnKey);
+      }
+      if (transactionId) {
+        handledOrderIdsRef.current.add(transactionId);
+      }
+
+      stopWebViewNavigation();
+    },
+    [stopWebViewNavigation]
+  );
+
+  const isReturnAlreadyHandled = useCallback(
+    (identifiers?: { orderId?: string; returnKey?: string }) => {
+      if (handledRef.current) {
+        return true;
+      }
+
+      const orderId = String(identifiers?.orderId || '').trim();
+      const returnKey = String(identifiers?.returnKey || '').trim();
+
+      if (orderId && handledOrderIdsRef.current.has(orderId)) {
+        return true;
+      }
+
+      if (returnKey && handledReturnKeysRef.current.has(returnKey)) {
+        return true;
+      }
+
+      return false;
+    },
+    []
+  );
+
+  const ignoreDuplicateReturn = useCallback((context: string, details: Record<string, unknown> = {}) => {
+    console.log('[PAYMENT RETURN DUPLICATE IGNORED]', { context, ...details });
+  }, []);
+
+  const logReturnAlreadyHandled = useCallback((context: string, details: Record<string, unknown> = {}) => {
+    console.log('[PAYMENT RETURN ALREADY HANDLED]', { context, ...details });
+  }, []);
+
+  useEffect(() => {
+    logPaymentBackendDiagnostics(resolvedBackendReturnUrl);
+    if (backendReturnUrl && resolvedBackendReturnUrl !== backendReturnUrl) {
+      console.log('[PAYMENT RETURN URL] remapped from route params', {
+        original: backendReturnUrl,
+        resolved: resolvedBackendReturnUrl,
+        host: getPaymentReturnHost(resolvedBackendReturnUrl),
+      });
+    }
+  }, [backendReturnUrl, resolvedBackendReturnUrl]);
 
   useEffect(() => {
     if (!paymentUrl || isValidPaymentUrl || Platform.OS === 'web') return;
 
-    Alert.alert('Payment Error', 'Payment link could not be created. Please try again.');
+    noodAlert('Payment Error', 'Payment link could not be created. Please try again.');
   }, [isValidPaymentUrl, paymentUrl]);
 
-  const finishSuccess = (
+  const finishSuccess = async (
     paymentMethod: string,
     shopifyOrderName: string,
     shopifyOrderId?: string,
-    transactionId?: string
+    transactionId?: string,
+    orderId?: string,
+    returnKey?: string,
+    paidTotal?: number
   ) => {
-    if (handledRef.current) return;
-    console.log('[NOOD payment] success received', {
+    if (handledRef.current || orderSaveInFlightRef.current) {
+      logReturnAlreadyHandled('finishSuccess', { shopifyOrderName, orderId, returnKey });
+      return;
+    }
+
+    orderSaveInFlightRef.current = true;
+
+    console.log('[ORDER CREATE SUCCESS] payment flow completed in app', {
       paymentMethod,
       shopifyOrderName,
       shopifyOrderId,
       transactionId,
+      orderId,
     });
 
     if (!shopifyOrderName && !shopifyOrderId) {
+      orderSaveInFlightRef.current = false;
       finishFailure('Payment was received, but Shopify did not confirm the order. Please contact support before trying again.');
       return;
     }
 
-    handledRef.current = true;
+    const profile = await getCustomerProfile();
+    const orderTotal = Number(
+      paidTotal !== undefined && paidTotal !== null ? paidTotal : total || 0
+    );
+    const saved = await saveOrderAfterPayment({
+      shopifyOrderId,
+      shopifyOrderName,
+      checkoutOrderId: orderId,
+      transactionId,
+      paymentMethod,
+      total: orderTotal,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
+      items: cartItems,
+      customer: {
+        name: defaultAddress?.fullName || profile?.displayName || '',
+        email: profile?.email || (defaultAddress as any)?.email || '',
+        phone: defaultAddress?.phone || '',
+      },
+      shippingAddress: defaultAddress,
+    });
 
-    addOrder({
-      id: shopifyOrderName || shopifyOrderId || Date.now().toString(),
-      date: new Date().toISOString(),
-      total: Number(total || 0),
-      currency: paymentCurrency,
-      status: 'paid',
-      paymentMethod: shopifyOrderName ? `${paymentMethod} (${shopifyOrderName})` : paymentMethod,
-      shopifyOrderId,
-      shopifyOrderName,
-      paymentTransactionId: transactionId,
-      customer: {
-        name: defaultAddress?.fullName || '',
-        email: (defaultAddress as any)?.email || '',
-        phone: defaultAddress?.phone || '',
-      },
-      shippingAddress: defaultAddress,
-      items: cartItems,
-    });
-    console.log('[NOOD order] app order saved');
-    console.log('[NOOD payment] saved app order after Shopify confirmation', {
-      shopifyOrderName,
-      shopifyOrderId,
-      paymentTransactionId: transactionId,
-      items: cartItems,
-      customer: {
-        name: defaultAddress?.fullName || '',
-        email: (defaultAddress as any)?.email || '',
-        phone: defaultAddress?.phone || '',
-      },
-      shippingAddress: defaultAddress,
-    });
+    if (!saved) {
+      orderSaveInFlightRef.current = false;
+      noodAlert(
+        'Order Save Issue',
+        'Payment succeeded, but the order could not be saved in the app. Please check Orders or contact support.'
+      );
+      return;
+    }
+
+    markReturnHandled({ orderId, returnKey, transactionId });
+    orderSaveInFlightRef.current = false;
+
     void addHistoryEvent({
       type: 'checkout',
       title: 'Payment completed',
       description: `${paymentMethod} payment completed for Shopify order ${shopifyOrderName || shopifyOrderId}.`,
-      amount: Number(total || 0),
-      currency: paymentCurrency,
+      amount: orderTotal,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
       status: 'success',
     });
 
     clearCart();
+    resetCheckoutSessionId();
     console.log('[NOOD order] cart cleared');
 
-    Alert.alert(
+    noodAlert(
       'Payment Successful',
       shopifyOrderName
         ? `Order ${shopifyOrderName} was created successfully.`
@@ -124,13 +251,16 @@ export default function PaymentScreen() {
   };
 
   const finishFailure = (message?: string) => {
-    if (handledRef.current) return;
-    handledRef.current = true;
+    if (handledRef.current) {
+      ignoreDuplicateReturn('finishFailure', { message: message || null });
+      return;
+    }
+    markReturnHandled();
     console.log('[NOOD payment] failure received', {
       message: message || 'Payment was cancelled or failed.',
     });
 
-    Alert.alert(
+    noodAlert(
       'Payment Not Completed',
       message || 'Payment was cancelled or failed.',
       [
@@ -154,60 +284,57 @@ export default function PaymentScreen() {
     paymentMethod: string,
     transactionId: string,
     orderId?: string,
-    recoveryId?: string
+    recoveryId?: string,
+    reason?: string
   ) => {
-    if (handledRef.current) return;
-    handledRef.current = true;
+    if (handledRef.current) {
+      logReturnAlreadyHandled('finishPaymentReceivedOrderIssue', { orderId, reason });
+      return;
+    }
+    markReturnHandled({ orderId, transactionId });
 
-    console.log('[NOOD payment] payment received but Shopify order needs recovery', {
+    console.log('[ORDER CREATE FAILED] payment received but Shopify order was not created', {
       paymentMethod,
       transactionId,
       orderId,
       recoveryId,
-      items: cartItems,
-    });
-
-    addOrder({
-      id: orderId || recoveryId || transactionId || Date.now().toString(),
-      date: new Date().toISOString(),
-      total: Number(total || 0),
-      currency: paymentCurrency,
-      status: 'failed-paid',
-      paymentMethod: transactionId ? `${paymentMethod} (${transactionId})` : paymentMethod,
-      paymentTransactionId: transactionId,
-      customer: {
-        name: defaultAddress?.fullName || '',
-        email: (defaultAddress as any)?.email || '',
-        phone: defaultAddress?.phone || '',
-      },
-      shippingAddress: defaultAddress,
+      reason: reason || 'unknown',
       items: cartItems,
     });
 
     void addHistoryEvent({
       type: 'checkout',
       title: 'Payment received - order needs review',
-      description: `Payment was successful, but Shopify order creation needs review. Transaction ID: ${transactionId || 'not provided'}.`,
+      description: `${PAYMENT_REVIEW_MESSAGE} Transaction ID: ${transactionId || 'not provided'}.`,
       amount: Number(total || 0),
-      currency: paymentCurrency,
+      currency: paymentCurrency || SHOPIFY_CHECKOUT_CURRENCY,
       status: 'needs_review',
       relatedId: recoveryId || orderId || transactionId,
     });
 
-    Alert.alert(
+    noodAlert(
       'Payment Received - Order Processing Issue',
-      `Your payment was successful, but your order needs review. Please contact support with transaction ID: ${transactionId || 'not provided'}.`,
-      [
-        {
-          text: 'View Orders',
-          onPress: () => router.replace('/account/orders'),
-        },
-      ]
+      transactionId
+        ? `${PAYMENT_REVIEW_MESSAGE} ${transactionId}`
+        : PAYMENT_REVIEW_MESSAGE,
+      [{ text: 'Back to Checkout', onPress: () => router.back() }]
     );
   };
 
   const handleSpecialUrl = (currentUrl: string) => {
     if (!currentUrl) return false;
+
+    if (handledRef.current) {
+      if (
+        currentUrl.includes('/payment-return') ||
+        currentUrl.includes('invalid_return_token') ||
+        currentUrl.includes('status=failed') ||
+        currentUrl.includes('status=cancelled')
+      ) {
+        ignoreDuplicateReturn('handleSpecialUrl', { url: currentUrl });
+        return true;
+      }
+    }
 
     if (currentUrl.startsWith('noodapp://payment-result')) {
       try {
@@ -227,11 +354,11 @@ export default function PaymentScreen() {
         const reason = parsed.searchParams.get('reason') || '';
 
         if (status === 'success' && type === 'checkout' && (shopifyOrderName || shopifyOrderId)) {
-          finishSuccess(method, shopifyOrderName, shopifyOrderId, transactionId);
+          void finishSuccess(method, shopifyOrderName, shopifyOrderId, transactionId, orderId);
         } else if (status === 'payment_received_order_review' && type === 'checkout') {
-          finishPaymentReceivedOrderIssue(method, transactionId, orderId, recoveryId);
+          finishPaymentReceivedOrderIssue(method, transactionId, orderId, recoveryId, reason);
         } else if (status === 'success' && type === 'checkout') {
-          finishPaymentReceivedOrderIssue(method, transactionId, orderId, recoveryId);
+          finishPaymentReceivedOrderIssue(method, transactionId, orderId, recoveryId, reason || 'success_without_shopify_order');
         } else {
           finishFailure(reason);
         }
@@ -243,7 +370,23 @@ export default function PaymentScreen() {
     }
 
     if (currentUrl.includes('/payment-return')) {
-      return false;
+      const coercedReturnUrl = resolvePaymentReturnUrl(currentUrl);
+      const identifiers = getReturnIdentifiers(coercedReturnUrl);
+
+      if (isReturnAlreadyHandled(identifiers)) {
+        logReturnAlreadyHandled('payment-return-navigation', identifiers);
+        return true;
+      }
+
+      if (isBlockedLocalPaymentHost(currentUrl)) {
+        console.log('[PAYMENT URL BLOCKED LOCAL]', {
+          original: currentUrl,
+          replacedWith: coercedReturnUrl,
+        });
+      }
+      console.log('[PAYMENT RETURN HOST]', getPaymentReturnHost(coercedReturnUrl) || '(invalid)');
+      void triggerBackendReturn(coercedReturnUrl);
+      return true;
     }
 
     if (currentUrl.includes('status=payment_received_order_review')) {
@@ -254,11 +397,12 @@ export default function PaymentScreen() {
           parsed.searchParams.get('method') || 'WiPay',
           parsed.searchParams.get('transaction_id') || '',
           parsed.searchParams.get('order_id') || '',
-          parsed.searchParams.get('recovery_id') || ''
+          parsed.searchParams.get('recovery_id') || '',
+          parsed.searchParams.get('reason') || 'payment_received_order_review'
         );
       } catch (error) {
         console.log('Payment review URL parse error:', error);
-        finishPaymentReceivedOrderIssue('WiPay', '', '', '');
+        finishPaymentReceivedOrderIssue('WiPay', '', '', '', 'payment_review_url_parse_error');
       }
       return true;
     }
@@ -278,13 +422,19 @@ export default function PaymentScreen() {
         const recoveryId = parsed.searchParams.get('recovery_id') || '';
 
         if (!shopifyOrderName && !shopifyOrderId) {
-          finishPaymentReceivedOrderIssue(method, transactionId, orderId, recoveryId);
+          finishPaymentReceivedOrderIssue(
+            method,
+            transactionId,
+            orderId,
+            recoveryId,
+            parsed.searchParams.get('reason') || 'success_without_shopify_order'
+          );
         } else {
-          finishSuccess(method, shopifyOrderName, shopifyOrderId, transactionId);
+          void finishSuccess(method, shopifyOrderName, shopifyOrderId, transactionId, orderId);
         }
       } catch (error) {
         console.log('Success URL parse error:', error);
-        finishPaymentReceivedOrderIssue('WiPay', '', '', '');
+        finishPaymentReceivedOrderIssue('WiPay', '', '', '', 'success_url_parse_error');
       }
       return true;
     }
@@ -301,12 +451,20 @@ export default function PaymentScreen() {
         const orderId = parsed.searchParams.get('order_id') || '';
         const recoveryId = parsed.searchParams.get('recovery_id') || '';
 
+        if (reason === 'invalid_return_token') {
+          if (isReturnAlreadyHandled({ orderId })) {
+            ignoreDuplicateReturn('failed-return-url', { orderId, reason });
+            return true;
+          }
+        }
+
         if (reason === 'shopify_order_create_failed' && transactionId) {
           finishPaymentReceivedOrderIssue(
             parsed.searchParams.get('method') || 'WiPay',
             transactionId,
             orderId,
-            recoveryId
+            recoveryId,
+            reason || 'shopify_order_create_failed'
           );
         } else {
           finishFailure(reason);
@@ -321,28 +479,93 @@ export default function PaymentScreen() {
     return false;
   };
 
-  const triggerBackendReturn = async () => {
-    if (didTriggerBackendReturnRef.current || handledRef.current) return;
-    if (!backendReturnUrl.startsWith('http://') && !backendReturnUrl.startsWith('https://')) return;
+  const triggerBackendReturn = async (overrideReturnUrl?: string) => {
+    const targetReturnUrl = resolvePaymentReturnUrl(
+      String(overrideReturnUrl || resolvedBackendReturnUrl || '').trim()
+    );
+    const identifiers = getReturnIdentifiers(targetReturnUrl);
 
+    if (isReturnAlreadyHandled(identifiers)) {
+      logReturnAlreadyHandled('triggerBackendReturn', identifiers);
+      return;
+    }
+
+    if (paymentReturnInFlightRef.current) {
+      ignoreDuplicateReturn('triggerBackendReturn', {
+        ...identifiers,
+        reason: 'in_flight',
+      });
+      return;
+    }
+
+    if (
+      !targetReturnUrl.startsWith('http://') &&
+      !targetReturnUrl.startsWith('https://')
+    ) {
+      return;
+    }
+
+    paymentReturnInFlightRef.current = true;
     didTriggerBackendReturnRef.current = true;
-    console.log('[NOOD payment] WiPay success screen detected; calling backend return URL', backendReturnUrl);
+    console.log('[WIPAY SUCCESS] app detected WiPay success screen; calling backend return URL', {
+      backendReturnUrl,
+      resolvedBackendReturnUrl: targetReturnUrl,
+      paymentReturnHost: getPaymentReturnHost(targetReturnUrl),
+    });
+    console.log('[PAYMENT RETURN URL]', targetReturnUrl);
+    console.log('[PAYMENT RETURN HOST]', getPaymentReturnHost(targetReturnUrl) || '(invalid)');
 
     try {
-      const data = await getBackendJsonFromUrl(backendReturnUrl, { timeoutMs: 45000 });
-      console.log('[NOOD payment] backend payment return response', data);
+      const data = await getBackendJsonFromUrl(targetReturnUrl, { timeoutMs: 45000 });
+      console.log('[PAYMENT RESULT REDIRECT] backend payment-return JSON response', data);
 
       const redirectUrl = String(data?.redirect_url || '').trim();
+      if (redirectUrl) {
+        console.log('[PAYMENT RESULT REDIRECT] redirect_url from backend', redirectUrl);
+      }
+
       if (redirectUrl && handleSpecialUrl(redirectUrl)) {
         return;
       }
 
+      const responseOrderId = String(data?.order_id || identifiers.orderId || '').trim();
+      const responseReturnKey =
+        identifiers.returnKey ||
+        (responseOrderId && identifiers.returnToken
+          ? `${responseOrderId}:${identifiers.returnToken}`
+          : responseOrderId);
+
+      if (data?.reason === 'invalid_return_token') {
+        if (isReturnAlreadyHandled({ orderId: responseOrderId, returnKey: responseReturnKey })) {
+          ignoreDuplicateReturn('backend-return-response', {
+            orderId: responseOrderId,
+            returnKey: responseReturnKey,
+            reason: 'invalid_return_token',
+          });
+          return;
+        }
+      }
+
       if (data?.status === 'success' && data?.type === 'checkout') {
-        finishSuccess(
+        if (!data?.shopify_order_name && !data?.shopify_order_id) {
+          finishPaymentReceivedOrderIssue(
+            data?.method || 'WiPay',
+            data?.transaction_id || '',
+            responseOrderId,
+            data?.recovery_id || '',
+            'success_without_shopify_order'
+          );
+          return;
+        }
+
+        void finishSuccess(
           data?.method || 'WiPay',
           data?.shopify_order_name || '',
           data?.shopify_order_id || '',
-          data?.transaction_id || ''
+          data?.transaction_id || '',
+          responseOrderId,
+          responseReturnKey,
+          Number(data?.amount ?? data?.total ?? total ?? 0)
         );
         return;
       }
@@ -352,16 +575,34 @@ export default function PaymentScreen() {
           data?.method || 'WiPay',
           data?.transaction_id || '',
           data?.order_id || '',
-          data?.recovery_id || ''
+          data?.recovery_id || '',
+          data?.reason || 'payment_received_order_review'
         );
+        return;
+      }
+
+      if (data?.reason === 'invalid_return_token' && isReturnAlreadyHandled(identifiers)) {
+        ignoreDuplicateReturn('backend-return-failed-response', {
+          ...identifiers,
+          reason: 'invalid_return_token',
+        });
         return;
       }
 
       finishFailure(data?.reason || 'Payment return could not be completed.');
     } catch (error: any) {
-      console.log('[NOOD payment] backend return call failed', error);
-      didTriggerBackendReturnRef.current = false;
-      finishPaymentReceivedOrderIssue('WiPay', '', '', '');
+      console.log('[ORDER CREATE FAILED] backend payment-return call failed', {
+        message: error?.message || String(error),
+        backendReturnUrl,
+        resolvedBackendReturnUrl: targetReturnUrl,
+        paymentReturnHost: getPaymentReturnHost(targetReturnUrl),
+      });
+      if (!handledRef.current) {
+        didTriggerBackendReturnRef.current = false;
+        finishPaymentReceivedOrderIssue('WiPay', '', '', '', 'backend_return_request_failed');
+      }
+    } finally {
+      paymentReturnInFlightRef.current = false;
     }
   };
 
@@ -467,41 +708,57 @@ export default function PaymentScreen() {
       </View>
 
       <View style={styles.webviewWrap}>
-        <WebView
-          ref={webViewRef}
-          source={{ uri: paymentUrl }}
-          startInLoadingState
-          javaScriptEnabled
-          domStorageEnabled
-          mixedContentMode="always"
-          javaScriptCanOpenWindowsAutomatically
-          setSupportMultipleWindows={false}
-          bounces={false}
-          contentInsetAdjustmentBehavior="never"
-          renderLoading={() => (
-            <View style={styles.loadingWrap}>
-              <NoodSpinner size={48} />
-            </View>
-          )}
-          onShouldStartLoadWithRequest={(request) => {
-            const intercepted = handleSpecialUrl(request.url);
-            return !intercepted;
-          }}
-          onNavigationStateChange={(navState) => {
-            handleSpecialUrl(navState.url);
-          }}
-          injectedJavaScript={wipaySuccessDetectionScript}
-          onMessage={(event) => {
-            try {
-              const message = JSON.parse(event.nativeEvent.data || '{}');
-              if (message?.type === 'wipay_success_detected') {
-                void triggerBackendReturn();
+        {webViewEnabled ? (
+          <WebView
+            ref={webViewRef}
+            source={{ uri: paymentUrl }}
+            startInLoadingState
+            javaScriptEnabled
+            domStorageEnabled
+            mixedContentMode="always"
+            javaScriptCanOpenWindowsAutomatically
+            setSupportMultipleWindows={false}
+            bounces={false}
+            contentInsetAdjustmentBehavior="never"
+            renderLoading={() => (
+              <View style={styles.loadingWrap}>
+                <NoodSpinner size={48} />
+              </View>
+            )}
+            onShouldStartLoadWithRequest={(request) => {
+              if (handledRef.current) {
+                ignoreDuplicateReturn('onShouldStartLoadWithRequest', { url: request.url });
+                return false;
               }
-            } catch (error) {
-              console.log('[NOOD payment] WebView message parse error', error);
-            }
-          }}
-        />
+              const intercepted = handleSpecialUrl(request.url);
+              return !intercepted;
+            }}
+            onNavigationStateChange={(navState) => {
+              if (handledRef.current) {
+                return;
+              }
+              handleSpecialUrl(navState.url);
+            }}
+            injectedJavaScript={wipaySuccessDetectionScript}
+            onMessage={(event) => {
+              if (handledRef.current) {
+                return;
+              }
+              try {
+                const message = JSON.parse(event.nativeEvent.data || '{}');
+                if (message?.type === 'wipay_success_detected') {
+                  void triggerBackendReturn();
+                }
+              } catch (error) {
+                console.log('[NOOD payment] WebView message parse error', error);
+              }
+            }}
+          />
+        ) : (
+          <View style={styles.loadingWrap}>
+            <NoodSpinner size={48} />
+          </View>
+        )}
       </View>
     </SafeAreaView>
   );

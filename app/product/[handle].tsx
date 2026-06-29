@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
-  Alert,
   Animated,
   BackHandler,
   DeviceEventEmitter,
@@ -27,26 +26,88 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCart } from '../../context/CartContext';
 import { useUser } from '../../context/UserContext';
 import NoodSpinner from '../../components/NoodSpinner';
-import { BASE_CURRENCY } from '../../utils/currency';
+import ZoomableImage from '../../components/ZoomableImage';
+import { useScreenPerfReporter } from '../../utils/screen-perf';
+import { ACCOUNT_SIGN_IN_GATE_DISABLED } from '../../components/RequireSignIn';
+import { BASE_CURRENCY, normalizeCatalogCurrencyCode } from '../../utils/currency';
 import { SHOPIFY_STORE_DOMAIN } from '../../utils/shopify';
-import { catalogFetch } from '../../utils/catalog';
-import { getProductFast } from '../../utils/product-data';
+import { catalogFetch, ensureCatalogFreshness } from '../../utils/catalog';
+import {
+  getProductFast,
+  mergeStrongerProductDetail,
+  productVariantCount,
+  readProductDetailCache,
+  refreshProductDetailFromBackend,
+  refreshProductVariantImages,
+  resolveInstantProductDetail,
+} from '../../utils/product-data';
 import {
   applyProductVariantState,
   buildProductDetailFromPreview,
   buildProductRouteParams,
   parseProductPreviewFromParams,
+  productHasRenderableVariants,
 } from '../../utils/product-navigation';
+import {
+  computeProductSoldOut,
+  getProductAvailabilityLabel,
+  isVariantPurchasable,
+  logProductStockState,
+  resolveListProductSoldOut,
+} from '../../utils/product-availability';
+import type { CatalogListProduct } from '../../utils/catalog-product-mapper';
+import { loadProductPageRecommendations } from '../../utils/product-recommendations';
+import {
+  buildColorImageMap,
+  findVariantForOptions,
+  getColorDisplayLabel,
+  getColorImageForValue,
+  getColorsForSize,
+  getFirstColorForSize,
+  getOptionSelectionState,
+  isColorOptionName,
+  isSizeOptionName,
+  logProductVariantImageDebug,
+  logVariantClickDebug,
+  normalizeOptionName,
+  optionValuesEqual,
+  productNeedsVariantImageEnrichment,
+  type VariantOptionMap,
+} from '../../utils/product-variant-images';
+import { noodAlert } from '../../utils/nood-alert';
+import { recordProductView } from '../../utils/recommendation-signals';
+import {
+  logSwatchImageQuality,
+  logSwatchUiQuality,
+  resolveColorSwatchImageUrls,
+  SWATCH_DISPLAY_SIZE,
+  SWATCH_RESIZE_MODE,
+} from '../../utils/shopify-image-url';
 
 const JUDGEME_SHOP_DOMAIN = SHOPIFY_STORE_DOMAIN;
 const JUDGEME_PUBLIC_API_TOKEN = 'QOqxbIUd0jzlg0HRjQU_Dwlsqmo';
 const PRODUCT_IMAGE_PLACEHOLDER = 'https://via.placeholder.com/600x700.png?text=No+Image';
+
+function productHasInstantRenderableDetail(productData: any) {
+  if (!productData?.title) return false;
+  const imageUrl =
+    productData?.featuredImage?.url ||
+    productData?.images?.edges?.[0]?.node?.url ||
+    productData?.image ||
+    '';
+  return Boolean(String(imageUrl || '').trim());
+}
 const REVIEWS_STORAGE_PREFIX = 'NOOD_CUSTOMER_REVIEWS';
 
 const failedJudgeMeHandles = new Set<string>();
 const loggedInvalidMediaSources = new Set<string>();
 
 const { width } = Dimensions.get('window');
+
+function logInstantVariants(message: string, detail?: Record<string, unknown>) {
+  if (!__DEV__) return;
+  console.log(`[PRODUCT INSTANT VARIANTS] ${message}`, detail ?? '');
+}
 
 function getValidMediaUri(uri?: string | null) {
   const trimmed = String(uri || '').trim();
@@ -62,9 +123,112 @@ function logInvalidMediaSource(componentName: string, detail: string) {
   console.warn(`[media] skipped empty uri in ${componentName}`, detail);
 }
 
+function collectProductMediaImages(product: any) {
+  const seenUrls = new Set<string>();
+  const images: Array<{ url: string; altText: string | null; id?: string }> = [];
+
+  const addImage = (image: any, id?: string) => {
+    const url = getValidMediaUri(image?.url);
+    if (!url || seenUrls.has(url)) return;
+    seenUrls.add(url);
+    images.push({
+      url,
+      altText: image?.altText ? String(image.altText) : null,
+      id,
+    });
+  };
+
+  (product?.media?.edges || []).forEach((edge: any) => {
+    const node = edge?.node;
+    if (node?.__typename === 'MediaImage') {
+      addImage(node?.image, node?.id ? String(node.id) : undefined);
+    }
+  });
+
+  (product?.images?.edges || []).forEach((edge: any) => {
+    addImage(edge?.node, edge?.node?.id ? String(edge.node.id) : undefined);
+  });
+
+  return images;
+}
+
+function logVariantImageFinalCheck(product: any) {
+  if (!__DEV__ || !product) return;
+
+  const variants = (product?.variants?.edges || [])
+    .map((edge: any) => edge?.node)
+    .filter(Boolean);
+
+  console.log('[VARIANT IMAGE FINAL CHECK]', {
+    productTitle: product?.title || '',
+    variantCount: variants.length,
+    first10Variants: variants.slice(0, 10).map((variant: any) => ({
+      id: variant?.id,
+      title: variant?.title,
+      selectedOptions: variant?.selectedOptions,
+      image: variant?.image,
+      imageUrl: variant?.image?.url,
+    })),
+  });
+}
+
+function countVariantImageUrls(product: any) {
+  return (product?.variants?.edges || []).reduce((count: number, edge: any) => {
+    return count + (getValidMediaUri(edge?.node?.image?.url) ? 1 : 0);
+  }, 0);
+}
+
 function getReviewsStorageKey(profileId: string) {
   return `${REVIEWS_STORAGE_PREFIX}:${profileId}`;
 }
+
+function RecommendationSkeletonCard() {
+  return (
+    <View style={styles.productCard}>
+      <View style={[styles.productCardImage, styles.recommendationSkeletonBlock]} />
+      <View style={[styles.recommendationSkeletonLine, styles.recommendationSkeletonLineWide]} />
+      <View style={[styles.recommendationSkeletonLine, styles.recommendationSkeletonLineMedium]} />
+      <View style={[styles.recommendationSkeletonLine, styles.recommendationSkeletonLinePrice]} />
+    </View>
+  );
+}
+
+const ProductRecommendationCard = React.memo(function ProductRecommendationCard({
+  item,
+  priceLabel,
+  onOpen,
+}: {
+  item: CatalogListProduct;
+  priceLabel: string;
+  onOpen: (item: CatalogListProduct) => void;
+}) {
+  const isSoldOut = resolveListProductSoldOut(item);
+
+  return (
+    <TouchableOpacity
+      style={styles.productCard}
+      activeOpacity={0.9}
+      onPress={() => onOpen(item)}
+    >
+      <Image
+        source={{
+          uri: item.image || PRODUCT_IMAGE_PLACEHOLDER,
+        }}
+        style={styles.productCardImage}
+        resizeMode="cover"
+      />
+      <Text numberOfLines={2} style={styles.productCardTitle}>
+        {item.title}
+      </Text>
+      <Text style={styles.productCardPrice}>{priceLabel}</Text>
+      {isSoldOut ? (
+        <Text numberOfLines={1} style={styles.recommendationSoldOutText}>
+          {getProductAvailabilityLabel(item)}
+        </Text>
+      ) : null}
+    </TouchableOpacity>
+  );
+});
 
 function ProductVideoPreview({
   previewUri,
@@ -104,7 +268,170 @@ const COLORS = {
 };
 
 type TabKey = 'overview' | 'details' | 'similar';
-type VariantOptionMap = Record<string, string>;
+
+type ProductOptionGroupProps = {
+  group: { name: string; values: string[] };
+  colorOptionName: string | null;
+  sizeOptionName: string | null;
+  variantNodes: any[];
+  productImageEdges?: any[];
+  selectedOptionsMap: VariantOptionMap;
+  getSelectionState: (optionName: string, optionValue: string) => {
+    exists: boolean;
+    purchasable: boolean;
+  };
+  onSelect: (groupName: string, value: string) => void;
+  chipStyle?: 'default' | 'picker';
+};
+
+const ProductOptionGroup = React.memo(function ProductOptionGroup({
+  group,
+  colorOptionName,
+  sizeOptionName,
+  variantNodes,
+  productImageEdges = [],
+  selectedOptionsMap,
+  getSelectionState,
+  onSelect,
+  chipStyle = 'default',
+}: ProductOptionGroupProps) {
+  const isColorGroup = Boolean(
+    colorOptionName &&
+      normalizeOptionName(group.name) === normalizeOptionName(colorOptionName)
+  );
+  const isPicker = chipStyle === 'picker';
+
+  const renderColorSwatch = (value: string) => {
+    const active = optionValuesEqual(selectedOptionsMap[group.name], value);
+    const { exists, purchasable } = getSelectionState(group.name, value);
+    const soldOut = exists && !purchasable;
+    const swatch = getColorImageForValue(
+      variantNodes,
+      group.name,
+      value,
+      selectedOptionsMap,
+      productImageEdges
+    );
+    const { galleryImageUrl, swatchImageUrl } = resolveColorSwatchImageUrls(swatch?.url);
+    const label = getColorDisplayLabel(group.name, value);
+
+    if (galleryImageUrl || swatchImageUrl) {
+      logSwatchImageQuality({
+        colorValue: value,
+        originalUrl: galleryImageUrl,
+        swatchUrl: swatchImageUrl,
+        width: SWATCH_DISPLAY_SIZE,
+        height: SWATCH_DISPLAY_SIZE,
+      });
+    }
+
+    logSwatchUiQuality({
+      colorValue: value,
+      swatchImageUrl,
+      displaySize: SWATCH_DISPLAY_SIZE,
+      resizeMode: SWATCH_RESIZE_MODE,
+      isSelected: active,
+      isSoldOut: soldOut,
+      isDisabled: !exists,
+    });
+
+    return (
+      <Pressable
+        key={`${chipStyle}-${group.name}-${value}`}
+        onPress={() => {
+          if (!exists) return;
+          onSelect(group.name, value);
+        }}
+        style={[
+          styles.colorSwatchButton,
+          active && styles.colorSwatchButtonActive,
+        ]}
+      >
+        {swatchImageUrl ? (
+          <View style={styles.colorSwatchImageWrap}>
+            <Image
+              source={{ uri: swatchImageUrl }}
+              style={styles.colorSwatchImage}
+              resizeMode={SWATCH_RESIZE_MODE}
+            />
+          </View>
+        ) : (
+          <View style={styles.colorSwatchTextWrap}>
+            <Text
+              style={[
+                styles.colorSwatchText,
+                active && styles.colorSwatchTextActive,
+              ]}
+              numberOfLines={2}
+            >
+              {label}
+            </Text>
+          </View>
+        )}
+      </Pressable>
+    );
+  };
+
+  const renderOptionChip = (value: string) => {
+    const active = optionValuesEqual(selectedOptionsMap[group.name], value);
+    const { exists } = getSelectionState(group.name, value);
+
+    return (
+      <Pressable
+        key={`${chipStyle}-${group.name}-${value}`}
+        onPress={() => {
+          if (!exists) return;
+          onSelect(group.name, value);
+        }}
+        style={[
+          isPicker ? styles.variantPickerChip : styles.optionChip,
+          active && (isPicker ? styles.variantPickerChipActive : styles.optionChipActive),
+        ]}
+      >
+        <Text
+          style={[
+            isPicker ? styles.variantPickerChipText : styles.optionChipText,
+            active &&
+              (isPicker ? styles.variantPickerChipTextActive : styles.optionChipTextActive),
+          ]}
+        >
+          {value}
+        </Text>
+      </Pressable>
+    );
+  };
+
+  return (
+    <View style={isPicker ? styles.variantPickerGroup : styles.optionGroupBlock}>
+      <View style={isPicker ? undefined : styles.optionGroupHeader}>
+        <Text style={isPicker ? styles.variantPickerGroupTitle : styles.optionGroupTitle}>
+          {group.name}
+        </Text>
+        {!isPicker ? (
+          <Text style={styles.optionGroupValue}>
+            {isColorGroup
+              ? getColorDisplayLabel(group.name, selectedOptionsMap[group.name] || '')
+              : selectedOptionsMap[group.name] || 'Choose'}
+          </Text>
+        ) : null}
+      </View>
+
+      {isColorGroup ? (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.colorSwatchScrollContent}
+        >
+          {group.values.map(renderColorSwatch)}
+        </ScrollView>
+      ) : (
+        <View style={isPicker ? styles.variantPickerChipGrid : styles.optionChipWrap}>
+          {group.values.map(renderOptionChip)}
+        </View>
+      )}
+    </View>
+  );
+});
 
 export default function ProductScreen() {
   const {
@@ -130,7 +457,6 @@ export default function ProductScreen() {
   }>();
   const {
     addToCart,
-    cartCount,
     selectedCurrency = BASE_CURRENCY,
     convertPrice,
     formatMoney,
@@ -142,19 +468,29 @@ export default function ProductScreen() {
   const galleryScrollRef = useRef<FlatList<any> | null>(null);
   const fullscreenGalleryRef = useRef<FlatList<any> | null>(null);
   const openedReviewFromRouteRef = useRef(false);
+  const initialGalleryFocusHandleRef = useRef('');
+  const variantImageEnrichRef = useRef('');
+  const backendVariantRefreshRef = useRef('');
+  const productOpenStartedAtRef = useRef(Date.now());
+  const recommendationsRequestRef = useRef(0);
+  const recommendationsLockedHandleRef = useRef('');
 
   const initialPreview = useMemo(
     () => parseProductPreviewFromParams({ handle, preview }),
     [handle, preview]
   );
   const initialProduct = useMemo(
-    () => (initialPreview ? buildProductDetailFromPreview(initialPreview) : null),
-    [initialPreview]
+    () =>
+      typeof handle === 'string' && handle.trim()
+        ? resolveInstantProductDetail(handle, initialPreview)
+        : null,
+    [handle, initialPreview]
   );
 
   const [product, setProduct] = useState<any>(initialProduct);
-  const [recommendedProducts, setRecommendedProducts] = useState<any[]>([]);
-  const [loading, setLoading] = useState(!initialProduct);
+  const [recommendedProducts, setRecommendedProducts] = useState<CatalogListProduct[]>([]);
+  const [recommendationsLoading, setRecommendationsLoading] = useState(false);
+  const [loading, setLoading] = useState(() => !productHasInstantRenderableDetail(initialProduct));
   const [detailRefreshing, setDetailRefreshing] = useState(false);
   const [reviewsLoading, setReviewsLoading] = useState(false);
   const [judgeMeWidgetHtml, setJudgeMeWidgetHtml] = useState('');
@@ -163,7 +499,6 @@ export default function ProductScreen() {
   const [descriptionExpanded, setDescriptionExpanded] = useState(false);
   const [activeTab, setActiveTab] = useState<TabKey>('overview');
   const [showPromoBar, setShowPromoBar] = useState(true);
-  const [showFloatingCart, setShowFloatingCart] = useState(true);
   const [showGalleryModal, setShowGalleryModal] = useState(false);
   const [showVariantPicker, setShowVariantPicker] = useState(false);
   const [selectedOptionsMap, setSelectedOptionsMap] = useState<VariantOptionMap>({});
@@ -197,6 +532,13 @@ export default function ProductScreen() {
     return () => subscription.remove();
   }, [handleBackPress]);
 
+  useEffect(() => {
+    recommendationsRequestRef.current += 1;
+    recommendationsLockedHandleRef.current = '';
+    setRecommendedProducts([]);
+    setRecommendationsLoading(false);
+  }, [handle]);
+
   const [sectionY, setSectionY] = useState<Record<TabKey, number>>({
     overview: 0,
     details: 0,
@@ -208,30 +550,84 @@ export default function ProductScreen() {
   const promoPulse = useRef(new Animated.Value(0)).current;
   const galleryDragY = useRef(new Animated.Value(0)).current;
 
-  const floatingCartScale = useRef(new Animated.Value(1)).current;
-  const floatingCartRotate = useRef(new Animated.Value(0)).current;
-
   useEffect(() => {
     if (typeof handle !== 'string' || !handle.trim()) {
       return;
     }
 
-    console.log(`[NOOD product] opened handle=${handle}`);
+    productOpenStartedAtRef.current = Date.now();
+    console.log('[NOOD product] route opened', { handle, from: from || null });
     const nextPreview = parseProductPreviewFromParams({ handle, preview });
+    const previewProduct = nextPreview ? buildProductDetailFromPreview(nextPreview) : null;
+    const instantProduct = resolveInstantProductDetail(handle, nextPreview);
+    const routePayloadHasVariants = productHasRenderableVariants(previewProduct);
+    const instantHasVariants = productHasRenderableVariants(instantProduct);
+    const hasInstantPreview = productHasInstantRenderableDetail(instantProduct);
 
-    if (nextPreview) {
-      const previewProduct = buildProductDetailFromPreview(nextPreview);
-      setProduct(previewProduct);
+    logInstantVariants(`routePayloadHasVariants ${routePayloadHasVariants}`);
+    logInstantVariants(`instantHasVariants ${instantHasVariants}`);
+
+    void (async () => {
+      const cached = await readProductDetailCache(handle);
+      logInstantVariants(`localCacheHasVariants ${productHasRenderableVariants(cached)}`);
+
+      if (!cached || !productHasInstantRenderableDetail(cached)) return;
+
+      const merged = mergeStrongerProductDetail(previewProduct, cached);
+      if (!merged || !productHasRenderableVariants(merged)) {
+        if (!previewProduct && merged) {
+          setProduct(merged);
+          setLoading(false);
+          applyProductVariantState(merged, setSelectedVariant, setSelectedOptionsMap, 'cache');
+        }
+        return;
+      }
+
+      if (
+        instantHasVariants &&
+        productVariantCount(instantProduct) >= productVariantCount(merged)
+      ) {
+        return;
+      }
+
+      setProduct(merged);
+      setLoading(false);
+      applyProductVariantState(merged, setSelectedVariant, setSelectedOptionsMap, 'cache');
+      logInstantVariants(`asyncCacheUpgrade variantCount=${productVariantCount(merged)}`);
+      console.log('[NOOD product] cached product used', {
+        handle,
+        source: 'detail-cache-upgrade',
+      });
+      console.log(
+        `[NOOD product] detail ready time ${Date.now() - productOpenStartedAtRef.current}ms`
+      );
+    })();
+
+    if (instantProduct && hasInstantPreview) {
+      setProduct(instantProduct);
       setLoading(false);
       setCurrentIndex(0);
       setActiveTab('overview');
       setDescriptionExpanded(false);
       setShowPromoBar(true);
-      applyProductVariantState(previewProduct, setSelectedVariant, setSelectedOptionsMap);
-      console.log('[NOOD product] rendered from passed data');
+      applyProductVariantState(instantProduct, setSelectedVariant, setSelectedOptionsMap, 'preview');
+      logInstantVariants(`firstRenderVariantCount ${productVariantCount(instantProduct)}`);
+      logInstantVariants(`firstRenderMs ${Date.now() - productOpenStartedAtRef.current}`);
+      console.log('[NOOD product] cached product used', {
+        handle,
+        source: instantHasVariants ? 'detail-cache' : 'route-preview',
+        hasVariants: instantHasVariants || routePayloadHasVariants,
+      });
+      console.log(
+        `[NOOD product] detail ready time ${Date.now() - productOpenStartedAtRef.current}ms`
+      );
     }
 
-    void fetchProduct(handle, Boolean(nextPreview));
+    variantImageEnrichRef.current = '';
+    backendVariantRefreshRef.current = '';
+
+    void fetchProduct(handle, hasInstantPreview, nextPreview);
+    void ensureCatalogFreshness('product-detail');
   }, [handle, preview]);
 
   useEffect(() => {
@@ -298,47 +694,6 @@ export default function ProductScreen() {
     };
   }, [showPromoBar, promoOpacity, promoPulse, promoTranslateY]);
 
-  useEffect(() => {
-    if (!showFloatingCart) {
-      floatingCartScale.setValue(1);
-      floatingCartRotate.setValue(0);
-      return;
-    }
-
-    const pulse = Animated.loop(
-      Animated.sequence([
-        Animated.parallel([
-          Animated.timing(floatingCartScale, {
-            toValue: 1.08,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-          Animated.timing(floatingCartRotate, {
-            toValue: 1,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-        ]),
-        Animated.parallel([
-          Animated.timing(floatingCartScale, {
-            toValue: 1,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-          Animated.timing(floatingCartRotate, {
-            toValue: 0,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-        ]),
-      ])
-    );
-
-    pulse.start();
-
-    return () => pulse.stop();
-  }, [showFloatingCart, floatingCartScale, floatingCartRotate]);
-
   const shopifyFetch = async (query: string, variables?: Record<string, any>) => {
     const json = await catalogFetch(query, variables);
 
@@ -349,9 +704,73 @@ export default function ProductScreen() {
     return json;
   };
 
-  const fetchProduct = async (productHandle: string, hasPassedPreview = false) => {
+  const loadRecommendationsForProduct = useCallback(async (productData: any) => {
+    const productHandle = String(productData?.handle || '').trim();
+    const productId = String(productData?.id || '').trim();
+
+    if (!productHandle || !productId) {
+      setRecommendedProducts([]);
+      setRecommendationsLoading(false);
+      return;
+    }
+
+    if (recommendationsLockedHandleRef.current === productHandle) {
+      return;
+    }
+
+    const requestId = ++recommendationsRequestRef.current;
+    setRecommendationsLoading(true);
+
     try {
-      if (!hasPassedPreview) {
+      const collectionHandles =
+        productData?.collections?.edges
+          ?.map((entry: any) => String(entry?.node?.handle || '').trim())
+          .filter(Boolean) || [];
+
+      const result = await loadProductPageRecommendations({
+        productId,
+        handle: productHandle,
+        title: productData?.title,
+        tags: Array.isArray(productData?.tags) ? productData.tags.map(String) : [],
+        productType: productData?.productType,
+        collectionHandles,
+        vendor: productData?.vendor,
+      });
+
+      if (requestId !== recommendationsRequestRef.current) return;
+
+      console.log('[RECOMMENDATIONS_DEBUG]', {
+        currentHandle: productHandle,
+        currentCollection: collectionHandles[0] || null,
+        recommendedCount: result.products.length,
+        handles: result.products.map((item) => item.handle),
+        source: result.source,
+      });
+
+      if (result.products.length > 0) {
+        setRecommendedProducts(result.products);
+        recommendationsLockedHandleRef.current = productHandle;
+      } else {
+        setRecommendedProducts([]);
+      }
+    } catch (error) {
+      if (requestId !== recommendationsRequestRef.current) return;
+      console.log('loadRecommendationsForProduct error:', error);
+      setRecommendedProducts([]);
+    } finally {
+      if (requestId === recommendationsRequestRef.current) {
+        setRecommendationsLoading(false);
+      }
+    }
+  }, []);
+
+  const fetchProduct = async (
+    productHandle: string,
+    hasInstantRenderable = false,
+    routePreview: ReturnType<typeof parseProductPreviewFromParams> = null
+  ) => {
+    try {
+      if (!hasInstantRenderable) {
         setLoading(true);
         setCurrentIndex(0);
         setActiveTab('overview');
@@ -361,26 +780,71 @@ export default function ProductScreen() {
         setDetailRefreshing(true);
       }
 
-      const p = await getProductFast(productHandle);
+      let p = await getProductFast(productHandle, routePreview);
 
-      setProduct(p);
-      applyProductVariantState(p, setSelectedVariant, setSelectedOptionsMap);
+      if (p && !productHasRenderableVariants(p)) {
+        const refreshed = await refreshProductDetailFromBackend(productHandle, p);
+        if (refreshed && productHasRenderableVariants(refreshed)) {
+          p = refreshed;
+          backendVariantRefreshRef.current = productHandle;
+        }
+      }
 
-      if (p?.variants?.edges?.length) {
-        const initialVariant = p.variants.edges[0].node;
+      const resolved = mergeStrongerProductDetail(
+        routePreview ? buildProductDetailFromPreview(routePreview) : null,
+        p
+      );
+
+      logVariantImageFinalCheck(resolved);
+      setProduct((current: any) => mergeStrongerProductDetail(current, resolved) || resolved);
+      applyProductVariantState(resolved, setSelectedVariant, setSelectedOptionsMap, 'detail');
+      logProductStockState(resolved, 'detail', {
+        selectedVariant: resolved?.variants?.edges?.[0]?.node,
+      });
+      setLoading(false);
+      setDetailRefreshing(false);
+      logInstantVariants(`firstRenderVariantCount ${productVariantCount(resolved)}`);
+      logInstantVariants(`firstRenderMs ${Date.now() - productOpenStartedAtRef.current}`);
+      console.log(
+        `[NOOD product] detail ready time ${Date.now() - productOpenStartedAtRef.current}ms`
+      );
+
+      if (resolved?.handle) {
+        void recordProductView(
+          { profileId: profileId || 'guest', isSignedIn },
+          {
+            handle: String(resolved.handle),
+            id: resolved.id ? String(resolved.id) : undefined,
+            title: resolved.title ? String(resolved.title) : undefined,
+            tags: Array.isArray(resolved.tags) ? resolved.tags.map(String) : [],
+            productType: resolved.productType ? String(resolved.productType) : undefined,
+            collectionHandles:
+              resolved.collections?.edges?.map((entry: any) => entry?.node?.handle).filter(Boolean) || [],
+            vendor: resolved.vendor ? String(resolved.vendor) : undefined,
+          }
+        );
+      }
+
+      if (
+        resolved?.variants?.edges?.length &&
+        (process.env.EXPO_PUBLIC_PRODUCT_LOAD_DEBUG === 'true' ||
+          process.env.EXPO_PUBLIC_PRODUCT_LOAD_DEBUG === '1')
+      ) {
+        const initialVariant = resolved.variants.edges[0].node;
         console.log('[NOOD product load] product detail initial variant', {
-          title: p.title,
-          handle: p.handle,
-          productId: p.id,
+          title: resolved.title,
+          handle: resolved.handle,
+          productId: resolved.id,
           variantId: initialVariant?.id || '',
           variantTitle: initialVariant?.title || '',
         });
       }
 
-      if (p?.id) {
-        await fetchRecommendedProducts(p.id);
+      if (resolved?.id && resolved?.handle) {
+        void loadRecommendationsForProduct(resolved);
       } else {
         setRecommendedProducts([]);
+        setRecommendationsLoading(false);
       }
 
       setTimeout(() => {
@@ -392,38 +856,10 @@ export default function ProductScreen() {
       setSelectedVariant(null);
       setSelectedOptionsMap({});
       setRecommendedProducts([]);
+      setRecommendationsLoading(false);
     } finally {
       setLoading(false);
       setDetailRefreshing(false);
-    }
-  };
-
-  const fetchRecommendedProducts = async (productId: string) => {
-    try {
-      const query = `
-        query ProductRecommendations($productId: ID!) {
-          productRecommendations(productId: $productId) {
-            id
-            title
-            handle
-            featuredImage {
-              url
-            }
-            priceRange {
-              minVariantPrice {
-                amount
-                currencyCode
-              }
-            }
-          }
-        }
-      `;
-
-      const json = await shopifyFetch(query, { productId });
-      setRecommendedProducts(json?.data?.productRecommendations ?? []);
-    } catch (error) {
-      console.log('fetchRecommendedProducts error:', error);
-      setRecommendedProducts([]);
     }
   };
 
@@ -461,8 +897,21 @@ export default function ProductScreen() {
     }
   };
 
+  const variantNodes = useMemo(
+    () => (product?.variants?.edges || []).map((edge: any) => edge.node).filter(Boolean),
+    [product]
+  );
+
+  const productSwatchImageCandidates = useMemo(
+    () => collectProductMediaImages(product),
+    [product]
+  );
+
   const gallery = useMemo(() => {
     if (!product) return [];
+
+    let baseItems: Array<{ id: string; type: string; url: string; previewUrl?: string | null }> =
+      [];
 
     if (product.media?.edges?.length) {
       const mediaItems = product.media.edges
@@ -497,34 +946,58 @@ export default function ProductScreen() {
         .filter(Boolean);
 
       if (mediaItems.length > 0) {
-        return mediaItems;
+        baseItems = mediaItems;
       }
     }
 
-    return (product.images?.edges ?? [])
-      .map((edge: any) => {
-        const uri = getValidMediaUri(edge?.node?.url);
-        if (!uri) {
-          logInvalidMediaSource('ProductScreen.galleryFallback', String(product?.handle || 'unknown'));
-          return null;
-        }
+    if (!baseItems.length) {
+      baseItems = (product.images?.edges ?? [])
+        .map((edge: any) => {
+          const uri = getValidMediaUri(edge?.node?.url);
+          if (!uri) {
+            logInvalidMediaSource(
+              'ProductScreen.galleryFallback',
+              String(product?.handle || 'unknown')
+            );
+            return null;
+          }
 
-        return {
-          id: String(edge?.node?.id || uri),
-          type: 'image',
-          url: uri,
-        };
-      })
-      .filter(Boolean);
-  }, [product]);
+          return {
+            id: String(edge?.node?.id || uri),
+            type: 'image',
+            url: uri,
+          };
+        })
+        .filter(Boolean);
+    }
+
+    const seenUrls = new Set(baseItems.map((item) => item.url));
+    const mergedItems = [...baseItems];
+
+    variantNodes.forEach((variant: any) => {
+      const uri = getValidMediaUri(variant?.image?.url);
+      if (!uri || seenUrls.has(uri)) return;
+
+      mergedItems.push({
+        id: `variant-${variant.id || uri}`,
+        type: 'image',
+        url: uri,
+      });
+      seenUrls.add(uri);
+    });
+
+    return mergedItems;
+  }, [product, variantNodes]);
 
   const productPrimaryImage = useMemo(() => {
     return (
+      getValidMediaUri(selectedVariant?.image?.url) ||
+      getValidMediaUri(gallery?.[currentIndex]?.url) ||
       getValidMediaUri(gallery?.[0]?.url) ||
       getValidMediaUri(product?.featuredImage?.url) ||
       PRODUCT_IMAGE_PLACEHOLDER
     );
-  }, [gallery, product]);
+  }, [currentIndex, gallery, product, selectedVariant]);
 
   useEffect(() => {
     if (openedReviewFromRouteRef.current || !product || openReview !== '1') return;
@@ -532,11 +1005,6 @@ export default function ProductScreen() {
     openedReviewFromRouteRef.current = true;
     setShowReviewModal(true);
   }, [openReview, product]);
-
-  const variantNodes = useMemo(
-    () => (product?.variants?.edges || []).map((edge: any) => edge.node).filter(Boolean),
-    [product]
-  );
 
   const optionGroups = useMemo(() => {
     const groups = new Map<string, string[]>();
@@ -557,73 +1025,358 @@ export default function ProductScreen() {
     return Array.from(groups.entries()).map(([name, values]) => ({ name, values }));
   }, [variantNodes]);
 
-  const isOptionValueAvailable = useCallback(
+  const colorOptionName = useMemo(
+    () => optionGroups.find((group) => isColorOptionName(group.name))?.name || null,
+    [optionGroups]
+  );
+
+  const sizeOptionName = useMemo(
+    () => optionGroups.find((group) => isSizeOptionName(group.name))?.name || null,
+    [optionGroups]
+  );
+
+  useEffect(() => {
+    if (!optionGroups.length) return;
+
+    if (colorOptionName) {
+      buildColorImageMap(
+        variantNodes,
+        colorOptionName,
+        selectedOptionsMap,
+        productSwatchImageCandidates
+      );
+    }
+
+    logProductVariantImageDebug(
+      optionGroups,
+      colorOptionName,
+      selectedOptionsMap,
+      selectedVariant
+    );
+  }, [
+    colorOptionName,
+    optionGroups,
+    productSwatchImageCandidates,
+    selectedOptionsMap,
+    selectedVariant,
+    variantNodes,
+  ]);
+
+  useEffect(() => {
+    const productHandle = String(product?.handle || '').trim();
+    if (!productHandle || backendVariantRefreshRef.current === productHandle) return;
+
+    backendVariantRefreshRef.current = productHandle;
+
+    void (async () => {
+      const startedAt = Date.now();
+      const beforeImageCount = countVariantImageUrls(product);
+      logInstantVariants('backendRefreshStarted');
+
+      const refreshed = await refreshProductDetailFromBackend(productHandle, product);
+      logInstantVariants(`backendRefreshCompleted ms=${Date.now() - startedAt}`);
+
+      if (!refreshed || refreshed === product) return;
+
+      const afterImageCount = countVariantImageUrls(refreshed);
+      const updatedImageCount = Math.max(0, afterImageCount - beforeImageCount);
+      const merged = mergeStrongerProductDetail(product, refreshed) || refreshed;
+
+      if (merged === product) return;
+
+      setProduct(merged);
+
+      const matchedVariant = findVariantForOptions(
+        (merged?.variants?.edges || []).map((edge: any) => edge?.node).filter(Boolean),
+        selectedOptionsMap
+      );
+
+      if (matchedVariant) {
+        setSelectedVariant(matchedVariant);
+      } else {
+        applyProductVariantState(merged, setSelectedVariant, setSelectedOptionsMap, 'detail');
+      }
+
+      logProductStockState(merged, 'backend', { selectedVariant: matchedVariant });
+
+      if (updatedImageCount > 0) {
+        logInstantVariants(`swatchImagesUpdated ${updatedImageCount}`);
+      }
+    })();
+  }, [product, selectedOptionsMap]);
+
+  useEffect(() => {
+    const productHandle = String(product?.handle || '').trim();
+    if (!productHandle || variantImageEnrichRef.current === productHandle) return;
+    if (!productNeedsVariantImageEnrichment(product, colorOptionName)) {
+      console.log('[PRODUCT LOAD SPEED] enrichment skipped reason=color-swatch-images-ready');
+      return;
+    }
+
+    variantImageEnrichRef.current = productHandle;
+
+    void (async () => {
+      logInstantVariants('enrichmentStarted reason=missing-variant-or-swatch-images');
+      const beforeImageCount = countVariantImageUrls(product);
+      const enriched = await refreshProductVariantImages(product, true);
+      if (!enriched || enriched === product) return;
+
+      setProduct(enriched);
+      const updatedImageCount = Math.max(0, countVariantImageUrls(enriched) - beforeImageCount);
+      if (updatedImageCount > 0) {
+        logInstantVariants(`swatchImagesUpdated ${updatedImageCount}`);
+      }
+      const matchedVariant = findVariantForOptions(
+        (enriched?.variants?.edges || []).map((edge: any) => edge?.node).filter(Boolean),
+        selectedOptionsMap
+      );
+
+      if (matchedVariant) {
+        setSelectedVariant(matchedVariant);
+      }
+    })();
+  }, [colorOptionName, product, selectedOptionsMap]);
+
+  const getSelectionState = useCallback(
     (optionName: string, optionValue: string) =>
-      variantNodes.some((variant: any) => {
-        const optionMap = Object.fromEntries(
-          (variant?.selectedOptions || []).map((option: any) => [option.name, option.value])
-        );
-
-        if (optionMap[optionName] !== optionValue) return false;
-
-        return Object.entries(selectedOptionsMap).every(([name, value]) => {
-          if (name === optionName || !value) return true;
-          return optionMap[name] === value;
-        });
+      getOptionSelectionState(variantNodes, optionName, optionValue, selectedOptionsMap, {
+        colorOptionName,
+        sizeOptionName,
       }),
-    [selectedOptionsMap, variantNodes]
+    [colorOptionName, selectedOptionsMap, sizeOptionName, variantNodes]
+  );
+
+  const focusGalleryOnImageUrl = useCallback(
+    (imageUrl?: string | null) => {
+      const validImageUrl = getValidMediaUri(imageUrl);
+      if (!validImageUrl || !gallery.length) return false;
+
+      const targetIndex = gallery.findIndex((item) => item.url === validImageUrl);
+      if (targetIndex < 0) return false;
+
+      setCurrentIndex(targetIndex);
+      requestAnimationFrame(() => {
+        galleryScrollRef.current?.scrollToIndex({ index: targetIndex, animated: true });
+      });
+
+      return true;
+    },
+    [gallery]
+  );
+
+  const focusGalleryOnVariant = useCallback(
+    (variant: any) => {
+      focusGalleryOnImageUrl(variant?.image?.url);
+    },
+    [focusGalleryOnImageUrl]
+  );
+
+  const focusGalleryOnColorValue = useCallback(
+    (colorValue: string, optionsMap: VariantOptionMap) => {
+      if (!colorOptionName) return false;
+
+      const swatch = getColorImageForValue(
+        variantNodes,
+        colorOptionName,
+        colorValue,
+        optionsMap,
+        productSwatchImageCandidates
+      );
+
+      return focusGalleryOnImageUrl(swatch?.url);
+    },
+    [colorOptionName, focusGalleryOnImageUrl, productSwatchImageCandidates, variantNodes]
   );
 
   const syncVariantSelection = useCallback(
-    (nextOptions: VariantOptionMap) => {
+    (nextOptions: VariantOptionMap, options: { focusGallery?: boolean } = {}) => {
       if (!variantNodes.length) return;
 
-      const exactMatch = variantNodes.find((variant: any) => {
-        const optionMap = Object.fromEntries(
-          (variant?.selectedOptions || []).map((option: any) => [option.name, option.value])
-        );
-
-        return Object.entries(nextOptions).every(([name, value]) => optionMap[name] === value);
-      });
+      const exactMatch = findVariantForOptions(variantNodes, nextOptions);
 
       if (exactMatch) {
         setSelectedVariant(exactMatch);
+        logVariantClickDebug('[PRODUCT VARIANT CLICK DEBUG] selectedVariant', {
+          variantId: String(exactMatch.id || ''),
+          availableForSale: exactMatch.availableForSale !== false,
+          selectedOptions: nextOptions,
+        });
+        if (options.focusGallery !== false) {
+          focusGalleryOnVariant(exactMatch);
+        }
         return;
       }
 
-      const fallbackMatch = variantNodes.find((variant: any) => {
-        const optionMap = Object.fromEntries(
-          (variant?.selectedOptions || []).map((option: any) => [option.name, option.value])
-        );
-
-        return Object.entries(nextOptions).every(([name, value]) => {
-          return !value || optionMap[name] === value;
-        });
+      logVariantClickDebug('[PRODUCT VARIANT CLICK DEBUG] disabled reason', {
+        reason: 'no-exact-variant-match',
+        selectedOptions: nextOptions,
       });
+    },
+    [focusGalleryOnVariant, variantNodes]
+  );
 
-      if (fallbackMatch) {
-        setSelectedVariant(fallbackMatch);
-        setSelectedOptionsMap(
-          Object.fromEntries(
-            (fallbackMatch?.selectedOptions || []).map((option: any) => [
-              option.name,
-              option.value,
-            ])
-          )
+  const handleOptionSelect = useCallback(
+    (groupName: string, value: string) => {
+      const isSize = Boolean(sizeOptionName && groupName === sizeOptionName);
+      const isColor = Boolean(colorOptionName && groupName === colorOptionName);
+
+      let nextOptions: VariantOptionMap = {
+        ...selectedOptionsMap,
+        [groupName]: value,
+      };
+
+      if (isSize) {
+        logVariantClickDebug('[PRODUCT VARIANT CLICK DEBUG] tapped size', {
+          size: value,
+          previousColor: colorOptionName ? selectedOptionsMap[colorOptionName] : null,
+        });
+
+        if (colorOptionName) {
+          const validColors = getColorsForSize(
+            variantNodes,
+            groupName,
+            value,
+            colorOptionName
+          );
+
+          logVariantClickDebug(
+            '[PRODUCT VARIANT CLICK DEBUG] matching variants for selected size',
+            {
+              size: value,
+              colors: validColors,
+            }
+          );
+
+          const currentColor = nextOptions[colorOptionName];
+          if (
+            !currentColor ||
+            !validColors.some((color) => optionValuesEqual(color, currentColor))
+          ) {
+            const firstColor = getFirstColorForSize(
+              variantNodes,
+              groupName,
+              value,
+              colorOptionName
+            );
+
+            if (firstColor) {
+              nextOptions = {
+                ...nextOptions,
+                [colorOptionName]: firstColor,
+              };
+            }
+          }
+        }
+      }
+
+      if (isColor) {
+        logVariantClickDebug('[PRODUCT VARIANT CLICK DEBUG] tapped color', {
+          color: value,
+          selectedSize: sizeOptionName ? nextOptions[sizeOptionName] : null,
+        });
+
+        logVariantClickDebug(
+          '[PRODUCT VARIANT CLICK DEBUG] matching variants for selected color',
+          {
+            color: value,
+            selectedSize: sizeOptionName ? nextOptions[sizeOptionName] : null,
+            variantIds: variantNodes
+              .filter((variant: any) => {
+                if (!colorOptionName) return false;
+                const matchesColor = variant?.selectedOptions?.some(
+                  (option: any) =>
+                    isColorOptionName(option?.name) &&
+                    optionValuesEqual(option?.value, value)
+                );
+                if (!matchesColor) return false;
+                if (sizeOptionName && nextOptions[sizeOptionName]) {
+                  return variant?.selectedOptions?.some(
+                    (option: any) =>
+                      isSizeOptionName(option?.name) &&
+                      optionValuesEqual(option?.value, nextOptions[sizeOptionName])
+                  );
+                }
+                return true;
+              })
+              .map((variant: any) => String(variant?.id || '')),
+          }
         );
       }
+
+      const selectionState = getSelectionState(groupName, value);
+      if (!selectionState.exists) {
+        logVariantClickDebug('[PRODUCT VARIANT CLICK DEBUG] disabled reason', {
+          reason: 'variant-combination-missing',
+          optionName: groupName,
+          optionValue: value,
+        });
+        return;
+      }
+
+      setSelectedOptionsMap(nextOptions);
+      syncVariantSelection(nextOptions, { focusGallery: !isColor });
+
+      if (isColor) {
+        focusGalleryOnColorValue(value, nextOptions);
+      }
     },
-    [variantNodes]
+    [
+      colorOptionName,
+      focusGalleryOnColorValue,
+      getSelectionState,
+      sizeOptionName,
+      selectedOptionsMap,
+      syncVariantSelection,
+      variantNodes,
+    ]
   );
+
+  useEffect(() => {
+    const productHandle = String(product?.handle || '').trim();
+    if (!productHandle || !selectedVariant || !gallery.length) return;
+    if (initialGalleryFocusHandleRef.current === productHandle) return;
+
+    initialGalleryFocusHandleRef.current = productHandle;
+    focusGalleryOnVariant(selectedVariant);
+  }, [focusGalleryOnVariant, gallery.length, product?.handle, selectedVariant]);
 
   const formatDisplayPrice = useCallback(
     (amount?: string | number | null, fromCurrency?: string | null) =>
       formatMoney(
-        convertPrice(Number(amount || 0), fromCurrency || BASE_CURRENCY, selectedCurrency),
+        convertPrice(
+          Number(amount || 0),
+          normalizeCatalogCurrencyCode(fromCurrency || undefined),
+          selectedCurrency
+        ),
         selectedCurrency
       ),
     [convertPrice, formatMoney, selectedCurrency]
   );
+
+  const openRecommendedProduct = useCallback((item: CatalogListProduct) => {
+    if (!item.handle) return;
+
+    router.push({
+      pathname: '/product/[handle]',
+      params: buildProductRouteParams(item) as any,
+    });
+  }, []);
+
+  const recommendationPriceById = useMemo(() => {
+    const map = new Map<string, string>();
+    recommendedProducts.forEach((item) => {
+      const key = `${item.id}-${item.handle}`;
+      map.set(key, formatDisplayPrice(item.priceAmount, item.currencyCode));
+    });
+    return map;
+  }, [formatDisplayPrice, recommendedProducts]);
+
+  const productSoldOut = useMemo(() => computeProductSoldOut(product), [product]);
+
+  useEffect(() => {
+    if (!product?.handle) return;
+    logProductStockState(product, 'detail', { selectedVariant });
+  }, [product, selectedVariant]);
 
   const priceText = useMemo(() => {
     if (selectedVariant?.price?.amount) {
@@ -666,12 +1419,23 @@ export default function ProductScreen() {
   }, [reviews]);
 
   const handleAddToCart = () => {
-    if (!selectedVariant || !product) return;
+    if (!product) return;
+    if (productSoldOut) {
+      noodAlert('Sold out', 'This product is currently unavailable.');
+      return;
+    }
+    if (!selectedVariant) return;
     setShowVariantPicker(true);
   };
 
   const confirmAddToCart = () => {
     if (!selectedVariant || !product) return;
+
+    if (productSoldOut || !isVariantPurchasable(selectedVariant)) {
+      noodAlert('Sold out', 'This variant is currently unavailable.');
+      return;
+    }
+
     const selectedVariantId = String(selectedVariant.id || '').trim();
 
     if (!selectedVariantId) {
@@ -679,7 +1443,7 @@ export default function ProductScreen() {
         product,
         selectedVariant,
       });
-      Alert.alert('Product unavailable', 'This product is missing its Shopify variant. Please try again.');
+      noodAlert('Product unavailable', 'This product is missing its Shopify variant. Please try again.');
       return;
     }
 
@@ -700,22 +1464,35 @@ export default function ProductScreen() {
       variantTitle: selectedVariant.title || 'Default Title',
       price: Number(selectedVariant.price?.amount || 0),
       currencyCode: selectedVariant.price?.currencyCode,
-      baseCurrency:
+      baseCurrency: normalizeCatalogCurrencyCode(
         selectedVariant.price?.currencyCode ||
-        product?.priceRange?.minVariantPrice?.currencyCode ||
-        BASE_CURRENCY,
+          product?.priceRange?.minVariantPrice?.currencyCode
+      ),
       image: productPrimaryImage,
       quantity: 1,
     });
 
     if (added) {
       setShowVariantPicker(false);
-      Alert.alert('Added to cart', selectedVariant.title || 'Default Title');
+      noodAlert('Added to cart', selectedVariant.title || 'Default Title');
     }
   };
 
   const handleBuyNow = () => {
-    if (!selectedVariant || !product) return;
+    if (!product) return;
+
+    if (productSoldOut) {
+      noodAlert('Sold out', 'This product is currently unavailable.');
+      return;
+    }
+
+    if (!selectedVariant) return;
+
+    if (!isVariantPurchasable(selectedVariant)) {
+      noodAlert('Sold out', 'This variant is currently unavailable.');
+      return;
+    }
+
     const selectedVariantId = String(selectedVariant.id || '').trim();
 
     if (!selectedVariantId) {
@@ -723,7 +1500,7 @@ export default function ProductScreen() {
         product,
         selectedVariant,
       });
-      Alert.alert('Product unavailable', 'This product is missing its Shopify variant. Please try again.');
+      noodAlert('Product unavailable', 'This product is missing its Shopify variant. Please try again.');
       return;
     }
 
@@ -744,10 +1521,10 @@ export default function ProductScreen() {
       variantTitle: selectedVariant.title || 'Default Title',
       price: Number(selectedVariant.price?.amount || 0),
       currencyCode: selectedVariant.price?.currencyCode,
-      baseCurrency:
+      baseCurrency: normalizeCatalogCurrencyCode(
         selectedVariant.price?.currencyCode ||
-        product?.priceRange?.minVariantPrice?.currencyCode ||
-        BASE_CURRENCY,
+          product?.priceRange?.minVariantPrice?.currencyCode
+      ),
       image: productPrimaryImage,
       quantity: 1,
     });
@@ -768,7 +1545,11 @@ export default function ProductScreen() {
       }));
     };
 
+  const activeTabRef = useRef<TabKey>('overview');
+  const lastTabScrollUpdateRef = useRef(0);
+
   const scrollToSection = (key: TabKey) => {
+    activeTabRef.current = key;
     setActiveTab(key);
     verticalScrollRef.current?.scrollTo({
       y: Math.max(sectionY[key] - 8, 0),
@@ -776,17 +1557,28 @@ export default function ProductScreen() {
     });
   };
 
-  const onVerticalScroll = (event: any) => {
-    const y = event?.nativeEvent?.contentOffset?.y ?? 0;
+  const onVerticalScroll = useCallback(
+    (event: any) => {
+      const y = event?.nativeEvent?.contentOffset?.y ?? 0;
 
-    if (y >= sectionY.similar - 120) {
-      setActiveTab('similar');
-    } else if (y >= sectionY.details - 120) {
-      setActiveTab('details');
-    } else {
-      setActiveTab('overview');
-    }
-  };
+      let nextTab: TabKey = 'overview';
+      if (y >= sectionY.similar - 120) {
+        nextTab = 'similar';
+      } else if (y >= sectionY.details - 120) {
+        nextTab = 'details';
+      }
+
+      if (nextTab === activeTabRef.current) return;
+
+      const now = Date.now();
+      if (now - lastTabScrollUpdateRef.current < 320) return;
+
+      activeTabRef.current = nextTab;
+      lastTabScrollUpdateRef.current = now;
+      setActiveTab(nextTab);
+    },
+    [sectionY.details, sectionY.similar]
+  );
 
   const updateGalleryIndex = useCallback((offsetX: number) => {
     const index = Math.max(0, Math.min(gallery.length - 1, Math.round(offsetX / width)));
@@ -847,22 +1639,13 @@ export default function ProductScreen() {
       return (
         <View style={styles.galleryModalSlide}>
           {item.type === 'image' ? (
-            <ScrollView
-              style={styles.zoomScroll}
-              contentContainerStyle={styles.zoomContent}
-              minimumZoomScale={1}
-              maximumZoomScale={4}
-              pinchGestureEnabled
-              showsHorizontalScrollIndicator={false}
-              showsVerticalScrollIndicator={false}
-              bouncesZoom
-            >
-              <Image
-                source={{ uri: mediaUri }}
-                style={styles.galleryModalImage}
-                resizeMode="contain"
-              />
-            </ScrollView>
+            <ZoomableImage
+              key={`zoom-${item.id || index}-${mediaUri}`}
+              uri={mediaUri}
+              width={width - 24}
+              height={Math.round(width * 0.78)}
+              resizeMode="contain"
+            />
           ) : (
             <ProductVideoPreview
               key={`fullscreen-video-${item.id}`}
@@ -915,13 +1698,13 @@ export default function ProductScreen() {
 
   const submitReview = async () => {
     if (!newReviewText.trim()) {
-      Alert.alert('Review needed', 'Please enter your review text.');
+      noodAlert('Review needed', 'Please enter your review text.');
       return;
     }
 
     if (reviewOrderId && reviewItemId) {
-      if (!isSignedIn || !profileId) {
-        Alert.alert('Sign in required', 'Sign in to submit a review for this item.');
+      if (!ACCOUNT_SIGN_IN_GATE_DISABLED && (!isSignedIn || !profileId)) {
+        noodAlert('Sign in required', 'Sign in to submit a review for this item.');
         return;
       }
 
@@ -956,7 +1739,7 @@ export default function ProductScreen() {
         setNewReviewText('');
         setNewReviewRating(5);
 
-        Alert.alert('Review submitted', 'Thanks for reviewing your item.', [
+        noodAlert('Review submitted', 'Thanks for reviewing your item.', [
           {
             text: 'OK',
             onPress: () => {
@@ -968,7 +1751,7 @@ export default function ProductScreen() {
         ]);
       } catch (error) {
         console.log('Save purchased review error:', error);
-        Alert.alert('Review not saved', 'Please try submitting your review again.');
+        noodAlert('Review not saved', 'Please try submitting your review again.');
       }
       return;
     }
@@ -981,7 +1764,7 @@ export default function ProductScreen() {
       ? `https://noodcaribbean.com/products/${product.handle}`
       : 'https://noodcaribbean.com';
 
-    Alert.alert(
+    noodAlert(
       'Continue on store',
       'Live Judge.me reviews are connected. Submit the real review on the store product page.',
       [
@@ -995,6 +1778,21 @@ export default function ProductScreen() {
       ]
     );
   };
+
+  useScreenPerfReporter(
+    'product',
+    {
+      itemCount: recommendedProducts.length,
+      isFetching: loading || detailRefreshing || recommendationsLoading,
+      isRefreshing: detailRefreshing,
+    },
+    [
+      detailRefreshing,
+      loading,
+      recommendationsLoading,
+      recommendedProducts.length,
+    ]
+  );
 
   if (loading) {
     return (
@@ -1031,6 +1829,7 @@ export default function ProductScreen() {
         ref={verticalScrollRef}
         style={styles.container}
         showsVerticalScrollIndicator={false}
+        nestedScrollEnabled
         onScroll={onVerticalScroll}
         scrollEventThrottle={16}
       >
@@ -1043,6 +1842,7 @@ export default function ProductScreen() {
           pagingEnabled
           directionalLockEnabled
           nestedScrollEnabled
+          style={styles.galleryCarousel}
           showsHorizontalScrollIndicator={false}
           scrollEventThrottle={16}
           initialNumToRender={1}
@@ -1113,52 +1913,17 @@ export default function ProductScreen() {
             {product?.variants?.edges?.length > 0 && (
               <View style={styles.optionGroupsWrap}>
                 {optionGroups.map((group) => (
-                  <View key={group.name} style={styles.optionGroupBlock}>
-                    <View style={styles.optionGroupHeader}>
-                      <Text style={styles.optionGroupTitle}>{group.name}</Text>
-                      <Text style={styles.optionGroupValue}>
-                        {selectedOptionsMap[group.name] || 'Choose'}
-                      </Text>
-                    </View>
-
-                    <View style={styles.optionChipWrap}>
-                      {group.values.map((value) => {
-                        const active = selectedOptionsMap[group.name] === value;
-                        const available = isOptionValueAvailable(group.name, value);
-
-                        return (
-                          <TouchableOpacity
-                            key={`${group.name}-${value}`}
-                            onPress={() => {
-                              const nextOptions = {
-                                ...selectedOptionsMap,
-                                [group.name]: value,
-                              };
-
-                              setSelectedOptionsMap(nextOptions);
-                              syncVariantSelection(nextOptions);
-                            }}
-                            style={[
-                              styles.optionChip,
-                              active && styles.optionChipActive,
-                              !available && styles.optionChipDisabled,
-                            ]}
-                            disabled={!available}
-                          >
-                            <Text
-                              style={[
-                                styles.optionChipText,
-                                active && styles.optionChipTextActive,
-                                !available && styles.optionChipTextDisabled,
-                              ]}
-                            >
-                              {value}
-                            </Text>
-                          </TouchableOpacity>
-                        );
-                      })}
-                    </View>
-                  </View>
+                  <ProductOptionGroup
+                    key={group.name}
+                    group={group}
+                    colorOptionName={colorOptionName}
+                    sizeOptionName={sizeOptionName}
+                    variantNodes={variantNodes}
+                    productImageEdges={productSwatchImageCandidates}
+                    selectedOptionsMap={selectedOptionsMap}
+                    getSelectionState={getSelectionState}
+                    onSelect={handleOptionSelect}
+                  />
                 ))}
               </View>
             )}
@@ -1168,7 +1933,7 @@ export default function ProductScreen() {
             <TouchableOpacity
               style={styles.infoRow}
               onPress={() =>
-                Alert.alert('Shipping & delivery', 'Estimated delivery: 5–9 business days')
+                noodAlert('Shipping & delivery', 'Estimated delivery: 5–9 business days')
               }
             >
               <Text style={styles.infoIcon}>🚚</Text>
@@ -1186,7 +1951,7 @@ export default function ProductScreen() {
             <TouchableOpacity
               style={styles.infoRow}
               onPress={() =>
-                Alert.alert('Safe payments', 'Secure checkout flow and payment protection.')
+                noodAlert('Safe payments', 'Secure checkout flow and payment protection.')
               }
             >
               <Text style={styles.infoIcon}>🔒</Text>
@@ -1204,7 +1969,7 @@ export default function ProductScreen() {
             <TouchableOpacity
               style={styles.infoRow}
               onPress={() =>
-                Alert.alert('Order guarantee', 'Product details, shipping support, and order help.')
+                noodAlert('Order guarantee', 'Product details, shipping support, and order help.')
               }
             >
               <Text style={styles.infoIcon}>🛍️</Text>
@@ -1362,96 +2127,31 @@ export default function ProductScreen() {
         <View onLayout={onSectionLayout('similar')} style={styles.sectionCard}>
           <Text style={styles.sectionTitle}>You may also like</Text>
 
-          {recommendedProducts.length > 0 ? (
+          {recommendationsLoading ? (
             <View style={styles.recommendGrid}>
-              {recommendedProducts.map((item: any) => (
-                <TouchableOpacity
-                  key={item.id}
-                  style={styles.productCard}
-                  onPress={() => {
-                    if (!item.handle) return;
-                    router.push({
-                      pathname: '/product/[handle]',
-                      params: buildProductRouteParams(item),
-                    });
-                  }}
-                >
-                  <Image
-                    source={{
-                      uri:
-                        item?.featuredImage?.url ||
-                        'https://via.placeholder.com/300',
-                    }}
-                    style={styles.productCardImage}
-                    resizeMode="cover"
-                  />
-                  <Text numberOfLines={2} style={styles.productCardTitle}>
-                    {item.title}
-                  </Text>
-                  <Text style={styles.productCardPrice}>
-                    {formatDisplayPrice(
-                      item?.priceRange?.minVariantPrice?.amount,
-                      item?.priceRange?.minVariantPrice?.currencyCode
-                    )}
-                  </Text>
-                </TouchableOpacity>
+              {Array.from({ length: 6 }).map((_, index) => (
+                <RecommendationSkeletonCard key={`recommendation-skeleton-${index}`} />
               ))}
             </View>
-          ) : (
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.fallbackRecommendedWrap}
-            >
-              {(product?.images?.edges ?? []).slice(0, 6).map((item: any) => (
-                getValidMediaUri(item?.node?.url) ? (
-                  <Image
-                    key={String(item?.node?.id || item.node.url)}
-                    source={{ uri: getValidMediaUri(item?.node?.url)! }}
-                    style={styles.fallbackRecommendedImage}
+          ) : recommendedProducts.length > 0 ? (
+            <View style={styles.recommendGrid}>
+              {recommendedProducts.map((item) => {
+                const itemKey = `${item.id}-${item.handle}`;
+                return (
+                  <ProductRecommendationCard
+                    key={itemKey}
+                    item={item}
+                    priceLabel={recommendationPriceById.get(itemKey) || ''}
+                    onOpen={openRecommendedProduct}
                   />
-                ) : null
-              ))}
-            </ScrollView>
-          )}
+                );
+              })}
+            </View>
+          ) : null}
         </View>
 
         <View style={{ height: 190 }} />
       </ScrollView>
-
-      {showFloatingCart && (
-        <Animated.View
-          style={[
-            styles.floatingCartWrap,
-            {
-              transform: [
-                { scale: floatingCartScale },
-                {
-                  rotate: floatingCartRotate.interpolate({
-                    inputRange: [0, 1],
-                    outputRange: ['0deg', '6deg'],
-                  }),
-                },
-              ],
-            },
-          ]}
-        >
-          <TouchableOpacity
-            style={styles.floatingCartButton}
-            onPress={() => router.push('/(tabs)/cart')}
-          >
-            {cartCount > 0 && (
-              <View style={styles.floatingCartBadge}>
-                <Text style={styles.floatingCartBadgeText}>{cartCount}</Text>
-              </View>
-            )}
-
-            <Text style={styles.floatingCartIcon}>🛒</Text>
-            <Text style={styles.floatingCartLabel}>Cart</Text>
-            <Text style={styles.floatingCartSub}>Fast checkout</Text>
-          </TouchableOpacity>
-        </Animated.View>
-      )}
 
       {showPromoBar && (
         <Animated.View
@@ -1489,13 +2189,17 @@ export default function ProductScreen() {
 
       <View style={styles.bottomBar}>
         <TouchableOpacity
-          style={styles.bottomAddButton}
+          style={[styles.bottomAddButton, productSoldOut && styles.bottomActionDisabled]}
           onPress={handleAddToCart}
+          disabled={productSoldOut}
+          activeOpacity={productSoldOut ? 1 : 0.85}
         >
           <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82} style={styles.bottomAddText}>
-            Add to cart
+            {productSoldOut ? 'Sold out' : 'Add to cart'}
           </Text>
-          <Text style={styles.bottomSubText}>Quick action</Text>
+          <Text style={styles.bottomSubText}>
+            {productSoldOut ? 'Unavailable' : 'Quick action'}
+          </Text>
         </TouchableOpacity>
 
         <Animated.View
@@ -1507,13 +2211,17 @@ export default function ProductScreen() {
           ]}
         >
           <TouchableOpacity
-            style={styles.bottomBuyButton}
+            style={[styles.bottomBuyButton, productSoldOut && styles.bottomActionDisabled]}
             onPress={handleBuyNow}
+            disabled={productSoldOut}
+            activeOpacity={productSoldOut ? 1 : 0.85}
           >
             <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82} style={styles.bottomBuyText}>
-              Buy now
+              {productSoldOut ? 'Sold out' : 'Buy now'}
             </Text>
-            <Text style={styles.bottomBuySubText}>Ready to order</Text>
+            <Text style={styles.bottomBuySubText}>
+              {productSoldOut ? 'Unavailable' : 'Ready to order'}
+            </Text>
           </TouchableOpacity>
         </Animated.View>
       </View>
@@ -1630,47 +2338,18 @@ export default function ProductScreen() {
               contentContainerStyle={styles.variantPickerContent}
             >
               {optionGroups.map((group) => (
-                <View key={`picker-${group.name}`} style={styles.variantPickerGroup}>
-                  <Text style={styles.variantPickerGroupTitle}>{group.name}</Text>
-
-                  <View style={styles.variantPickerChipGrid}>
-                    {group.values.map((value) => {
-                      const active = selectedOptionsMap[group.name] === value;
-                      const available = isOptionValueAvailable(group.name, value);
-
-                      return (
-                        <TouchableOpacity
-                          key={`picker-${group.name}-${value}`}
-                          onPress={() => {
-                            const nextOptions = {
-                              ...selectedOptionsMap,
-                              [group.name]: value,
-                            };
-
-                            setSelectedOptionsMap(nextOptions);
-                            syncVariantSelection(nextOptions);
-                          }}
-                          style={[
-                            styles.variantPickerChip,
-                            active && styles.variantPickerChipActive,
-                            !available && styles.variantPickerChipDisabled,
-                          ]}
-                          disabled={!available}
-                        >
-                          <Text
-                            style={[
-                              styles.variantPickerChipText,
-                              active && styles.variantPickerChipTextActive,
-                              !available && styles.variantPickerChipTextDisabled,
-                            ]}
-                          >
-                            {value}
-                          </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
-                  </View>
-                </View>
+                <ProductOptionGroup
+                  key={`picker-${group.name}`}
+                  group={group}
+                  colorOptionName={colorOptionName}
+                  sizeOptionName={sizeOptionName}
+                  variantNodes={variantNodes}
+                  productImageEdges={productSwatchImageCandidates}
+                  selectedOptionsMap={selectedOptionsMap}
+                  getSelectionState={getSelectionState}
+                  onSelect={handleOptionSelect}
+                  chipStyle="picker"
+                />
               ))}
             </ScrollView>
 
@@ -1775,6 +2454,9 @@ const styles = StyleSheet.create({
     fontSize: 20,
     color: COLORS.text,
     fontWeight: '800',
+  },
+  galleryCarousel: {
+    height: width * 1.14,
   },
   slide: {
     width,
@@ -1950,12 +2632,12 @@ const styles = StyleSheet.create({
     paddingBottom: 6,
   },
   optionGroupsWrap: {
-    paddingTop: 16,
+    paddingTop: 18,
     paddingHorizontal: 0,
-    gap: 18,
+    gap: 22,
   },
   optionGroupBlock: {
-    gap: 10,
+    gap: 12,
     maxWidth: '100%',
   },
   optionGroupHeader: {
@@ -1983,35 +2665,38 @@ const styles = StyleSheet.create({
   optionChipWrap: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 10,
-    rowGap: 10,
+    gap: 11,
+    rowGap: 11,
     maxWidth: '100%',
   },
   optionChip: {
     maxWidth: '100%',
-    minHeight: 52,
+    minHeight: 50,
     paddingVertical: 12,
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#d9d9d9',
-    backgroundColor: COLORS.card,
+    borderWidth: 1.25,
+    borderColor: '#E5E7EB',
+    backgroundColor: '#FFFFFF',
     minWidth: 82,
     alignItems: 'center',
     justifyContent: 'center',
     alignSelf: 'flex-start',
   },
   optionChipActive: {
-    backgroundColor: COLORS.dark,
-    borderColor: COLORS.dark,
-  },
-  optionChipDisabled: {
-    opacity: 0.35,
+    backgroundColor: '#FFF7ED',
+    borderColor: '#FF7A00',
+    borderWidth: 2,
+    shadowColor: '#ff7a00',
+    shadowOpacity: 0.12,
+    shadowRadius: 7,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2,
   },
   optionChipText: {
-    color: COLORS.text,
+    color: '#111827',
     fontSize: 15,
-    fontWeight: '700',
+    fontWeight: '800',
     lineHeight: 20,
     flexShrink: 1,
     flexWrap: 'wrap',
@@ -2019,10 +2704,69 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   optionChipTextActive: {
-    color: '#fff',
+    color: '#FF6A00',
   },
-  optionChipTextDisabled: {
-    color: '#8e8e93',
+  colorSwatchScrollContent: {
+    paddingRight: 12,
+    alignItems: 'center',
+  },
+  colorSwatchButton: {
+    width: SWATCH_DISPLAY_SIZE,
+    height: SWATCH_DISPLAY_SIZE,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    backgroundColor: '#FFFFFF',
+    overflow: 'hidden',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+    marginBottom: 10,
+    shadowColor: '#111827',
+    shadowOpacity: 0.05,
+    shadowRadius: 3,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 1,
+  },
+  colorSwatchButtonActive: {
+    borderColor: '#FF7A00',
+    borderWidth: 2,
+    backgroundColor: '#FFF7ED',
+    shadowColor: '#FF7A00',
+    shadowOpacity: 0.22,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  colorSwatchImageWrap: {
+    width: '100%',
+    height: '100%',
+    padding: 5,
+    backgroundColor: '#FFFFFF',
+  },
+  colorSwatchImage: {
+    width: '100%',
+    height: '100%',
+    backgroundColor: '#FFFFFF',
+  },
+  colorSwatchTextWrap: {
+    flex: 1,
+    width: '100%',
+    height: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 6,
+    backgroundColor: '#FFFFFF',
+  },
+  colorSwatchText: {
+    color: '#111827',
+    fontSize: 12,
+    fontWeight: '800',
+    textAlign: 'center',
+    lineHeight: 16,
+  },
+  colorSwatchTextActive: {
+    color: '#FF6A00',
   },
   variantButton: {
     paddingVertical: 10,
@@ -2306,74 +3050,30 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     marginTop: 6,
   },
-  fallbackRecommendedWrap: {
-    paddingBottom: 4,
-  },
-  fallbackRecommendedImage: {
-    width: 130,
-    height: 130,
-    marginRight: 10,
-    borderRadius: 14,
-  },
-  floatingCartWrap: {
-    position: 'absolute',
-    right: 14,
-    bottom: 170,
-    zIndex: 25,
-  },
-  floatingCartButton: {
-    width: 86,
-    minHeight: 100,
-    backgroundColor: COLORS.card,
-    borderRadius: 999,
-    borderWidth: 3,
-    borderColor: COLORS.cartBorder,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 10,
-    shadowColor: '#000',
-    shadowOpacity: 0.16,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 3 },
-    elevation: 7,
-  },
-  floatingCartBadge: {
-    position: 'absolute',
-    top: -4,
-    right: -2,
-    minWidth: 26,
-    height: 26,
-    borderRadius: 13,
-    backgroundColor: COLORS.orange,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 6,
-  },
-  floatingCartBadgeText: {
-    color: '#fff',
-    fontWeight: '800',
-    fontSize: 13,
-  },
-  floatingCartIcon: {
-    fontSize: 24,
-    marginBottom: 2,
-  },
-  floatingCartLabel: {
-    color: COLORS.orange,
-    fontWeight: '800',
-    fontSize: 18,
-    lineHeight: 20,
-  },
-  floatingCartSub: {
+  recommendationSoldOutText: {
     marginTop: 4,
-    color: COLORS.orange,
-    backgroundColor: COLORS.cartSoft,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 999,
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
-    textAlign: 'center',
+    color: '#b42318',
+  },
+  recommendationSkeletonBlock: {
+    backgroundColor: '#e8e8e8',
+  },
+  recommendationSkeletonLine: {
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#ececec',
+    marginTop: 8,
+  },
+  recommendationSkeletonLineWide: {
+    width: '92%',
+  },
+  recommendationSkeletonLineMedium: {
+    width: '72%',
+  },
+  recommendationSkeletonLinePrice: {
+    width: '42%',
+    marginTop: 10,
   },
   floatingPromoWrap: {
     position: 'absolute',
@@ -2448,6 +3148,9 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.card,
     borderTopWidth: 1,
     borderTopColor: COLORS.line,
+  },
+  bottomActionDisabled: {
+    opacity: 0.55,
   },
   bottomAddButton: {
     flex: 1,
@@ -2567,7 +3270,7 @@ const styles = StyleSheet.create({
     paddingBottom: 10,
   },
   variantPickerGroup: {
-    marginBottom: 20,
+    marginBottom: 22,
     maxWidth: '100%',
   },
   variantPickerGroupTitle: {
@@ -2581,35 +3284,38 @@ const styles = StyleSheet.create({
   variantPickerChipGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 10,
-    rowGap: 10,
+    gap: 11,
+    rowGap: 11,
     maxWidth: '100%',
   },
   variantPickerChip: {
     maxWidth: '100%',
-    borderWidth: 1.5,
-    borderColor: '#d9d9d9',
+    borderWidth: 1.25,
+    borderColor: '#E5E7EB',
     borderRadius: 16,
     paddingVertical: 12,
     paddingHorizontal: 16,
-    minHeight: 52,
+    minHeight: 50,
     minWidth: 92,
     alignItems: 'center',
     justifyContent: 'center',
     alignSelf: 'flex-start',
-    backgroundColor: '#fff',
+    backgroundColor: '#FFFFFF',
   },
   variantPickerChipActive: {
-    borderColor: COLORS.orange,
-    backgroundColor: COLORS.orangeSoft,
-  },
-  variantPickerChipDisabled: {
-    opacity: 0.35,
+    borderColor: '#FF7A00',
+    borderWidth: 2,
+    backgroundColor: '#FFF7ED',
+    shadowColor: '#ff7a00',
+    shadowOpacity: 0.12,
+    shadowRadius: 7,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2,
   },
   variantPickerChipText: {
     fontSize: 14,
     fontWeight: '800',
-    color: COLORS.text,
+    color: '#111827',
     lineHeight: 20,
     flexShrink: 1,
     flexWrap: 'wrap',
@@ -2617,10 +3323,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   variantPickerChipTextActive: {
-    color: '#c96b00',
-  },
-  variantPickerChipTextDisabled: {
-    color: '#8e8e93',
+    color: '#FF6A00',
   },
   variantPickerAddButton: {
     marginTop: 4,

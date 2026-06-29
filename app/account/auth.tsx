@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Alert,
-  Linking,
+  ActivityIndicator,
   Platform,
   StatusBar,
   StyleSheet,
@@ -10,303 +9,111 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import * as WebBrowser from 'expo-web-browser';
 import { useHistoryEvents } from '../../context/HistoryContext';
 import { useUser } from '../../context/UserContext';
-import NoodSpinner from '../../components/NoodSpinner';
-import {
-  buildShopifyAccountLoginUrl,
-  createPendingAuthPayload,
-  createPkcePair,
-  createRandomString,
-  isShopifyAccountPageUrl,
-  SHOPIFY_CUSTOMER_ACCOUNT_CLIENT_ID_PUBLIC,
-  SHOPIFY_STORE_DOMAIN,
-  SHOPIFY_REDIRECT_URI,
-  SHOPIFY_APP_REDIRECT_URI,
-  SHOPIFY_AUTH_STORAGE_KEY,
-  validateShopifyAccountLoginUrl,
-} from '../../utils/shopify-auth';
+import { logAuthRestartCheck } from '../../utils/auth-restart-debug';
+import { isAppBootstrapComplete } from '../../utils/app-bootstrap';
+import { handleShopifyAuthRedirectUrl } from '../../utils/shopify-auth-handlers';
+import { launchShopifyAuthSession } from '../../utils/shopify-auth-launcher';
 
 WebBrowser.maybeCompleteAuthSession();
 
-const SHOPIFY_CUSTOMER_PROFILE_STORAGE_KEY = 'NOOD_SHOPIFY_CUSTOMER_PROFILE';
-
-function getRuntimeShopifyRedirectUri() {
-  return SHOPIFY_REDIRECT_URI || SHOPIFY_APP_REDIRECT_URI;
-}
-
 export default function AccountAuthScreen() {
   const router = useRouter();
-  const { markSignedIn } = useUser();
+  const { markSignedIn, isAuthLoading } = useUser();
   const { addHistoryEvent } = useHistoryEvents();
   const insets = useSafeAreaInsets();
   const { provider } = useLocalSearchParams<{ provider?: string }>();
-  const [loading, setLoading] = useState(true);
-  const [openingBrowser, setOpeningBrowser] = useState(false);
+  const [statusMessage, setStatusMessage] = useState('Preparing Shopify sign-in...');
   const [errorMessage, setErrorMessage] = useState('');
-  const [authUrl, setAuthUrl] = useState('');
+  const [awaitingReturn, setAwaitingReturn] = useState(false);
+  const [openingBrowser, setOpeningBrowser] = useState(false);
   const [authAttempt, setAuthAttempt] = useState(0);
-  const openedAttemptRef = useRef(0);
+  const launchedAttemptRef = useRef(0);
 
-  const completeHostedAccountLogin = useCallback(async (sourceUrl: string) => {
-    console.log('SHOPIFY_ACCOUNT_PAGE_REACHED', sourceUrl);
-
-    try {
-      WebBrowser.dismissAuthSession();
-      console.log('SHOPIFY_BROWSER_DISMISSED');
-    } catch (dismissError) {
-      console.log('SHOPIFY_BROWSER_DISMISSED', dismissError);
-    }
-
-    await markSignedIn();
-    await AsyncStorage.setItem(
-      SHOPIFY_CUSTOMER_PROFILE_STORAGE_KEY,
-      JSON.stringify({
-        displayName: '',
-        email: '',
-        source: 'shopify-hosted-account',
-        signedInAt: new Date().toISOString(),
-      })
-    );
-    await AsyncStorage.removeItem(SHOPIFY_AUTH_STORAGE_KEY);
-    void addHistoryEvent({
-      type: 'account',
-      title: 'Signed in',
-      description: 'Customer signed in to NOOD with Shopify.',
-      status: 'signed-in',
-    });
-
-    console.log('SHOPIFY_LOGIN_SUCCESS', {
-      source: 'hosted-account-page',
-      url: sourceUrl,
-    });
-    router.replace('/account');
-  }, [addHistoryEvent, markSignedIn, router]);
-
-  const handleRedirect = useCallback((url: string) => {
-    if (!url) {
-      return false;
-    }
-
-    const expectedRuntimeRedirectUri = getRuntimeShopifyRedirectUri();
-    console.log('SHOPIFY_CALLBACK_URL_RECEIVED', url);
-
-    if (isShopifyAccountPageUrl(url)) {
-      void completeHostedAccountLogin(url);
-      return true;
-    }
-
-    if (
-      !url.startsWith(SHOPIFY_REDIRECT_URI) &&
-      !url.startsWith(SHOPIFY_APP_REDIRECT_URI) &&
-      !url.startsWith(expectedRuntimeRedirectUri)
-    ) {
-      return false;
-    }
-
-    try {
-      const parsed = new URL(url);
-      const code = parsed.searchParams.get('code') || undefined;
-      const state = parsed.searchParams.get('state') || undefined;
-      const error = parsed.searchParams.get('error') || undefined;
-      const errorDescription = parsed.searchParams.get('error_description') || undefined;
-
-      router.replace({
-        pathname: '/auth/callback',
-        params: {
-          ...(code ? { code } : {}),
-          ...(state ? { state } : {}),
-          ...(error ? { error } : {}),
-          ...(errorDescription ? { error_description: errorDescription } : {}),
-        },
+  const processRedirect = useCallback(
+    async (url: string) => {
+      const result = await handleShopifyAuthRedirectUrl(url, {
+        markSignedIn,
+        addHistoryEvent,
       });
-    } catch (redirectError) {
-      console.log('Customer auth redirect parse error:', redirectError);
-      Alert.alert('Error', 'Could not finish Shopify sign-in.');
-      router.replace('/sign-in');
-    }
 
-    return true;
-  }, [completeHostedAccountLogin, router]);
-
-  useEffect(() => {
-    const subscription = Linking.addEventListener('url', ({ url }) => {
-      handleRedirect(url);
-    });
-
-    void Linking.getInitialURL().then((url) => {
-      if (url) {
-        handleRedirect(url);
+      if (result.errorMessage) {
+        setErrorMessage('Sign-in could not be completed. Please try again.');
+        setAwaitingReturn(false);
       }
-    });
+    },
+    [addHistoryEvent, markSignedIn]
+  );
 
-    return () => subscription.remove();
-  }, [handleRedirect]);
-
-  useEffect(() => {
-    const startAuth = async () => {
-      try {
-        if (Platform.OS === 'web') {
-          setErrorMessage(
-            'Shopify mobile sign-in must be tested in the NOOD app build, not in the web preview.'
-          );
-          return;
-        }
-
-        setLoading(true);
-        setErrorMessage('');
-
-        const state = createRandomString(32);
-        const nonce = createRandomString(32);
-        const { codeVerifier, codeChallenge } = await createPkcePair();
-        const redirectUri = getRuntimeShopifyRedirectUri();
-        const accountLoginUrl = buildShopifyAccountLoginUrl({
-          state,
-          nonce,
-          codeChallenge,
-          redirectUri,
-        });
-        const validation = validateShopifyAccountLoginUrl(accountLoginUrl, redirectUri);
-
-        console.log('SHOPIFY_STORE_DOMAIN', SHOPIFY_STORE_DOMAIN);
-        console.log('SHOPIFY_CUSTOMER_ACCOUNT_CLIENT_ID', SHOPIFY_CUSTOMER_ACCOUNT_CLIENT_ID_PUBLIC);
-        console.log('SHOPIFY_REDIRECT_URI', redirectUri);
-        console.log('SHOPIFY_ACCOUNT_LOGIN_URL', accountLoginUrl);
-
-        if (!validation.valid) {
-          setErrorMessage(validation.message);
-          setAuthUrl('');
-          return;
-        }
-
-        await AsyncStorage.setItem(
-          SHOPIFY_AUTH_STORAGE_KEY,
-          JSON.stringify(createPendingAuthPayload(provider || 'email', state, nonce, codeVerifier, redirectUri))
-        );
-        console.log('SHOPIFY_STORED_REDIRECT_URI', redirectUri);
-
-        setAuthUrl(accountLoginUrl);
-      } catch (error) {
-        console.log('Customer auth start error:', error);
-        setErrorMessage('Could not start Shopify sign-in. Please try again.');
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    void startAuth();
-  }, [authAttempt, handleRedirect, provider]);
-
-  const openSecureAuthBrowser = useCallback(async () => {
-    if (!authUrl || openingBrowser) return;
+  const startSecureSignIn = useCallback(async () => {
+    if (openingBrowser) return;
 
     setOpeningBrowser(true);
     setErrorMessage('');
+    setAwaitingReturn(false);
+    setStatusMessage('Opening Shopify sign-in...');
 
-    const openFallbackBrowser = async () => {
-      const fallbackResult = await WebBrowser.openBrowserAsync(authUrl, {
-        toolbarColor: '#ff6a00',
-        controlsColor: '#ff6a00',
-        showTitle: true,
-      });
+    logAuthRestartCheck({
+      step: 'account-auth-start-browser',
+      isAppBootstrapping: !isAppBootstrapComplete(),
+      isAuthLoading: true,
+    });
 
-      console.log('SHOPIFY_BROWSER_FALLBACK_RESULT', fallbackResult);
-      setErrorMessage('Complete Shopify sign-in in the browser. NOOD will reopen after login.');
-    };
+    const result = await launchShopifyAuthSession({
+      provider: provider || 'email',
+      onAuthUrlReady: () => {
+        setStatusMessage('Opening Shopify sign-in...');
+      },
+      onBrowserOpened: () => {
+        setStatusMessage(
+          Platform.OS === 'android'
+            ? 'Complete sign-in in Shopify, then close the browser tab to return to NOOD.'
+            : 'Complete sign-in in Shopify, then return to NOOD.'
+        );
+      },
+      onBrowserDismissed: () => {
+        setAwaitingReturn(true);
+        setStatusMessage('If you finished signing in, NOOD will update your account shortly.');
+      },
+      onRedirectUrl: processRedirect,
+      onError: (message) => {
+        setErrorMessage(message);
+      },
+    });
 
-    try {
-      if (authUrl.includes('im3dst-x9')) {
-        throw new Error('Blocked old dev store auth URL. Remove im3dst-x9 from Shopify Customer Account login config.');
-      }
+    setOpeningBrowser(false);
 
-      const redirectUri = getRuntimeShopifyRedirectUri();
-      console.log('SHOPIFY_REDIRECT_URI', redirectUri);
-      console.log('SHOPIFY_APP_REDIRECT_URI', SHOPIFY_APP_REDIRECT_URI);
-      console.log('SHOPIFY_STORED_REDIRECT_URI', redirectUri);
-      console.log('SHOPIFY_ACCOUNT_LOGIN_URL', authUrl);
-
-      if (Platform.OS === 'android') {
-        await WebBrowser.warmUpAsync().catch(() => null);
-        await WebBrowser.mayInitWithUrlAsync(authUrl).catch(() => null);
-      }
-
-      const result = await WebBrowser.openAuthSessionAsync(authUrl, redirectUri, {
-        toolbarColor: '#ff6a00',
-        controlsColor: '#ff6a00',
-        showTitle: true,
-        preferEphemeralSession: false,
-      });
-
-      console.log('SHOPIFY_AUTH_SESSION_RESULT', result);
-
-      if (result.type === 'success' && result.url) {
-        if (isShopifyAccountPageUrl(result.url)) {
-          await completeHostedAccountLogin(result.url);
-          return;
-        }
-
-        handleRedirect(result.url);
-        return;
-      }
-
-      if (result.type === 'opened') {
-        setErrorMessage('');
-        return;
-      }
-
-      await openFallbackBrowser();
-    } catch (error) {
-      console.log('Secure Shopify auth session error:', error);
-      console.log('SHOPIFY_LOGIN_ERROR', error);
-      try {
-        await openFallbackBrowser();
-      } catch (fallbackError) {
-        console.log('Shopify browser fallback error:', fallbackError);
-        const detail = fallbackError instanceof Error ? ` ${fallbackError.message}` : '';
-        setErrorMessage(`The secure sign-in session could not open. Tap Try again.${detail}`);
-      }
-    } finally {
-      setOpeningBrowser(false);
-      if (Platform.OS === 'android') {
-        await WebBrowser.coolDownAsync().catch(() => null);
-      }
+    if (result.resultType === 'opened') {
+      setAwaitingReturn(true);
     }
-  }, [authUrl, completeHostedAccountLogin, handleRedirect, openingBrowser]);
+  }, [openingBrowser, processRedirect, provider]);
 
   useEffect(() => {
-    if (loading || !authUrl || openingBrowser || openedAttemptRef.current === authAttempt + 1) {
+    if (openingBrowser || launchedAttemptRef.current === authAttempt + 1) {
       return;
     }
 
-    openedAttemptRef.current = authAttempt + 1;
-    void openSecureAuthBrowser();
-  }, [authAttempt, authUrl, loading, openSecureAuthBrowser, openingBrowser]);
+    launchedAttemptRef.current = authAttempt + 1;
+    void startSecureSignIn();
+  }, [authAttempt, openingBrowser, startSecureSignIn]);
 
   const title = useMemo(() => {
-    if (provider === 'google') {
-      return 'Continue with Google';
-    }
-
-    if (provider === 'phone') {
-      return 'Continue with phone number';
-    }
-
+    if (provider === 'google') return 'Continue with Google';
+    if (provider === 'facebook') return 'Continue with Facebook';
+    if (provider === 'shop') return 'Continue with Shop';
+    if (provider === 'phone') return 'Continue with phone number';
     return 'Continue with Email';
   }, [provider]);
 
   const subtitle = useMemo(() => {
-    if (provider === 'google') {
-      return 'Choose Google on the Shopify sign-in page to continue.';
-    }
-
-    if (provider === 'phone') {
-      return 'Choose phone number on the Shopify sign-in page to continue.';
-    }
-
+    if (provider === 'google') return 'Choose Google on the Shopify sign-in page to continue.';
+    if (provider === 'facebook') return 'Choose Facebook on the Shopify sign-in page to continue.';
+    if (provider === 'shop') return 'Choose Shop on the Shopify sign-in page to continue.';
+    if (provider === 'phone') return 'Choose phone number on the Shopify sign-in page to continue.';
     return 'Sign in with your email on the Shopify customer account page.';
   }, [provider]);
 
@@ -344,7 +151,6 @@ export default function AccountAuthScreen() {
         <TouchableOpacity
           style={styles.refreshButton}
           onPress={() => {
-            setLoading(true);
             setErrorMessage('');
             setAuthAttempt((current) => current + 1);
           }}
@@ -354,44 +160,46 @@ export default function AccountAuthScreen() {
         </TouchableOpacity>
       </View>
 
-      {loading ? (
-        <View pointerEvents="none" style={[styles.loadingOverlay, { top: Math.max(insets.top, 8) + 78 }]}>
-          <NoodSpinner size={28} />
-          <Text style={styles.loadingText}>Preparing Shopify sign-in...</Text>
-        </View>
-      ) : null}
-
       <View style={styles.webviewWrap}>
-          <View style={styles.webRedirectCard}>
-            <Ionicons name="shield-checkmark-outline" size={28} color="#ff6a00" />
-            <Text style={styles.webRedirectTitle}>Secure Shopify sign-in</Text>
-            <Text style={styles.webRedirectText}>
-              {openingBrowser
-                ? 'Opening Shopify sign-in...'
-                : 'Shopify sign-in should open automatically.'}
-            </Text>
+        <View style={styles.webRedirectCard}>
+          <Ionicons name="shield-checkmark-outline" size={28} color="#ff6a00" />
+          <Text style={styles.webRedirectTitle}>Secure Shopify sign-in</Text>
+          <Text style={styles.webRedirectText}>{statusMessage}</Text>
 
-            {openingBrowser || (!errorMessage && authUrl) ? (
-              <NoodSpinner size={28} style={styles.authSpinner} />
-            ) : null}
+          {openingBrowser || isAuthLoading ? (
+            <ActivityIndicator size="small" color="#ff6a00" style={styles.authSpinner} />
+          ) : null}
 
-            {errorMessage ? (
-              <TouchableOpacity
-                style={styles.webRedirectButton}
-                activeOpacity={0.9}
-                onPress={() => {
-                  openedAttemptRef.current = 0;
-                  setLoading(true);
-                  setErrorMessage('');
-                  setAuthAttempt((current) => current + 1);
-                }}
-              >
-                <Text style={styles.webRedirectButtonText}>Try again</Text>
-              </TouchableOpacity>
-            ) : null}
+          {awaitingReturn ? (
+            <TouchableOpacity
+              style={styles.webRedirectButton}
+              activeOpacity={0.9}
+              onPress={() => {
+                launchedAttemptRef.current = 0;
+                setAwaitingReturn(false);
+                void startSecureSignIn();
+              }}
+            >
+              <Text style={styles.webRedirectButtonText}>I finished signing in</Text>
+            </TouchableOpacity>
+          ) : null}
 
-            {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
-          </View>
+          {errorMessage ? (
+            <TouchableOpacity
+              style={styles.webRedirectButton}
+              activeOpacity={0.9}
+              onPress={() => {
+                launchedAttemptRef.current = 0;
+                setErrorMessage('');
+                setAuthAttempt((current) => current + 1);
+              }}
+            >
+              <Text style={styles.webRedirectButtonText}>Try again</Text>
+            </TouchableOpacity>
+          ) : null}
+
+          {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+        </View>
       </View>
     </SafeAreaView>
   );
@@ -449,21 +257,6 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#ffffff',
   },
-  loadingOverlay: {
-    position: 'absolute',
-    top: 88,
-    left: 0,
-    right: 0,
-    zIndex: 5,
-    alignItems: 'center',
-    pointerEvents: 'none',
-  },
-  loadingText: {
-    marginTop: 8,
-    fontSize: 13,
-    color: '#666',
-    fontWeight: '600',
-  },
   webRedirectCard: {
     flex: 1,
     alignItems: 'center',
@@ -501,22 +294,6 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '800',
   },
-  returnButton: {
-    marginTop: 12,
-    minWidth: 200,
-    minHeight: 48,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: '#e7dfd6',
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  returnButtonText: {
-    color: '#111',
-    fontSize: 15,
-    fontWeight: '800',
-  },
   errorText: {
     marginTop: 12,
     color: '#b02a00',
@@ -524,11 +301,5 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textAlign: 'center',
     maxWidth: 320,
-  },
-  loadingWrap: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#ffffff',
   },
 });

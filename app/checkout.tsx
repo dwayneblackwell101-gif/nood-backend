@@ -1,24 +1,39 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
   ScrollView,
-  Alert,
   Platform,
   SafeAreaView,
   Image,
+  InteractionManager,
 } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { useCart } from '../context/CartContext';
 import { useAddressBook } from '../context/AddressContext';
 import { useHistoryEvents } from '../context/HistoryContext';
 import { useUser } from '../context/UserContext';
-import { postBackendJson } from '../utils/backend';
+import {
+  getConfiguredBackendUrl,
+  getPaymentBackendUrl,
+  logPaymentBackendDiagnostics,
+  postPaymentBackendJson,
+  resolvePaymentReturnUrl,
+} from '../utils/backend';
 import { BASE_CURRENCY } from '../utils/currency';
-import { getCheckoutCustomer, getPaymentTestingEmail } from '../utils/customer';
+import { SHOPIFY_CHECKOUT_CURRENCY } from '../utils/checkout-totals';
+import { getCheckoutSessionId, resetCheckoutSessionId } from '../utils/checkout-session';
+import {
+  hasCompleteShippingAddress,
+  validateCheckoutPrerequisites,
+} from '../utils/checkout-validation';
+import { getPaymentCustomerEmail, getCheckoutCustomer } from '../utils/customer';
+import { PAYMENT_TESTING_MODE } from '../utils/payment-testing';
+import { getCustomerProfile } from '../utils/customer-profile';
+import { noodAlert } from '../utils/nood-alert';
 
 const COLORS = {
   bg: '#f6f3ef',
@@ -47,47 +62,65 @@ const isValidHttpsUrl = (value: unknown) => {
 
 export default function CheckoutScreen() {
   const router = useRouter();
+  const { method } = useLocalSearchParams<{ method?: string }>();
+  const selectedMethod = String(method || '').trim().toLowerCase();
 
   const {
     cartItems = [],
-    cartSubtotalRaw = 0,
-    spendWalletFunds,
-    addWalletFunds,
-    balanceConverted = 0,
+    checkoutTotals,
+    balance = 0,
     balanceFormatted = 'USD 0.00',
     addOrder,
     clearCart,
     selectedCurrency = 'USD',
     convertPrice,
     formatMoney,
+    syncWalletBalanceFromBackend,
   } = useCart();
   const { isSignedIn, displayName } = useUser();
   const { defaultAddress, loadingAddresses } = useAddressBook();
   const { addHistoryEvent } = useHistoryEvents();
 
   const [loadingMethod, setLoadingMethod] = useState<LoadingMethod>('');
+  const [profileEmail, setProfileEmail] = useState('');
 
-  const total = useMemo(() => Number(cartSubtotalRaw || 0), [cartSubtotalRaw]);
-  const walletBalance = useMemo(
-    () => Number(balanceConverted || 0),
-    [balanceConverted]
+  const subtotal = checkoutTotals.subtotal;
+  const total = checkoutTotals.total;
+  const cartPayload = checkoutTotals.cartLines;
+  const displaySubtotal = useMemo(
+    () => convertPrice(subtotal, SHOPIFY_CHECKOUT_CURRENCY, selectedCurrency),
+    [convertPrice, selectedCurrency, subtotal]
   );
-  const enoughBalance = walletBalance >= total && total > 0;
+  const displayTotal = useMemo(
+    () => convertPrice(total, SHOPIFY_CHECKOUT_CURRENCY, selectedCurrency),
+    [convertPrice, selectedCurrency, total]
+  );
+  const methodHint = useMemo(() => {
+    if (selectedMethod === 'wallet') return 'Wallet checkout selected from cart.';
+    if (selectedMethod === 'wipay') return 'WiPay checkout selected from cart.';
+    if (selectedMethod === 'paypal') return 'PayPal checkout selected from cart.';
+    return '';
+  }, [selectedMethod]);
+  const walletBalanceTtd = useMemo(
+    () => convertPrice(Number(balance || 0), 'USD', SHOPIFY_CHECKOUT_CURRENCY),
+    [balance]
+  );
+  const enoughBalance = walletBalanceTtd >= total && total > 0;
   const hasItems = cartItems.length > 0;
-  const hasCompleteAddress = Boolean(
-    defaultAddress?.fullName?.trim() &&
-      defaultAddress?.phone?.trim() &&
-      defaultAddress?.address1?.trim() &&
-      defaultAddress?.city?.trim() &&
-      defaultAddress?.region?.trim()
-  );
 
-  const showMessage = (title: string, message: string) => {
-    if (Platform.OS === 'web' && typeof window !== 'undefined') {
-      window.alert(`${title}\n\n${message}`);
+  useEffect(() => {
+    if (!isSignedIn) {
+      setProfileEmail('');
       return;
     }
-    Alert.alert(title, message);
+
+    void getCustomerProfile().then((profile) => {
+      setProfileEmail(String(profile?.email || '').trim());
+    });
+  }, [isSignedIn]);
+
+  const showMessage = (title: string, message: string) => {
+    noodAlert(title, message);
   };
 
   const showActionMessage = (
@@ -96,103 +129,46 @@ export default function CheckoutScreen() {
     actionLabel: string,
     onAction: () => void
   ) => {
-    if (Platform.OS === 'web' && typeof window !== 'undefined') {
-      window.alert(`${title}\n\n${message}`);
-      onAction();
-      return;
-    }
-
-    Alert.alert(title, message, [
+    noodAlert(title, message, [
       { text: 'Cancel', style: 'cancel' },
       { text: actionLabel, onPress: onAction },
     ]);
   };
 
-  const getCartItemsMissingVariantIds = () =>
-    cartItems.filter((item: any) => !String(item?.variantId || '').trim());
+  const checkoutCustomer = useMemo(
+    () => getCheckoutCustomer({ defaultAddress, displayName, isSignedIn, profileEmail }),
+    [defaultAddress, displayName, isSignedIn, profileEmail]
+  );
+  const paymentCustomerEmail = getPaymentCustomerEmail(checkoutCustomer.email);
 
-  const getCartItemsWithInvalidQuantityOrPrice = () =>
-    cartItems.filter((item: any) => {
-      const quantity = Number(item?.quantity);
-      const price = Number(item?.price);
-      return (
-        !Number.isFinite(quantity) ||
-        quantity <= 0 ||
-        !Number.isFinite(price) ||
-        price <= 0
-      );
+  const ensureCheckoutReady = (requireEmail = !PAYMENT_TESTING_MODE) => {
+    const validation = validateCheckoutPrerequisites({
+      cartItems,
+      defaultAddress,
+      profileEmail,
+      loadingAddresses,
+      requireEmail,
     });
 
-  const ensureCheckoutReady = () => {
-    if (!hasItems) {
-      showMessage('Cart is empty', 'Add items before checking out.');
-      return false;
+    if (validation.ok) {
+      return true;
     }
 
-    const itemsMissingVariantIds = getCartItemsMissingVariantIds();
-    if (itemsMissingVariantIds.length) {
-      console.log('[NOOD checkout] blocked checkout missing Shopify variantId', itemsMissingVariantIds);
-      showMessage(
-        'Product needs to be re-added',
-        'One or more cart items is missing its Shopify variant ID. Please remove it and add it again before checkout.'
-      );
-      return false;
-    }
-
-    const invalidItems = getCartItemsWithInvalidQuantityOrPrice();
-    if (invalidItems.length) {
-      console.log('[NOOD checkout] blocked checkout invalid quantity or price', invalidItems);
-      showMessage(
-        'Product needs to be re-added',
-        'One or more cart items has an invalid quantity or price. Please remove it and add it again before checkout.'
-      );
-      return false;
-    }
-
-    if (loadingAddresses) {
-      showMessage('Address loading', 'Please wait while your saved address is loading.');
-      return false;
-    }
-
-    if (!hasCompleteAddress) {
+    if (validation.actionLabel && validation.actionRoute) {
       showActionMessage(
-        'Shipping address required',
-        'Please add your shipping address before checkout.',
-        'Add address',
-        () => router.push('/account/address' as any)
+        validation.title || 'Checkout unavailable',
+        validation.message || 'Please complete checkout details.',
+        validation.actionLabel,
+        () => router.push(validation.actionRoute as any)
       );
       return false;
     }
 
-    return true;
+    showMessage(validation.title || 'Checkout unavailable', validation.message || 'Please try again.');
+    return false;
   };
 
-  const buildCartPayload = () =>
-    cartItems.map((item: any) => {
-      const itemBaseCurrency = item?.baseCurrency || BASE_CURRENCY;
-      const convertedUnitPrice = convertPrice(
-        Number(item?.price || 0),
-        itemBaseCurrency,
-        selectedCurrency
-      );
-
-      return {
-        title: item?.title || 'Product',
-        productId: item?.productId ? String(item.productId) : '',
-        quantity: Number(item?.quantity || 1),
-        price: Number(convertedUnitPrice.toFixed(2)),
-        currency: selectedCurrency,
-        variantId: item?.variantId ? String(item.variantId) : '',
-        image: item?.image || '',
-        handle: item?.handle || '',
-        variantTitle: item?.variantTitle || '',
-      };
-    });
-
-  const checkoutCustomer = getCheckoutCustomer({ defaultAddress, displayName, isSignedIn });
-  const paymentCustomerEmail = getPaymentTestingEmail(checkoutCustomer.email);
-
-  const createLocalOrder = (
+  const finalizeSuccessfulOrder = (
     paymentMethod: string,
     orderName?: string,
     shopifyOrderId?: string,
@@ -202,7 +178,7 @@ export default function CheckoutScreen() {
       id: orderName || shopifyOrderId || Date.now().toString(),
       date: new Date().toISOString(),
       total,
-      currency: selectedCurrency,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
       status: 'Paid',
       paymentMethod: orderName ? `${paymentMethod} (${orderName})` : paymentMethod,
       shopifyOrderId,
@@ -213,93 +189,94 @@ export default function CheckoutScreen() {
     });
 
     clearCart();
+    resetCheckoutSessionId();
   };
 
   const handleWalletPayment = async () => {
     if (loadingMethod) return;
+    if (!PAYMENT_TESTING_MODE && !isSignedIn) {
+      showMessage('Sign in required', 'Sign in to pay with your NOOD wallet.');
+      return;
+    }
     if (!ensureCheckoutReady()) return;
 
     if (!enoughBalance) {
       showMessage(
         'Not enough balance',
-        `Wallet: ${formatMoney(walletBalance, selectedCurrency)}\nTotal: ${formatMoney(
-          total,
-          selectedCurrency
-        )}`
+        `Wallet: ${balanceFormatted}\nTotal: ${formatMoney(displayTotal, selectedCurrency)}`
       );
       return;
     }
 
     setLoadingMethod('wallet');
-    console.log('[NOOD checkout] wallet cart line items before checkout', buildCartPayload());
+    const checkoutSessionId = getCheckoutSessionId();
+    console.log('[NOOD checkout] wallet cart line items before checkout', cartPayload);
     void addHistoryEvent({
       type: 'checkout',
       title: 'Wallet payment attempted',
-      description: `Wallet checkout for ${formatMoney(total, selectedCurrency)}.`,
+      description: `Wallet checkout for ${formatMoney(total, SHOPIFY_CHECKOUT_CURRENCY)}.`,
       amount: total,
-      currency: selectedCurrency,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
       status: 'attempted',
     });
 
     try {
-      const paid = spendWalletFunds(total, 'Order payment');
-
-      if (!paid) {
-        showMessage('Payment failed', 'Could not charge wallet.');
-        return;
-      }
-
-      const shopifyOrder = await postBackendJson(
-        '/api/shopify/orders',
+      const shopifyOrder = await postPaymentBackendJson(
+        '/api/wallet/checkout',
         {
+          checkoutSessionId,
+          clientOrderId: checkoutSessionId,
+          customerId: paymentCustomerEmail,
           total: Number(total.toFixed(2)),
-          currency: selectedCurrency,
+          currency: SHOPIFY_CHECKOUT_CURRENCY,
           paymentMethod: 'NOOD Wallet',
           name: checkoutCustomer.name,
           email: paymentCustomerEmail,
           phone: checkoutCustomer.phone,
-          cartItems: buildCartPayload(),
+          cartItems: cartPayload,
           shippingAddress: defaultAddress,
         },
         { timeoutMs: 45000 }
       );
-      console.log('[NOOD checkout] wallet Shopify order response', shopifyOrder);
+      console.log('[NOOD checkout] wallet checkout response', shopifyOrder);
 
       const shopifyOrderId =
         shopifyOrder?.shopify_order_id ||
         shopifyOrder?.shopifyOrderId ||
         shopifyOrder?.shopifyOrder?.id ||
-        shopifyOrder?.order?.id ||
         '';
       const shopifyOrderName =
         shopifyOrder?.shopify_order_name ||
         shopifyOrder?.shopifyOrderName ||
         shopifyOrder?.shopifyOrder?.name ||
-        shopifyOrder?.order?.name ||
         '';
+      const orderReference = shopifyOrderName || shopifyOrderId;
 
-      if (!shopifyOrderId && !shopifyOrderName) {
-        addWalletFunds(total, 'Wallet refund: Shopify order was not created');
+      if (!shopifyOrder?.success || !orderReference) {
         showMessage(
           'Order not completed',
-          'Wallet was refunded because Shopify did not confirm the order. Please try again.'
+          shopifyOrder?.message || 'Shopify did not confirm the order. Your wallet was not charged.'
         );
         return;
       }
 
-      createLocalOrder('Wallet', shopifyOrderName, shopifyOrderId, 'NOOD Wallet');
-
-      if (Platform.OS === 'web' && typeof window !== 'undefined') {
-        window.alert('Success\n\nOrder placed successfully.');
-        router.replace('/account/orders');
-      } else {
-        Alert.alert('Success', 'Order placed successfully.', [
-          {
-            text: 'View Orders',
-            onPress: () => router.replace('/account/orders'),
-          },
-        ]);
+      if (shopifyOrder?.wallet_balance != null) {
+        syncWalletBalanceFromBackend(Number(shopifyOrder.wallet_balance));
       }
+
+      finalizeSuccessfulOrder(
+        'Wallet',
+        shopifyOrderName,
+        shopifyOrderId,
+        String(shopifyOrder?.transaction_id || checkoutSessionId)
+      );
+
+      noodAlert('Success', 'Order placed successfully.', [
+        {
+          text: 'View Orders',
+          onPress: () => router.replace('/account/orders'),
+        },
+      ]);
     } catch (error) {
       console.log('Wallet payment error:', error);
       showMessage('Error', 'Something went wrong.');
@@ -313,21 +290,25 @@ export default function CheckoutScreen() {
     if (!ensureCheckoutReady()) return;
 
     setLoadingMethod('wipay');
-    const cartPayload = buildCartPayload();
+    const checkoutSessionId = getCheckoutSessionId();
     console.log('[NOOD checkout] WiPay cart line items before checkout', cartPayload);
     void addHistoryEvent({
       type: 'checkout',
       title: 'WiPay checkout started',
-      description: `WiPay checkout for ${formatMoney(total, selectedCurrency)}.`,
+      description: `WiPay checkout for ${formatMoney(total, SHOPIFY_CHECKOUT_CURRENCY)}.`,
       amount: total,
-      currency: selectedCurrency,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
       status: 'started',
     });
 
     try {
-      const data = await postBackendJson('/create-wipay-payment', {
+      logPaymentBackendDiagnostics();
+      const data = await postPaymentBackendJson('/create-wipay-payment', {
+        checkoutSessionId,
+        clientOrderId: checkoutSessionId,
+        localOrderId: checkoutSessionId,
         total: Number(total.toFixed(2)),
-        currency: selectedCurrency,
+        currency: SHOPIFY_CHECKOUT_CURRENCY,
         name: checkoutCustomer.name,
         email: paymentCustomerEmail,
         phone: checkoutCustomer.phone,
@@ -352,13 +333,17 @@ export default function CheckoutScreen() {
         return;
       }
 
+      const resolvedReturnUrl = resolvePaymentReturnUrl(String(data?.return_url || ''));
+      logPaymentBackendDiagnostics(resolvedReturnUrl);
+
       router.push({
         pathname: '/payment',
         params: {
           url: paymentUrl,
-          returnUrl: String(data?.return_url || ''),
+          returnUrl: resolvedReturnUrl,
           total: String(total),
-          currency: selectedCurrency,
+          currency: SHOPIFY_CHECKOUT_CURRENCY,
+          checkoutSessionId,
         },
       });
     } catch (error: any) {
@@ -373,7 +358,7 @@ export default function CheckoutScreen() {
         title: 'WiPay checkout failed',
         description: message,
         amount: total,
-        currency: selectedCurrency,
+        currency: SHOPIFY_CHECKOUT_CURRENCY,
         status: 'failed',
       });
       console.log('WiPay checkout error:', error);
@@ -382,31 +367,102 @@ export default function CheckoutScreen() {
     }
   };
 
-  const handlePayPalPayment = async () => {
-    console.log('PayPal checkout pressed');
+  const logPayPalNavigationDiagnostics = (): string | null => {
+    if (loadingMethod) {
+      console.log(
+        '[NOOD checkout] navigation blocked: button onPress ignored (loadingMethod=' +
+          loadingMethod +
+          ')'
+      );
+      return 'button onPress not firing';
+    }
 
-    if (loadingMethod) return;
-    if (!ensureCheckoutReady()) return;
+    if (!cartItems.length) {
+      console.log('[NOOD checkout] navigation blocked: missing cart');
+      return 'missing cart';
+    }
+
+    if (loadingAddresses) {
+      console.log('[NOOD checkout] prerequisite warning: address still loading');
+    }
+
+    if (!hasCompleteShippingAddress(defaultAddress)) {
+      console.log('[NOOD checkout] prerequisite warning: missing address');
+    }
+
+    if (!PAYMENT_TESTING_MODE) {
+      const validation = validateCheckoutPrerequisites({
+        cartItems,
+        defaultAddress,
+        profileEmail,
+        loadingAddresses,
+        requireEmail: true,
+      });
+      if (!validation.ok) {
+        console.log('[NOOD checkout] prerequisite warning: missing email/customer');
+      }
+      console.log('[NOOD checkout] payment testing mode is off; checkout gates are enforced on PayPal screen');
+    }
+
+    const paypalClientId = String(process.env.EXPO_PUBLIC_PAYPAL_CLIENT_ID || '').trim();
+    if (!paypalClientId) {
+      console.log('[NOOD checkout] prerequisite warning: PayPal client ID missing');
+    }
+
+    const backendUrl = getConfiguredBackendUrl() || getPaymentBackendUrl();
+    if (!backendUrl) {
+      console.log('[NOOD checkout] prerequisite warning: backend URL missing');
+    }
+
+    return null;
+  };
+
+  const handlePayPalPayment = () => {
+    console.log('[NOOD checkout] PayPal continue pressed');
+
+    const blockReason = logPayPalNavigationDiagnostics();
+    if (blockReason === 'missing cart') {
+      showMessage('Cart is empty', 'Add items before checking out.');
+      return;
+    }
+    if (blockReason === 'button onPress not firing') {
+      return;
+    }
 
     setLoadingMethod('paypal');
-    console.log('[NOOD checkout] PayPal cart line items before checkout', buildCartPayload());
+    const checkoutSessionId = getCheckoutSessionId();
+    console.log('[NOOD checkout] PayPal cart line items before checkout', cartPayload);
     void addHistoryEvent({
       type: 'checkout',
       title: 'PayPal checkout started',
-      description: `PayPal checkout for ${formatMoney(total, selectedCurrency)}.`,
+      description: `PayPal checkout for ${formatMoney(total, SHOPIFY_CHECKOUT_CURRENCY)}.`,
       amount: total,
-      currency: selectedCurrency,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
       status: 'started',
     });
 
-    router.push({
-      pathname: '/paypal-checkout',
-      params: {
-        total: String(total),
-        currency: selectedCurrency,
-      },
+    console.log('[NOOD checkout] navigating to paypal-checkout');
+
+    InteractionManager.runAfterInteractions(() => {
+      try {
+        router.push({
+          pathname: '/paypal-checkout',
+          params: {
+            total: String(total),
+            currency: SHOPIFY_CHECKOUT_CURRENCY,
+            checkoutSessionId,
+          },
+        });
+      } catch (error) {
+        console.log(
+          '[NOOD checkout] navigation blocked: route path wrong or router.push failed',
+          error
+        );
+        showMessage('Navigation error', 'Could not open PayPal checkout. Please try again.');
+      } finally {
+        setLoadingMethod('');
+      }
     });
-    setLoadingMethod('');
   };
 
   return (
@@ -521,7 +577,7 @@ export default function CheckoutScreen() {
           <View style={styles.totalRow}>
             <Text style={styles.totalLabel}>Subtotal</Text>
             <Text style={styles.totalValueDark}>
-              {formatMoney(total, selectedCurrency)}
+              {formatMoney(displaySubtotal, selectedCurrency)}
             </Text>
           </View>
 
@@ -535,27 +591,26 @@ export default function CheckoutScreen() {
           <View style={styles.totalRow}>
             <Text style={styles.totalLabelBig}>Total</Text>
             <Text style={styles.totalValueBig}>
-              {formatMoney(total, selectedCurrency)}
+              {formatMoney(displayTotal, selectedCurrency)}
             </Text>
           </View>
         </View>
 
         <View style={styles.methodCard}>
           <Text style={styles.sectionTitle}>Choose Payment Method</Text>
+          {!!methodHint ? <Text style={styles.methodHint}>{methodHint}</Text> : null}
 
           <TouchableOpacity
             style={[
               styles.walletMethodButton,
-              ((isSignedIn && hasCompleteAddress && !enoughBalance) ||
-                (loadingMethod !== '' && loadingMethod !== 'wallet'))
+              ((isSignedIn && !enoughBalance) || (loadingMethod !== '' && loadingMethod !== 'wallet'))
                 ? styles.disabledButton
                 : null,
             ]}
             activeOpacity={0.9}
             onPress={handleWalletPayment}
             disabled={
-              (isSignedIn && hasCompleteAddress && !enoughBalance) ||
-              (loadingMethod !== '' && loadingMethod !== 'wallet')
+              (isSignedIn && !enoughBalance) || (loadingMethod !== '' && loadingMethod !== 'wallet')
             }
           >
             <View style={styles.methodButtonLeft}>
@@ -616,64 +671,30 @@ export default function CheckoutScreen() {
             </Text>
           </TouchableOpacity>
 
-          <View
+          <TouchableOpacity
             style={[
-              styles.paypalSmartCard,
-              loadingMethod !== '' && loadingMethod !== 'paypal'
-                ? styles.disabledButton
-                : null,
+              styles.paypalMethodButton,
+              loadingMethod !== '' && loadingMethod !== 'paypal' ? styles.disabledButton : null,
             ]}
+            activeOpacity={0.9}
+            onPress={handlePayPalPayment}
+            disabled={loadingMethod !== '' && loadingMethod !== 'paypal'}
           >
-            <Text style={styles.paypalSmartIntro}>
-              Pay in full or choose eligible PayPal payment options.
-            </Text>
-
-            <TouchableOpacity
-              style={[styles.paypalSmartButton, styles.paypalButtonGold]}
-              activeOpacity={0.9}
-              onPress={handlePayPalPayment}
-              disabled={loadingMethod !== '' && loadingMethod !== 'paypal'}
-            >
-              <Image source={{ uri: PAYPAL_LOGO }} style={styles.paypalSmartLogo} resizeMode="contain" />
-              <Text style={styles.paypalSmartPayPalText}>
-                {loadingMethod === 'paypal' ? 'Opening...' : 'PayPal'}
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.paypalSmartButton, styles.venmoButton]}
-              activeOpacity={0.9}
-              onPress={handlePayPalPayment}
-              disabled={loadingMethod !== '' && loadingMethod !== 'paypal'}
-            >
-              <Text style={styles.venmoButtonText}>venmo</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.paypalSmartButton, styles.payLaterButton]}
-              activeOpacity={0.9}
-              onPress={handlePayPalPayment}
-              disabled={loadingMethod !== '' && loadingMethod !== 'paypal'}
-            >
-              <Image source={{ uri: PAYPAL_LOGO }} style={styles.payLaterLogo} resizeMode="contain" />
-              <Text style={styles.payLaterButtonText}>Pay Later</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.paypalSmartButton, styles.cardButtonDark]}
-              activeOpacity={0.9}
-              onPress={handlePayPalPayment}
-              disabled={loadingMethod !== '' && loadingMethod !== 'paypal'}
-            >
-              <Ionicons name="card-outline" size={24} color="#ffffff" />
-              <Text style={styles.cardButtonText}>Debit or Credit Card</Text>
-            </TouchableOpacity>
-
-            <View style={styles.paypalPoweredRow}>
-              <Text style={styles.paypalPoweredText}>Powered by </Text>
-              <Text style={styles.paypalPoweredBrand}>PayPal</Text>
+            <View style={styles.methodButtonLeft}>
+              <View style={styles.logoBadgeDark}>
+                <Image source={{ uri: PAYPAL_LOGO }} style={styles.paypalLogo} resizeMode="contain" />
+              </View>
+              <View style={styles.methodTextWrap}>
+                <Text style={styles.methodButtonTitlePaypal}>Pay with PayPal / Card</Text>
+                <Text style={styles.methodButtonSubtitlePaypal}>
+                  PayPal, card, and eligible options in one secure flow
+                </Text>
+              </View>
             </View>
-          </View>
+            <Text style={styles.methodButtonActionPaypal}>
+              {loadingMethod === 'paypal' ? 'Opening...' : 'Continue'}
+            </Text>
+          </TouchableOpacity>
 
           <TouchableOpacity
             style={styles.backToCartBtn}
@@ -923,6 +944,32 @@ const styles = StyleSheet.create({
     padding: 16,
     borderWidth: 1,
     borderColor: COLORS.line,
+  },
+  methodHint: {
+    marginTop: -4,
+    marginBottom: 12,
+    color: COLORS.muted,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  paypalMethodButton: {
+    minHeight: 76,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#d7e6f7',
+    backgroundColor: '#ffffff',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    marginBottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  methodButtonSubtitlePaypal: {
+    marginTop: 3,
+    fontSize: 12,
+    color: '#4e6b86',
+    fontWeight: '700',
   },
   walletMethodButton: {
     minHeight: 76,

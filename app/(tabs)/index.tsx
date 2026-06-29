@@ -9,42 +9,72 @@ import {
   StyleSheet,
   Text,
   FlatList,
-  Alert,
   Modal,
   RefreshControl,
   ScrollView,
-  Animated,
   DeviceEventEmitter,
   InteractionManager,
   ImageSourcePropType,
   Platform,
   Pressable,
+  Alert,
+  ActionSheetIOS,
 } from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { CameraView, useCameraPermissions } from 'expo-camera';
+
 import { Image as ExpoImage } from 'expo-image';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import { useNavigationState } from '@react-navigation/native';
+
 import { useFocusEffect, useNavigation, usePathname, useRouter } from 'expo-router';
 import { VideoView, useVideoPlayer, type VideoSource } from 'expo-video';
 import { WebView } from 'react-native-webview';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useCart } from '../../context/CartContext';
 import NoodSpinner from '../../components/NoodSpinner';
-import { BASE_CURRENCY } from '../../utils/currency';
+import CameraSearchModal, { type CameraSearchPhoto } from '../../components/CameraSearchModal';
+import { postBackendJson } from '../../utils/backend';
+import { BASE_CURRENCY, normalizeCatalogCurrencyCode } from '../../utils/currency';
 import {
   catalogFetch,
+  clearCatalogCacheForDev,
   clearCatalogProductListCache,
+  ensureCatalogFreshness,
+  fetchCatalogPath,
   fetchHomeProductFeedPath,
   getHomeProductFeedSession,
   isHomeProductFeedSessionActive,
   startHomeProductFeedSession,
 } from '../../utils/catalog';
 import {
-  buildBalancedHomeFeed,
-  refreshBalancedHomeFeedProducts,
-} from '../../utils/homeFeed';
+  catalogCacheDebugSummary,
+  emergencyPruneCatalogStorage,
+  isStorageFullError,
+  MAX_CACHED_HOME_PRODUCTS,
+  MAX_IN_MEMORY_HOME_PRODUCTS,
+  trimProductsForCache,
+} from '../../utils/catalog-cache';
+import { HOME_PERF_DEBUG, LACE_VIDEO_DEBUG, PRODUCT_LOAD_DEBUG } from '../../utils/debug-flags';
+import {
+  getHomeListImageUrl,
+  prepareInMemoryHomeProducts,
+  slimHomeListProduct,
+  slimHomeListProducts,
+} from '../../utils/list-product';
+import { logMemoryPressureDebug } from '../../utils/memory-pressure-debug';
+import { buildBalancedHomeFeed } from '../../utils/homeFeed';
+import { useUser } from '../../context/UserContext';
 import { buildProductRouteParams } from '../../utils/product-navigation';
+import {
+  getFirstPurchasableVariant,
+  getProductAvailabilityLabel,
+  getVariantNodes,
+  logCardProductStockState,
+  logSoldOutDebug,
+  resolveListProductAvailableForSale,
+  resolveListProductSoldOut,
+} from '../../utils/product-availability';
+import { noodAlert } from '../../utils/nood-alert';
 import {
   LACE_FRONT_VIDEO_1,
   LACE_FRONT_VIDEO_2,
@@ -55,11 +85,22 @@ import {
 const HOME_PRODUCTS_CACHE_VERSION = 2;
 const HOME_PRODUCTS_CACHE_KEY = 'NOOD_HOME_PRODUCTS_CACHE_V2';
 const HOME_SHOWCASE_CACHE_KEY = 'NOOD_HOME_SHOWCASE_CACHE_V1';
+const LACE_FRONT_COLLECTION_HANDLE = 'lacefront';
+const LACE_FRONT_PRODUCTS_LIMIT = 8;
+const LACE_FRONT_PRODUCTS_CACHE_KEY = 'NOOD_HOME_LACEFRONT_PRODUCTS_V1';
+const LACE_FRONT_PRODUCTS_CACHE_VERSION = 1;
 
-const PRODUCTS_PER_PAGE = 48;
+const PRODUCTS_PER_PAGE = 30;
+const HOME_INITIAL_VISIBLE_PRODUCTS = 30;
 const HOME_SHOWCASE_PRODUCTS_PER_SECTION = 60;
-const HOME_VISIBLE_PRODUCTS_STEP = 60;
+const HOME_VISIBLE_PRODUCTS_STEP = 30;
+const HOME_FEED_PREFETCH_BUFFER = 12;
+const HOME_FEED_LOAD_MORE_COOLDOWN_MS = 400;
+const HOME_END_REACHED_THRESHOLD = 0.75;
 const HOME_PROFILE_LOGS_ENABLED = __DEV__ && process.env.EXPO_PUBLIC_HOME_PERF_LOGS === '1';
+const HOME_CATALOG_DRAIN_MAX_PAGES_PER_RUN = 2;
+const HOME_CATALOG_DRAIN_COOLDOWN_MS = 4000;
+const HOME_CATALOG_DRAIN_IDLE_DELAY_MS = 2000;
 const homeModuleStartedAt = getNow();
 const SLIDESHOW_SLIDE_3_VIDEO = require('../../assets/videos/slideshow-slide-3.mp4');
 
@@ -70,7 +111,11 @@ const LACE_FRONT_VIDEOS = [
   { id: 'lace-front-4', assetId: LACE_FRONT_VIDEO_4 },
 ];
 
-const HOME_PERF_INVESTIGATION_ENABLED = __DEV__;
+const HOME_PERF_INVESTIGATION_ENABLED = HOME_PERF_DEBUG;
+const HOME_LIST_REMOVE_CLIPPED_SUBVIEWS = Platform.OS === 'android';
+const HOME_LACE_FRONT_VIDEO_SCROLL_OFFSET = 900;
+const HOME_IMAGE_PREFETCH_AHEAD = 12;
+const HOME_HERO_PREFETCH_MAX_URLS = 2;
 const perfNow = () => globalThis.performance?.now?.() ?? Date.now();
 
 const homePerfInvestigation = {
@@ -114,6 +159,30 @@ function homeLog(message: string, data?: Record<string, unknown> | number) {
   console.log(message, data ?? '');
 }
 
+const slideshowPerfStore = {
+  homeSlideshowRenders: 0,
+  heroSlideItemRenders: 0,
+};
+
+function slideshowPerfLog(message: string, data?: Record<string, unknown>) {
+  console.log(message, data ?? '');
+}
+
+function useSlideshowRenderCounter(component: 'HomeSlideshow' | 'HeroSlideItem') {
+  useEffect(() => {
+    if (component === 'HomeSlideshow') {
+      slideshowPerfStore.homeSlideshowRenders += 1;
+      slideshowPerfLog('[NOOD slideshow perf] render count', {
+        component,
+        count: slideshowPerfStore.homeSlideshowRenders,
+      });
+      return;
+    }
+
+    slideshowPerfStore.heroSlideItemRenders += 1;
+  });
+}
+
 function getVideoPerfMeta(assetId: number) {
   const fileName = VIDEO_ASSET_FILE_NAMES[assetId] || 'unknown';
   return {
@@ -121,6 +190,14 @@ function getVideoPerfMeta(assetId: number) {
     fileName,
     sizeMB: VIDEO_ASSET_SIZES_MB[fileName] ?? null,
   };
+}
+
+function getResolvedVideoAssetUri(assetId: number) {
+  try {
+    return Image.resolveAssetSource(assetId as ImageSourcePropType)?.uri || '';
+  } catch {
+    return '';
+  }
 }
 
 function logHomePerfInvestigationSummary(reason: string) {
@@ -139,7 +216,7 @@ function logHomePerfInvestigationSummary(reason: string) {
         ? homePerfInvestigation.firstVisibleAt - homePerfInvestigation.homeScreenStartAt
         : null,
     videoAssetSizesMB: VIDEO_ASSET_SIZES_MB,
-    androidListRemoveClippedSubviews: false,
+    androidListRemoveClippedSubviews: HOME_LIST_REMOVE_CLIPPED_SUBVIEWS,
     usesFlatListNotFlashList: true,
   });
 }
@@ -226,7 +303,7 @@ function prefetchHomeHeroSlides(slides: HomeHeroSlide[]) {
     return homeHeroSlidesPrefetchPromise;
   }
 
-  const urls = getHomeHeroPrefetchUrls(slides);
+  const urls = getHomeHeroPrefetchUrls(slides).slice(0, HOME_HERO_PREFETCH_MAX_URLS);
   console.log('HOME_SLIDES_PREFETCH_START', { count: urls.length });
 
   homeHeroSlidesPrefetchPromise = Promise.allSettled(
@@ -284,13 +361,151 @@ const HOME_SHOWCASE_SECTIONS = [
   { title: 'Electronics', handle: 'electronics' },
 ];
 
+const HOME_CATEGORIES_CACHE_KEY = 'NOOD_CATEGORIES_CACHE_V18_VERSIONED';
+const HOME_CATEGORIES_CACHE_VERSION = 3;
+
+type HomeCollectionShortcut = {
+  title: string;
+  handle: string;
+};
+
+function normalizeShortcutKey(value: unknown) {
+  return String(value || '')
+    .trim()
+    .toLowerCase();
+}
+
+function compactShortcutKey(value: unknown) {
+  return normalizeShortcutKey(value)
+    .replace(/\b(and|of|the|a)\b/g, '')
+    .replace(/\s+/g, '');
+}
+
+function findShortcutCollectionMatch(
+  config: { title: string; handle: string },
+  collections: HomeCollectionShortcut[]
+) {
+  const configHandle = normalizeShortcutKey(config.handle);
+  const configTitle = normalizeShortcutKey(config.title);
+  const compactConfigTitle = compactShortcutKey(config.title);
+  const compactConfigHandle = compactShortcutKey(config.handle);
+
+  return collections.find((collection) => {
+    const handle = normalizeShortcutKey(collection.handle);
+    const title = normalizeShortcutKey(collection.title);
+    const compactTitle = compactShortcutKey(collection.title);
+    const compactHandle = compactShortcutKey(collection.handle);
+
+    return (
+      handle === configHandle ||
+      title === configTitle ||
+      compactTitle === compactConfigTitle ||
+      compactHandle === compactConfigHandle ||
+      (compactConfigTitle && compactTitle.includes(compactConfigTitle)) ||
+      (compactConfigTitle && compactConfigTitle.includes(compactTitle)) ||
+      (compactConfigHandle && compactHandle.includes(compactConfigHandle)) ||
+      (compactConfigHandle && compactConfigHandle.includes(compactHandle))
+    );
+  });
+}
+
+function buildHomeCollectionShortcuts(collections: HomeCollectionShortcut[]): HomeCollectionShortcut[] {
+  if (!collections.length) return [];
+
+  const shortcuts: HomeCollectionShortcut[] = [];
+  const usedHandles = new Set<string>();
+
+  HOME_COLLECTION_TABS.forEach((tab) => {
+    const match = findShortcutCollectionMatch(tab, collections);
+    if (!match?.handle || usedHandles.has(match.handle)) return;
+
+    usedHandles.add(match.handle);
+    shortcuts.push({
+      title: tab.title,
+      handle: match.handle,
+    });
+  });
+
+  return shortcuts;
+}
+
+function extractCollectionsFromCategoriesCache(raw: string | null): HomeCollectionShortcut[] {
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (Number(parsed?.version) !== HOME_CATEGORIES_CACHE_VERSION) return [];
+
+    const groups = Array.isArray(parsed?.categories) ? parsed.categories : [];
+    const records: HomeCollectionShortcut[] = [];
+    const seen = new Set<string>();
+
+    groups.forEach((group: any) => {
+      const groupHandle = String(group?.handle || '').trim();
+      const groupTitle = String(group?.title || groupHandle || '').trim();
+
+      if (groupHandle && !seen.has(groupHandle)) {
+        seen.add(groupHandle);
+        records.push({ title: groupTitle, handle: groupHandle });
+      }
+
+      const items = Array.isArray(group?.items) ? group.items : [];
+      items.forEach((item: any) => {
+        const itemHandle = String(item?.handle || '').trim();
+        const itemTitle = String(item?.title || itemHandle || '').trim();
+
+        if (itemHandle && !seen.has(itemHandle)) {
+          seen.add(itemHandle);
+          records.push({ title: itemTitle, handle: itemHandle });
+        }
+      });
+    });
+
+    return records;
+  } catch {
+    return [];
+  }
+}
+
+async function fetchHomeCollectionRecords(): Promise<HomeCollectionShortcut[]> {
+  const records: HomeCollectionShortcut[] = [];
+  const seen = new Set<string>();
+  let after: string | null = null;
+  let hasMore = true;
+  let guard = 0;
+
+  while (hasMore && guard < 20) {
+    const afterParam = after ? `&after=${encodeURIComponent(after)}` : '';
+    const json: any = await fetchCatalogPath(
+      `/api/catalog/collections?limit=250&first=250${afterParam}`
+    );
+    const edges = json?.data?.collections?.edges || [];
+
+    edges.forEach((edge: any) => {
+      const handle = String(edge?.node?.handle || '').trim();
+      const title = String(edge?.node?.title || handle).trim();
+      if (!handle || seen.has(handle)) return;
+
+      seen.add(handle);
+      records.push({ title, handle });
+    });
+
+    const pageInfo = json?.data?.collections?.pageInfo || {};
+    after = pageInfo?.endCursor ?? null;
+    hasMore = Boolean(pageInfo?.hasNextPage && after);
+    guard += 1;
+  }
+
+  return records;
+}
+
 type ShopifyProduct = {
   id: string;
   title: string;
   handle: string;
   brand: string;
   category: string;
-  description: string;
+  description?: string;
   tags: string[];
   image: string;
   imageWidth?: number | null;
@@ -352,8 +567,12 @@ function parseStoredHomeProductsCache(raw: string | null): {
     const parsed = JSON.parse(raw) as ShopifyProduct[] | HomeProductsCache;
 
     if (Array.isArray(parsed)) {
+      const { products } = trimProductsForCache(
+        slimHomeListProducts(parsed) as ShopifyProduct[],
+        MAX_CACHED_HOME_PRODUCTS
+      );
       return {
-        products: parsed,
+        products: capHomeProductsForMemory(products as ShopifyProduct[]),
         nextCursor: null,
         hasMore: false,
         mixKey: null,
@@ -361,8 +580,12 @@ function parseStoredHomeProductsCache(raw: string | null): {
     }
 
     if (parsed && typeof parsed === 'object' && Array.isArray(parsed.products)) {
+      const { products } = trimProductsForCache(
+        slimHomeListProducts(parsed.products) as ShopifyProduct[],
+        MAX_CACHED_HOME_PRODUCTS
+      );
       return {
-        products: parsed.products,
+        products: capHomeProductsForMemory(products as ShopifyProduct[]),
         nextCursor: parsed.nextCursor ?? null,
         hasMore: Boolean(parsed.hasMore),
         mixKey: typeof parsed.mixKey === 'number' ? parsed.mixKey : null,
@@ -381,6 +604,7 @@ type HomeSessionSnapshot = {
   allProducts: ShopifyProduct[];
   products: ShopifyProduct[];
   showcaseProducts: Record<string, ShopifyProduct[]>;
+  laceFrontProducts: ShopifyProduct[];
   nextProductsCursor: string | null;
   hasMoreProducts: boolean;
   hotBadgeSeed: number;
@@ -388,7 +612,45 @@ type HomeSessionSnapshot = {
   scrollOffset: number;
 };
 
+type LaceFrontProductsCache = {
+  version: number;
+  savedAt: string;
+  products: ShopifyProduct[];
+};
+
 let homeSessionSnapshot: HomeSessionSnapshot | null = null;
+
+function parseLaceFrontProductsCache(raw: string | null): ShopifyProduct[] {
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw) as LaceFrontProductsCache;
+    if (!parsed || Number(parsed.version) !== LACE_FRONT_PRODUCTS_CACHE_VERSION) return [];
+    if (!Array.isArray(parsed.products)) return [];
+    return slimHomeListProducts(
+      parsed.products.filter((product) => product?.id && product?.handle)
+    ) as ShopifyProduct[];
+  } catch {
+    return [];
+  }
+}
+
+async function readLaceFrontProductsCache(): Promise<ShopifyProduct[]> {
+  const raw = await AsyncStorage.getItem(LACE_FRONT_PRODUCTS_CACHE_KEY);
+  return parseLaceFrontProductsCache(raw);
+}
+
+async function saveLaceFrontProductsCache(products: ShopifyProduct[]) {
+  if (!products.length) return;
+
+  const envelope: LaceFrontProductsCache = {
+    version: LACE_FRONT_PRODUCTS_CACHE_VERSION,
+    savedAt: new Date().toISOString(),
+    products,
+  };
+
+  await AsyncStorage.setItem(LACE_FRONT_PRODUCTS_CACHE_KEY, JSON.stringify(envelope));
+}
 
 function isHomeTabPath(pathname: string): boolean {
   return (
@@ -488,8 +750,8 @@ function productMatchesSearch(product: ShopifyProduct, query: string) {
     product.handle,
     product.brand,
     product.category,
-    product.description,
-    product.tags.join(' '),
+    product.description || '',
+    (product.tags || []).join(' '),
     collectionLabel,
     product.collectionHandle,
     product.price,
@@ -504,16 +766,23 @@ function productMatchesSearch(product: ShopifyProduct, query: string) {
     .every((term) => searchableText.includes(term));
 }
 
-function getOptimizedImageUrl(url?: string | null, width = 520) {
-  if (!url) return 'https://via.placeholder.com/600x700.png?text=No+Image';
+function getOptimizedImageUrl(url?: string | null) {
+  return getHomeListImageUrl(url);
+}
 
-  try {
-    const parsed = new URL(url);
-    parsed.searchParams.set('width', String(width));
-    return parsed.toString();
-  } catch {
-    return url;
-  }
+function capHomeProductsForMemory(products: ShopifyProduct[]) {
+  return prepareInMemoryHomeProducts(products).products as ShopifyProduct[];
+}
+
+function slimShowcaseProducts(
+  showcase: Record<string, ShopifyProduct[]>
+): Record<string, ShopifyProduct[]> {
+  return Object.fromEntries(
+    Object.entries(showcase).map(([handle, sectionProducts]) => [
+      handle,
+      slimHomeListProducts(Array.isArray(sectionProducts) ? sectionProducts : []) as ShopifyProduct[],
+    ])
+  );
 }
 
 function getProductCategory(
@@ -630,6 +899,23 @@ type ProductCardProps = {
   onAddToCart: (item: ShopifyProduct) => void;
 };
 
+function productCardPropsAreEqual(prev: ProductCardProps, next: ProductCardProps) {
+  return (
+    prev.item.id === next.item.id &&
+    prev.item.handle === next.item.handle &&
+    prev.item.image === next.item.image &&
+    prev.item.title === next.item.title &&
+    prev.item.priceAmount === next.item.priceAmount &&
+    prev.item.oldPriceAmount === next.item.oldPriceAmount &&
+    prev.item.variantId === next.item.variantId &&
+    prev.hotBadgeSeed === next.hotBadgeSeed &&
+    prev.displayPrice === next.displayPrice &&
+    prev.displayOldPrice === next.displayOldPrice &&
+    prev.onOpen === next.onOpen &&
+    prev.onAddToCart === next.onAddToCart
+  );
+}
+
 const ProductCard = React.memo(function ProductCard({
   item,
   hotBadgeSeed,
@@ -639,18 +925,19 @@ const ProductCard = React.memo(function ProductCard({
   onAddToCart,
 }: ProductCardProps) {
   useHomeRenderCounter('ProductCard', item.handle);
-  const imageStartedAtRef = useRef(0);
   const showHotBadge = shouldShowHotBadge(item.id, hotBadgeSeed);
+  const stockLabel = getProductAvailabilityLabel(item);
+  const isSoldOut = resolveListProductSoldOut(item);
+
+  useEffect(() => {
+    if (!PRODUCT_LOAD_DEBUG) return;
+    logCardProductStockState(item, 'home');
+    logSoldOutDebug(item, 'home');
+  }, [item.availableForSale, item.handle]);
 
   useEffect(() => {
     if (!HOME_PERF_INVESTIGATION_ENABLED) return;
-
     homePerfInvestigation.productCardMounts += 1;
-    homeLog('[HOME PERF] ProductCard mounted', {
-      handle: item.handle,
-      totalProductCardMounts: homePerfInvestigation.productCardMounts,
-      time: perfNow(),
-    });
   }, [item.handle]);
 
   return (
@@ -662,27 +949,12 @@ const ProductCard = React.memo(function ProductCard({
       <View style={styles.productImageWrap}>
         <ExpoImage
           source={{ uri: item.image }}
+          placeholder={HERO_IMAGE_FALLBACK_SOURCE}
+          placeholderContentFit="cover"
           style={styles.productImage}
           contentFit="cover"
           cachePolicy="memory-disk"
           transition={80}
-          onLoadStart={() => {
-            imageStartedAtRef.current = getNow();
-          }}
-          onLoad={(event) => {
-            if (HOME_PROFILE_LOGS_ENABLED) {
-              const duration = getNow() - imageStartedAtRef.current;
-              console.log('[Home perf] ProductCard image loaded', {
-                handle: item.handle,
-                original: `${item.imageWidth ?? 'unknown'}x${item.imageHeight ?? 'unknown'}`,
-                requestedUrl: item.image,
-                loaded: event.source
-                  ? `${event.source.width ?? 'unknown'}x${event.source.height ?? 'unknown'}`
-                  : 'unknown',
-                durationMs: duration.toFixed(1),
-              });
-            }
-          }}
         />
         {showHotBadge ? (
           <View
@@ -706,12 +978,14 @@ const ProductCard = React.memo(function ProductCard({
       </View>
 
       <View style={styles.cardBottomRow}>
-        <Text style={styles.soldText}>Available now</Text>
+        <Text style={[styles.soldText, isSoldOut && styles.soldTextUnavailable]}>{stockLabel}</Text>
 
         <TouchableOpacity
           style={styles.cartButton}
+          disabled={isSoldOut}
           onPress={(event) => {
             event.stopPropagation();
+            if (isSoldOut) return;
             onAddToCart(item);
           }}
         >
@@ -720,7 +994,7 @@ const ProductCard = React.memo(function ProductCard({
       </View>
     </TouchableOpacity>
   );
-});
+}, productCardPropsAreEqual);
 
 type CategoryCardProps = {
   item: ShopifyProduct;
@@ -730,6 +1004,19 @@ type CategoryCardProps = {
   displayPrice: string;
   onOpen: (item: ShopifyProduct) => void;
 };
+
+function categoryCardPropsAreEqual(prev: CategoryCardProps, next: CategoryCardProps) {
+  return (
+    prev.item.id === next.item.id &&
+    prev.item.image === next.item.image &&
+    prev.item.title === next.item.title &&
+    prev.badgeKey === next.badgeKey &&
+    prev.showHotBadge === next.showHotBadge &&
+    prev.hotBadgeSeed === next.hotBadgeSeed &&
+    prev.displayPrice === next.displayPrice &&
+    prev.onOpen === next.onOpen
+  );
+}
 
 const CategoryCard = React.memo(function CategoryCard({
   item,
@@ -743,13 +1030,7 @@ const CategoryCard = React.memo(function CategoryCard({
 
   useEffect(() => {
     if (!HOME_PERF_INVESTIGATION_ENABLED) return;
-
     homePerfInvestigation.categoryCardMounts += 1;
-    homeLog('[HOME PERF] CategoryCard mounted', {
-      handle: item.handle,
-      totalCategoryCardMounts: homePerfInvestigation.categoryCardMounts,
-      time: perfNow(),
-    });
   }, [item.handle]);
   const imageStartedAtRef = useRef(0);
 
@@ -761,6 +1042,8 @@ const CategoryCard = React.memo(function CategoryCard({
     >
       <ExpoImage
         source={{ uri: item.image }}
+        placeholder={HERO_IMAGE_FALLBACK_SOURCE}
+        placeholderContentFit="cover"
         style={styles.collectionProductImage}
         contentFit="cover"
         cachePolicy="memory-disk"
@@ -799,7 +1082,7 @@ const CategoryCard = React.memo(function CategoryCard({
       <Text style={styles.collectionProductPrice}>{displayPrice}</Text>
     </TouchableOpacity>
   );
-});
+}, categoryCardPropsAreEqual);
 
 const Banner = React.memo(function Banner() {
   useHomeRenderCounter('Banner', 'safe-payments');
@@ -1027,12 +1310,48 @@ const WebExpoVideoCard = React.memo(function WebExpoVideoCard({ uri, index }: Vi
 
 type LaceFrontVideoCardProps = {
   assetId: number;
+  index: number;
+  mountPlayer?: boolean;
+  posterUri?: string;
+  laceFrontVideosReady?: boolean;
 };
 
-function LaceFrontVideoCard({ assetId }: LaceFrontVideoCardProps) {
+const LaceFrontVideoCardPlayer = React.memo(function LaceFrontVideoCardPlayer({
+  assetId,
+  index,
+  posterUri,
+  laceFrontVideosReady = false,
+}: LaceFrontVideoCardProps) {
   const videoMeta = getVideoPerfMeta(assetId);
+  const uri = useMemo(() => getResolvedVideoAssetUri(assetId), [assetId]);
+  const videoSource = useMemo<VideoSource>(
+    () => (uri ? { uri } : { assetId }),
+    [assetId, uri]
+  );
   const mountAtRef = useRef(perfNow());
   const playerCreatedAtRef = useRef<number | null>(null);
+  const [firstFrameRendered, setFirstFrameRendered] = useState(false);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const [playerStatus, setPlayerStatus] = useState<string>('idle');
+
+  const logLaceVideoDebug = useCallback(
+    (status: string, error?: unknown) => {
+      if (!LACE_VIDEO_DEBUG) return;
+
+      console.log('[LACE_VIDEO_DEBUG]', {
+        index,
+        uri,
+        isLoaded: status === 'readyToPlay' || firstFrameRendered,
+        status,
+        error: error ? String((error as any)?.message || error) : playbackError,
+        shouldPlay: true,
+        isMuted: true,
+        isLooping: true,
+        laceFrontVideosReady,
+      });
+    },
+    [firstFrameRendered, index, laceFrontVideosReady, playbackError, uri]
+  );
 
   useEffect(() => {
     if (!HOME_PERF_INVESTIGATION_ENABLED) return;
@@ -1047,7 +1366,7 @@ function LaceFrontVideoCard({ assetId }: LaceFrontVideoCardProps) {
     });
   }, [assetId]);
 
-  const player = useVideoPlayer(assetId, (videoPlayer) => {
+  const player = useVideoPlayer(videoSource, (videoPlayer) => {
     playerCreatedAtRef.current = perfNow();
     homeLog('[HOME PERF] video player created', {
       id: videoMeta.fileName,
@@ -1057,18 +1376,47 @@ function LaceFrontVideoCard({ assetId }: LaceFrontVideoCardProps) {
     });
     videoPlayer.loop = true;
     videoPlayer.muted = true;
-    videoPlayer.play();
+    videoPlayer.volume = 0;
+    videoPlayer.audioMixingMode = 'mixWithOthers';
+    videoPlayer.staysActiveInBackground = false;
+    videoPlayer.keepScreenOnWhilePlaying = false;
   });
+
+  const playSafely = useCallback(
+    (reason: string) => {
+      try {
+        player.loop = true;
+        player.muted = true;
+        player.volume = 0;
+        player.audioMixingMode = 'mixWithOthers';
+        player.staysActiveInBackground = false;
+        player.keepScreenOnWhilePlaying = false;
+        player.play();
+        logLaceVideoDebug(`${player.status || 'play'}:${reason}`);
+      } catch (error) {
+        const message = String((error as any)?.message || error);
+        setPlaybackError(message);
+        logLaceVideoDebug('play-error', message);
+      }
+    },
+    [logLaceVideoDebug, player]
+  );
 
   useEffect(() => {
     const sourceLoadSubscription = player.addListener('sourceLoad', () => {
+      setPlaybackError(null);
+      playSafely('sourceLoad');
       homeLog('[HOME PERF] video source loaded', {
         id: videoMeta.fileName,
         time: perfNow(),
       });
+      logLaceVideoDebug('sourceLoad');
     });
     const statusSubscription = player.addListener('statusChange', ({ status, error }) => {
+      setPlayerStatus(status);
+      logLaceVideoDebug(status, error);
       if (status === 'readyToPlay') {
+        playSafely('readyToPlay');
         homeLog('[HOME PERF] video ready', {
           id: videoMeta.fileName,
           time: perfNow(),
@@ -1076,6 +1424,7 @@ function LaceFrontVideoCard({ assetId }: LaceFrontVideoCardProps) {
       }
 
       if (status === 'error') {
+        setPlaybackError(String((error as any)?.message || error || 'Video playback error'));
         homeLog('[HOME PERF] video error', {
           id: videoMeta.fileName,
           time: perfNow(),
@@ -1088,7 +1437,45 @@ function LaceFrontVideoCard({ assetId }: LaceFrontVideoCardProps) {
       sourceLoadSubscription.remove();
       statusSubscription.remove();
     };
-  }, [player, videoMeta.fileName]);
+  }, [logLaceVideoDebug, playSafely, player, videoMeta.fileName]);
+
+  useEffect(() => {
+    logLaceVideoDebug(player.status || playerStatus || 'mount');
+    const playFrame = requestAnimationFrame(() => playSafely('frame'));
+    const playTimerOne = setTimeout(() => playSafely('350ms'), 350);
+    const playTimerTwo = setTimeout(() => playSafely('1200ms'), 1200);
+    const playTimerThree = setTimeout(() => playSafely('2400ms'), 2400);
+
+    return () => {
+      cancelAnimationFrame(playFrame);
+      clearTimeout(playTimerOne);
+      clearTimeout(playTimerTwo);
+      clearTimeout(playTimerThree);
+      try {
+        player.pause();
+      } catch {
+        // The expo-video hook releases the player during unmount.
+      }
+    };
+  }, [logLaceVideoDebug, playSafely, player, playerStatus]);
+
+  useFocusEffect(
+    useCallback(() => {
+      playSafely('focus');
+      const focusTimer = setTimeout(() => playSafely('focus-retry'), 800);
+
+      return () => {
+        clearTimeout(focusTimer);
+        try {
+          player.pause();
+        } catch {
+          // The native player may already be released.
+        }
+      };
+    }, [playSafely, player])
+  );
+
+  const showPosterFallback = Boolean(posterUri && (!firstFrameRendered || playbackError));
 
   return (
     <View style={styles.laceFrontVideoCard}>
@@ -1097,8 +1484,16 @@ function LaceFrontVideoCard({ assetId }: LaceFrontVideoCardProps) {
         style={styles.laceFrontVideo}
         nativeControls={false}
         contentFit="cover"
+        fullscreenOptions={{ enable: false }}
         surfaceType={Platform.OS === 'android' ? 'textureView' : undefined}
+        allowsPictureInPicture={false}
+        startsPictureInPictureAutomatically={false}
+        useExoShutter={false}
         onFirstFrameRender={() => {
+          setFirstFrameRendered(true);
+          setPlaybackError(null);
+          playSafely('firstFrame');
+          logLaceVideoDebug('firstFrame');
           homeLog('[HOME PERF] video first frame', {
             id: videoMeta.fileName,
             time: perfNow(),
@@ -1106,36 +1501,427 @@ function LaceFrontVideoCard({ assetId }: LaceFrontVideoCardProps) {
           });
         }}
       />
+      {showPosterFallback ? (
+        <ExpoImage
+          source={{ uri: posterUri }}
+          style={styles.laceFrontVideoFallback}
+          contentFit="cover"
+          cachePolicy="memory-disk"
+          transition={0}
+        />
+      ) : null}
     </View>
   );
-}
+});
 
-function LaceFrontVideoSection() {
-  const router = useRouter();
+const LaceFrontVideoCard = React.memo(function LaceFrontVideoCard({
+  assetId,
+  index,
+  mountPlayer = false,
+  posterUri,
+  laceFrontVideosReady = false,
+}: LaceFrontVideoCardProps) {
+  if (!mountPlayer) {
+    if (posterUri) {
+      return (
+        <View style={styles.laceFrontVideoCard}>
+          <ExpoImage
+            source={{ uri: posterUri }}
+            style={styles.laceFrontVideo}
+            contentFit="cover"
+            cachePolicy="memory-disk"
+            transition={0}
+          />
+        </View>
+      );
+    }
 
-  const goToLaceFrontCollection = () => {
-    router.push({
-      pathname: '/collection/[handle]',
-      params: { handle: 'lacefront', from: 'home' },
-    });
-  };
+    return <View style={[styles.laceFrontVideoCard, styles.laceFrontVideoPosterEmpty]} />;
+  }
+
+  return (
+    <LaceFrontVideoCardPlayer
+      assetId={assetId}
+      index={index}
+      posterUri={posterUri}
+      laceFrontVideosReady={laceFrontVideosReady}
+    />
+  );
+});
+
+type LaceFrontSectionProps = {
+  products: ShopifyProduct[];
+  loading: boolean;
+  mountVideos: boolean;
+  hotBadgeSeed: number;
+  getDisplayPrice: (item: ShopifyProduct) => string;
+  onOpenProduct: (item: ShopifyProduct) => void;
+  onSeeMore: () => void;
+};
+
+const LaceFrontSection = React.memo(function LaceFrontSection({
+  products,
+  loading,
+  mountVideos,
+  hotBadgeSeed,
+  getDisplayPrice,
+  onOpenProduct,
+  onSeeMore,
+}: LaceFrontSectionProps) {
+  const visibleProducts = products.slice(0, LACE_FRONT_PRODUCTS_LIMIT);
+  const renderedProductCount = visibleProducts.length;
+  const placeholderCardCount = mountVideos ? 0 : 0;
+
+  useEffect(() => {
+    console.log('[NOOD lacefront] section mounted');
+  }, []);
+
+  useEffect(() => {
+    console.log('[NOOD lacefront] real product cards rendered count', renderedProductCount);
+    console.log('[NOOD lacefront] placeholder cards count', placeholderCardCount);
+    if (mountVideos) {
+      console.log('[NOOD lacefront] videos lazy mounted');
+    }
+  }, [mountVideos, placeholderCardCount, renderedProductCount]);
 
   return (
     <View style={styles.laceFrontSection}>
-      <Text style={styles.laceFrontTitle}>Lace Front</Text>
-
-      <View style={styles.laceFrontGrid}>
-        {LACE_FRONT_VIDEOS.map((video) => (
-          <LaceFrontVideoCard key={video.id} assetId={video.assetId} />
-        ))}
+      <View style={styles.laceFrontHeaderRow}>
+        <Text style={styles.laceFrontTitle}>Lace Front</Text>
+        <TouchableOpacity activeOpacity={0.85} onPress={onSeeMore}>
+          <Text style={styles.viewAllText}>View All →</Text>
+        </TouchableOpacity>
       </View>
 
-      <Pressable style={styles.laceFrontButton} onPress={goToLaceFrontCollection}>
+      {loading && !renderedProductCount ? (
+        <View style={styles.laceFrontLoadingWrap}>
+          <NoodSpinner size={28} />
+        </View>
+      ) : renderedProductCount ? (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.showcaseRow}
+          removeClippedSubviews={HOME_LIST_REMOVE_CLIPPED_SUBVIEWS}
+        >
+          {visibleProducts.map((item) => {
+            const badgeKey = `${LACE_FRONT_COLLECTION_HANDLE}-${item.id}`;
+            const showHotBadge = shouldShowHotBadge(badgeKey, hotBadgeSeed);
+
+            return (
+              <CategoryCard
+                key={badgeKey}
+                item={item}
+                badgeKey={badgeKey}
+                showHotBadge={showHotBadge}
+                hotBadgeSeed={hotBadgeSeed}
+                displayPrice={getDisplayPrice(item)}
+                onOpen={onOpenProduct}
+              />
+            );
+          })}
+        </ScrollView>
+      ) : null}
+
+      <View style={styles.laceFrontGrid}>
+        {LACE_FRONT_VIDEOS.map((video, index) => {
+          const posterUri = visibleProducts[index % Math.max(visibleProducts.length, 1)]?.image;
+          return (
+            <LaceFrontVideoCard
+              key={video.id}
+              assetId={video.assetId}
+              index={index}
+              mountPlayer={mountVideos}
+              posterUri={posterUri}
+              laceFrontVideosReady={mountVideos}
+            />
+          );
+        })}
+      </View>
+
+      <Pressable style={styles.laceFrontButton} onPress={onSeeMore}>
         <Text style={styles.laceFrontButtonText}>See More</Text>
       </Pressable>
     </View>
   );
-}
+});
+
+type CollectionShowcaseProps = {
+  title: string;
+  handle: string;
+  collectionProducts: ShopifyProduct[];
+  hotBadgeSeed: number;
+  getDisplayPrice: (item: ShopifyProduct) => string;
+  onOpen: (item: ShopifyProduct) => void;
+  onViewAll: (handle: string) => void;
+};
+
+const CollectionShowcase = React.memo(function CollectionShowcase({
+  title,
+  handle,
+  collectionProducts,
+  hotBadgeSeed,
+  getDisplayPrice,
+  onOpen,
+  onViewAll,
+}: CollectionShowcaseProps) {
+  if (!collectionProducts.length) {
+    return null;
+  }
+
+  return (
+    <View style={styles.showcaseWrap}>
+      <View style={styles.showcaseHeaderRow}>
+        <Text style={styles.showcaseTitle}>{title}</Text>
+
+        <TouchableOpacity activeOpacity={0.85} onPress={() => onViewAll(handle)}>
+          <Text style={styles.viewAllText}>View All →</Text>
+        </TouchableOpacity>
+      </View>
+
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.showcaseRow}
+        removeClippedSubviews={HOME_LIST_REMOVE_CLIPPED_SUBVIEWS}
+      >
+        {collectionProducts.slice(0, 10).map((item) => {
+          const badgeKey = `${handle}-${item.id}`;
+          const showHotBadge = shouldShowHotBadge(badgeKey, hotBadgeSeed);
+
+          return (
+            <CategoryCard
+              key={badgeKey}
+              item={item}
+              badgeKey={badgeKey}
+              showHotBadge={showHotBadge}
+              hotBadgeSeed={hotBadgeSeed}
+              displayPrice={getDisplayPrice(item)}
+              onOpen={onOpen}
+            />
+          );
+        })}
+      </ScrollView>
+    </View>
+  );
+});
+
+type HomeTopHeaderProps = {
+  onRefresh: () => void;
+  onOpenSearch: () => void;
+  onOpenCamera: () => void;
+};
+
+const HomeTopHeader = React.memo(function HomeTopHeader({
+  onRefresh,
+  onOpenSearch,
+  onOpenCamera,
+}: HomeTopHeaderProps) {
+  return (
+    <View
+      style={styles.headerWrap}
+      onLayout={() => {
+        if (homePerfInvestigation.topHeaderMounted) return;
+        homePerfInvestigation.topHeaderMounted = true;
+        homeLog('[HOME PERF] header mounted', perfNow());
+      }}
+    >
+      <TouchableOpacity activeOpacity={0.85} onPress={onRefresh}>
+        <Image
+          source={require('../../assets/images/nood-brand-logo.png')}
+          style={styles.logo}
+          resizeMode="contain"
+          fadeDuration={0}
+        />
+      </TouchableOpacity>
+
+      <TouchableOpacity style={styles.searchBox} activeOpacity={0.95} onPress={onOpenSearch}>
+        <TextInput
+          placeholder="Search products"
+          placeholderTextColor="#666"
+          style={styles.input}
+          value=""
+          editable={false}
+          onPressIn={onOpenSearch}
+        />
+
+        <View style={styles.searchIconButton}>
+          <TouchableOpacity
+            style={styles.searchBarIconTap}
+            activeOpacity={0.8}
+            onPress={onOpenCamera}
+          >
+            <Ionicons
+              name="camera-outline"
+              size={20}
+              color="#000"
+              style={styles.cameraIcon}
+            />
+          </TouchableOpacity>
+          <Ionicons name="search" size={22} color="#000" onPress={onOpenSearch} />
+        </View>
+      </TouchableOpacity>
+    </View>
+  );
+});
+
+type HomeScrollableHeaderProps = {
+  visualSearchLoading: boolean;
+  visualSearchMode: boolean;
+  searchText: string;
+  homeCollectionShortcuts: HomeCollectionShortcut[];
+  showcaseProducts: Record<string, ShopifyProduct[]>;
+  allProducts: ShopifyProduct[];
+  hotBadgeSeed: number;
+  laceFrontProducts: ShopifyProduct[];
+  laceFrontLoading: boolean;
+  laceFrontVideosReady: boolean;
+  requestedSlideIndex: number | null;
+  requestedSlideKey: number;
+  getDisplayPrice: (item: ShopifyProduct) => string;
+  onShowTrendingNow: () => void;
+  onShowRewardsInSlideshow: () => void;
+  onOpenCollectionShortcut: (handle: string) => void;
+  onOpenProduct: (item: ShopifyProduct) => void;
+  onViewAllCollection: (handle: string) => void;
+  onLaceFrontSeeMore: () => void;
+  onSlideshowFirstFrameReady: () => void;
+};
+
+const HomeScrollableHeader = React.memo(function HomeScrollableHeader({
+  visualSearchLoading,
+  visualSearchMode,
+  searchText,
+  homeCollectionShortcuts,
+  showcaseProducts,
+  allProducts,
+  hotBadgeSeed,
+  laceFrontProducts,
+  laceFrontLoading,
+  laceFrontVideosReady,
+  requestedSlideIndex,
+  requestedSlideKey,
+  getDisplayPrice,
+  onShowTrendingNow,
+  onShowRewardsInSlideshow,
+  onOpenCollectionShortcut,
+  onOpenProduct,
+  onViewAllCollection,
+  onLaceFrontSeeMore,
+  onSlideshowFirstFrameReady,
+}: HomeScrollableHeaderProps) {
+  const showcaseSections = useMemo(
+    () =>
+      HOME_SHOWCASE_SECTIONS.map((section) => {
+        const collectionProducts =
+          showcaseProducts[section.handle] && showcaseProducts[section.handle].length
+            ? showcaseProducts[section.handle]
+            : allProducts.filter((item) =>
+                item.collectionHandles?.length
+                  ? item.collectionHandles.includes(section.handle)
+                  : item.collectionHandle === section.handle
+              );
+
+        return {
+          ...section,
+          collectionProducts,
+        };
+      }),
+    [allProducts, showcaseProducts]
+  );
+
+  if (visualSearchLoading) {
+    return (
+      <View style={styles.visualSearchStatusWrap}>
+        <NoodSpinner size={42} />
+        <Text style={styles.visualSearchStatusText}>Searching similar items...</Text>
+      </View>
+    );
+  }
+
+  if (visualSearchMode) {
+    return (
+      <View style={styles.feedHeaderWrap}>
+        <Text style={styles.feedHeaderTitle}>Similar items</Text>
+      </View>
+    );
+  }
+
+  if (searchText.trim()) return null;
+
+  return (
+    <>
+      <View style={styles.homeTopInfoRow}>
+        <View style={styles.homeTopInfoFixed}>
+          <TouchableOpacity style={styles.homePill} activeOpacity={0.9} onPress={onShowTrendingNow}>
+            <Text style={styles.homePillText}>Trending now</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.homePill}
+            activeOpacity={0.92}
+            onPress={onShowRewardsInSlideshow}
+          >
+            <Text style={styles.homePillText}>Rewards</Text>
+          </TouchableOpacity>
+        </View>
+
+        {homeCollectionShortcuts.length > 0 ? (
+          <ScrollView
+            horizontal
+            style={styles.homeCollectionScroll}
+            contentContainerStyle={styles.homeCollectionScrollContent}
+            showsHorizontalScrollIndicator={false}
+            nestedScrollEnabled
+          >
+            {homeCollectionShortcuts.map((shortcut) => (
+              <TouchableOpacity
+                key={shortcut.handle}
+                style={styles.homePill}
+                activeOpacity={0.9}
+                onPress={() => onOpenCollectionShortcut(shortcut.handle)}
+              >
+                <Text style={styles.homePillText}>{shortcut.title}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        ) : null}
+      </View>
+      <Banner />
+      <HomeSlideshow
+        requestedSlideIndex={requestedSlideIndex}
+        requestedSlideKey={requestedSlideKey}
+        onFirstSlideReady={onSlideshowFirstFrameReady}
+      />
+
+      {showcaseSections.map((section) => (
+        <CollectionShowcase
+          key={section.handle}
+          title={section.title}
+          handle={section.handle}
+          collectionProducts={section.collectionProducts}
+          hotBadgeSeed={hotBadgeSeed}
+          getDisplayPrice={getDisplayPrice}
+          onOpen={onOpenProduct}
+          onViewAll={onViewAllCollection}
+        />
+      ))}
+      <LaceFrontSection
+        products={laceFrontProducts}
+        loading={laceFrontLoading}
+        mountVideos={laceFrontVideosReady}
+        hotBadgeSeed={hotBadgeSeed}
+        getDisplayPrice={getDisplayPrice}
+        onOpenProduct={onOpenProduct}
+        onSeeMore={onLaceFrontSeeMore}
+      />
+
+      <View style={styles.feedHeaderWrap}>
+        <Text style={styles.feedHeaderTitle}>Trending now</Text>
+      </View>
+    </>
+  );
+});
 
 type HeroVideoSlideProps = {
   uri: VideoSource;
@@ -1144,9 +1930,30 @@ type HeroVideoSlideProps = {
   onReady?: () => void;
 };
 
-const HeroVideoSlide = React.memo(function HeroVideoSlide({
+const HeroVideoSlidePoster = React.memo(function HeroVideoSlidePoster({
+  posterSource,
+}: {
+  posterSource?: ImageSourcePropType;
+}) {
+  return (
+    <View style={styles.heroSlideMedia}>
+      {posterSource ? (
+        <ExpoImage
+          source={posterSource}
+          style={styles.heroSlideMedia}
+          contentFit="cover"
+          cachePolicy="memory-disk"
+          transition={0}
+        />
+      ) : (
+        <View style={[styles.heroVideoPosterFallback, styles.heroVideoPosterNoPointer]} />
+      )}
+    </View>
+  );
+});
+
+const HeroVideoSlidePlayer = React.memo(function HeroVideoSlidePlayer({
   uri,
-  isActive,
   posterSource,
   onReady,
 }: HeroVideoSlideProps) {
@@ -1159,24 +1966,29 @@ const HeroVideoSlide = React.memo(function HeroVideoSlide({
       : 'slideshow-hero-video';
 
   useEffect(() => {
+    slideshowPerfLog('[NOOD slideshow perf] video load start', {
+      id: videoId,
+      ...(typeof uri === 'number' ? getVideoPerfMeta(uri) : { assetId: null, fileName: videoId }),
+    });
+
     if (!HOME_PERF_INVESTIGATION_ENABLED) return;
 
     homePerfInvestigation.videoMounts += 1;
     homeLog('[HOME PERF] video mounted', {
       id: videoId,
-      isActive,
+      isActive: true,
       ...(typeof uri === 'number' ? getVideoPerfMeta(uri) : { assetId: null, fileName: videoId }),
       time: mountAtRef.current,
       totalVideoMounts: homePerfInvestigation.videoMounts,
       surfaceType: 'default',
     });
-  }, [isActive, uri, videoId]);
+  }, [uri, videoId]);
 
   const player = useVideoPlayer(uri, (videoPlayer) => {
     const createdAt = perfNow();
     homeLog('[HOME PERF] video player created', {
       id: videoId,
-      isActive,
+      isActive: true,
       time: createdAt,
       sinceMountMs: createdAt - mountAtRef.current,
     });
@@ -1196,17 +2008,19 @@ const HeroVideoSlide = React.memo(function HeroVideoSlide({
   useEffect(() => {
     const sourceLoadSubscription = player.addListener('sourceLoad', () => {
       console.log('HOME_SLIDE_MEDIA_LOADED', { type: 'video-source', uri });
-      homeLog('[HOME PERF] video source loaded', { id: videoId, isActive, time: perfNow() });
+      slideshowPerfLog('[NOOD slideshow perf] video loaded', { id: videoId, stage: 'source' });
+      homeLog('[HOME PERF] video source loaded', { id: videoId, isActive: true, time: perfNow() });
     });
     const statusSubscription = player.addListener('statusChange', ({ status, error }) => {
       if (status === 'readyToPlay') {
         console.log('HOME_SLIDE_MEDIA_LOADED', { type: 'video-ready', uri });
-        homeLog('[HOME PERF] video ready', { id: videoId, isActive, time: perfNow() });
+        slideshowPerfLog('[NOOD slideshow perf] video loaded', { id: videoId, stage: 'ready' });
+        homeLog('[HOME PERF] video ready', { id: videoId, isActive: true, time: perfNow() });
       }
 
       if (status === 'error') {
         console.log('HOME_SLIDE_MEDIA_ERROR', { type: 'video', uri, error });
-        homeLog('[HOME PERF] video error', { id: videoId, isActive, time: perfNow(), error });
+        homeLog('[HOME PERF] video error', { id: videoId, isActive: true, time: perfNow(), error });
         if (!reportedReadyRef.current) {
           reportedReadyRef.current = true;
           onReady?.();
@@ -1218,12 +2032,10 @@ const HeroVideoSlide = React.memo(function HeroVideoSlide({
       sourceLoadSubscription.remove();
       statusSubscription.remove();
     };
-  }, [isActive, onReady, player, uri, videoId]);
+  }, [onReady, player, uri, videoId]);
 
   useEffect(() => {
     const play = () => {
-      if (!isActive) return;
-
       try {
         player.muted = true;
         player.volume = 0;
@@ -1236,28 +2048,17 @@ const HeroVideoSlide = React.memo(function HeroVideoSlide({
     };
 
     const playFrame = requestAnimationFrame(play);
-    const playTimerOne = setTimeout(play, 350);
-    const playTimerTwo = setTimeout(play, 1200);
-
-    if (!isActive) {
-      try {
-        player.pause();
-      } catch {
-        // Ignore if player is not ready yet.
-      }
-    }
 
     return () => {
       cancelAnimationFrame(playFrame);
-      clearTimeout(playTimerOne);
-      clearTimeout(playTimerTwo);
+      slideshowPerfLog('[NOOD slideshow perf] inactive video paused', { id: videoId });
       try {
         player.pause();
       } catch {
         // Ignore release state.
       }
     };
-  }, [isActive, player]);
+  }, [player, videoId]);
 
   return (
     <View style={styles.heroSlideMedia}>
@@ -1271,9 +2072,13 @@ const HeroVideoSlide = React.memo(function HeroVideoSlide({
         startsPictureInPictureAutomatically={false}
         onFirstFrameRender={() => {
           console.log('HOME_SLIDE_MEDIA_LOADED', { type: 'video-first-frame', uri });
+          slideshowPerfLog('[NOOD slideshow perf] first frame ready', {
+            id: videoId,
+            sinceMountMs: perfNow() - mountAtRef.current,
+          });
           homeLog('[HOME PERF] video first frame', {
             id: videoId,
-            isActive,
+            isActive: true,
             time: perfNow(),
             sinceMountMs: perfNow() - mountAtRef.current,
           });
@@ -1282,12 +2087,10 @@ const HeroVideoSlide = React.memo(function HeroVideoSlide({
             reportedReadyRef.current = true;
             onReady?.();
           }
-          if (isActive) {
-            try {
-              player.play();
-            } catch {
-              // Ignore transient native state.
-            }
+          try {
+            player.play();
+          } catch {
+            // Ignore transient native state.
           }
         }}
       />
@@ -1305,6 +2108,26 @@ const HeroVideoSlide = React.memo(function HeroVideoSlide({
         )
       ) : null}
     </View>
+  );
+});
+
+const HeroVideoSlide = React.memo(function HeroVideoSlide({
+  uri,
+  isActive,
+  posterSource,
+  onReady,
+}: HeroVideoSlideProps) {
+  if (!isActive) {
+    return <HeroVideoSlidePoster posterSource={posterSource} />;
+  }
+
+  return (
+    <HeroVideoSlidePlayer
+      uri={uri}
+      isActive={isActive}
+      posterSource={posterSource}
+      onReady={onReady}
+    />
   );
 });
 
@@ -1453,6 +2276,7 @@ const HeroImageSlide = React.memo(function HeroImageSlide({
           transition={120}
           onLoad={() => {
             console.log('HOME_SLIDE_MEDIA_LOADED', { type: 'image', uri });
+            slideshowPerfLog('[NOOD slideshow perf] first frame ready', { type: 'image', uri });
             reportReady();
           }}
           onError={(error) => {
@@ -1485,6 +2309,44 @@ function heroSlideItemPropsAreEqual(
   return true;
 }
 
+function HeroSlideStaticPoster({
+  imageUrl,
+  posterSource,
+}: {
+  imageUrl?: string;
+  posterSource?: ImageSourcePropType;
+}) {
+  if (imageUrl) {
+    return (
+      <View style={styles.heroSlideMedia}>
+        <ExpoImage
+          source={{ uri: imageUrl }}
+          style={styles.heroSlideMedia}
+          contentFit="cover"
+          cachePolicy="memory-disk"
+          transition={0}
+        />
+      </View>
+    );
+  }
+
+  if (posterSource) {
+    return (
+      <View style={styles.heroSlideMedia}>
+        <ExpoImage
+          source={posterSource}
+          style={styles.heroSlideMedia}
+          contentFit="cover"
+          cachePolicy="memory-disk"
+          transition={0}
+        />
+      </View>
+    );
+  }
+
+  return <View style={styles.heroSlideFallback} />;
+}
+
 const HeroSlideItem = React.memo(function HeroSlideItem({
   slide,
   index,
@@ -1496,6 +2358,8 @@ const HeroSlideItem = React.memo(function HeroSlideItem({
 }: HeroSlideItemProps) {
   const isActive = index === activePhysicalIndex;
   const isNearActive = Math.abs(index - activePhysicalIndex) <= 1;
+
+  useSlideshowRenderCounter('HeroSlideItem');
 
   useEffect(() => {
     if (!HOME_PERF_INVESTIGATION_ENABLED) return;
@@ -1512,20 +2376,20 @@ const HeroSlideItem = React.memo(function HeroSlideItem({
   return (
     <View style={[styles.heroSlide, { width: width || 1 }]}>
       {slide.type === 'updates' ? (
-        isNearActive ? (
+        isActive ? (
           <HeroUpdatesSlide onOpenUpdates={onOpenUpdates} />
         ) : (
-          <View style={styles.heroSlideFallback} />
+          <HeroSlideStaticPoster posterSource={HERO_IMAGE_FALLBACK_SOURCE} />
         )
       ) : slide.id === 'customer-update-2' ? (
-        isNearActive ? (
+        isActive ? (
           <HaulSavingsSlide
             title={slide.title}
             subtitle={slide.subtitle}
             onReady={() => onMediaReady?.(index)}
           />
         ) : (
-          <View style={styles.heroSlideFallback} />
+          <HeroSlideStaticPoster imageUrl={slide.imageUrl} />
         )
       ) : (
         <>
@@ -1538,22 +2402,18 @@ const HeroSlideItem = React.memo(function HeroSlideItem({
                 onReady={() => onMediaReady?.(index)}
               />
             ) : (
-              <View style={styles.heroSlideMedia}>
-                <ExpoImage
-                  source={slide.posterSource ?? HERO_VIDEO_POSTER_SOURCE}
-                  style={styles.heroSlideMedia}
-                  contentFit="cover"
-                  cachePolicy="memory-disk"
-                  transition={0}
-                />
-              </View>
+              <HeroVideoSlidePoster posterSource={slide.posterSource ?? HERO_VIDEO_POSTER_SOURCE} />
             )
           ) : slide.imageUrl ? (
-            <HeroImageSlide
-              uri={slide.imageUrl}
-              posterUrl={slide.posterUrl ?? slide.imageUrl}
-              onReady={() => onMediaReady?.(index)}
-            />
+            isNearActive ? (
+              <HeroImageSlide
+                uri={slide.imageUrl}
+                posterUrl={slide.posterUrl ?? slide.imageUrl}
+                onReady={() => onMediaReady?.(index)}
+              />
+            ) : (
+              <HeroSlideStaticPoster imageUrl={slide.posterUrl ?? slide.imageUrl} />
+            )
           ) : (
             <View style={styles.heroSlideFallback} />
           )}
@@ -1739,21 +2599,36 @@ const HeroUpdatesSlide = React.memo(function HeroUpdatesSlide({
 type HeroSlideshowProps = {
   requestedSlideIndex?: number | null;
   requestedSlideKey?: number;
+  onFirstSlideReady?: () => void;
 };
 
 const HomeSlideshow = React.memo(function HomeSlideshow({
   requestedSlideIndex = null,
   requestedSlideKey = 0,
+  onFirstSlideReady,
 }: HeroSlideshowProps) {
   useHomeRenderCounter('HomeSlideshow');
+  useSlideshowRenderCounter('HomeSlideshow');
+  const onFirstSlideReadyRef = useRef(onFirstSlideReady);
+
+  useEffect(() => {
+    onFirstSlideReadyRef.current = onFirstSlideReady;
+  }, [onFirstSlideReady]);
+
   useLayoutEffect(() => {
+    console.log('[NOOD home] slideshow mounted');
+    slideshowPerfLog('[NOOD slideshow perf] mount', {
+      loopedSlideCount: HOME_HERO_SLIDES.length + 2,
+      time: perfNow(),
+    });
+
     if (homePerfInvestigation.heroMounted) return;
 
     homePerfInvestigation.heroMounted = true;
     homeLog('[HOME PERF] hero mounted', perfNow());
     homeLog('[HOME PERF] hero slideshow config', {
       loopedSlideCount: HOME_HERO_SLIDES.length + 2,
-      initialNumToRender: 3,
+      initialNumToRender: 2,
       windowSize: 3,
       lazyVideoMount: true,
       removeClippedSubviews: false,
@@ -1809,7 +2684,7 @@ const HomeSlideshow = React.memo(function HomeSlideshow({
     const link = SLIDE_3_SHOP_NOW_LINK.trim();
 
     if (!link) {
-      Alert.alert('Shop Now', 'Send the link and I will connect this button.');
+      noodAlert('Shop Now', 'Send the link and I will connect this button.');
       return;
     }
 
@@ -1840,6 +2715,7 @@ const HomeSlideshow = React.memo(function HomeSlideshow({
   }, []);
 
   const setActiveIndexes = useCallback((nextIndex: number, nextPhysicalIndex = nextIndex) => {
+    const previousPhysicalIndex = activePhysicalIndexRef.current;
     activeIndexRef.current = nextIndex;
     activePhysicalIndexRef.current = nextPhysicalIndex;
     setActiveIndex((currentIndex) => (currentIndex === nextIndex ? currentIndex : nextIndex));
@@ -1847,6 +2723,13 @@ const HomeSlideshow = React.memo(function HomeSlideshow({
       currentIndex === nextPhysicalIndex ? currentIndex : nextPhysicalIndex
     );
     homePerfInvestigation.slideChanges += 1;
+    if (previousPhysicalIndex !== nextPhysicalIndex) {
+      slideshowPerfLog('[NOOD slideshow perf] active slide changed', {
+        logicalIndex: nextIndex,
+        physicalIndex: nextPhysicalIndex,
+        previousPhysicalIndex,
+      });
+    }
     homeLog('[HOME PERF] slide changed', {
       index: nextIndex,
       physicalIndex: nextPhysicalIndex,
@@ -1900,15 +2783,24 @@ const HomeSlideshow = React.memo(function HomeSlideshow({
 
   useEffect(() => {
     let mounted = true;
+    let deferredPrefetch: { cancel?: () => void } | null = null;
 
-    void prefetchHomeHeroSlides(heroSlides).finally(() => {
-      if (mounted && homeHeroSlidesPrefetched && firstSlideReadyRef.current) {
-        scheduleAutoplay();
-      }
+    const runPrefetch = () => {
+      void prefetchHomeHeroSlides(heroSlides).finally(() => {
+        if (mounted && homeHeroSlidesPrefetched && firstSlideReadyRef.current) {
+          scheduleAutoplay();
+        }
+      });
+    };
+
+    deferredPrefetch = InteractionManager.runAfterInteractions(() => {
+      if (!mounted) return;
+      requestAnimationFrame(runPrefetch);
     });
 
     return () => {
       mounted = false;
+      deferredPrefetch?.cancel?.();
     };
   }, [heroSlides, scheduleAutoplay]);
 
@@ -1919,9 +2811,14 @@ const HomeSlideshow = React.memo(function HomeSlideshow({
 
       firstSlideReadyRef.current = true;
       setFirstSlideReady(true);
+      slideshowPerfLog('[NOOD slideshow perf] first frame ready', {
+        physicalIndex: index,
+        slideId: heroSlides[0]?.id || 'unknown',
+      });
+      onFirstSlideReadyRef.current?.();
       scheduleAutoplay();
     },
-    [scheduleAutoplay]
+    [heroSlides, scheduleAutoplay]
   );
 
   const jumpToPhysicalIndex = useCallback(
@@ -2063,13 +2960,13 @@ const HomeSlideshow = React.memo(function HomeSlideshow({
         slide={item}
         index={index}
         width={sliderWidth}
-        activePhysicalIndex={activePhysicalIndexRef.current}
+        activePhysicalIndex={activePhysicalIndex}
         onOpenUpdates={openUpdatesPage}
         onOpenSlide3ShopNow={openSlide3ShopNow}
         onMediaReady={handleMediaReady}
       />
     ),
-    [handleMediaReady, openSlide3ShopNow, openUpdatesPage, sliderWidth]
+    [activePhysicalIndex, handleMediaReady, openSlide3ShopNow, openUpdatesPage, sliderWidth]
   );
 
   const handleScrollBeginDrag = useCallback(() => {
@@ -2104,8 +3001,8 @@ const HomeSlideshow = React.memo(function HomeSlideshow({
           bounces={false}
           removeClippedSubviews={false}
           initialScrollIndex={physicalFirstIndex}
-          initialNumToRender={3}
-          maxToRenderPerBatch={2}
+          initialNumToRender={2}
+          maxToRenderPerBatch={1}
           windowSize={3}
           getItemLayout={getItemLayout}
           onMomentumScrollEnd={handleMomentumScrollEnd}
@@ -2152,11 +3049,18 @@ export default function HomeScreen() {
   const router = useRouter();
   const navigation = useNavigation();
   const pathname = usePathname();
-  const isHomeTabActive = useNavigationState(
-    (state) => state.routes[state.index]?.name === 'index'
-  );
-  const shouldIgnoreHomeTabPress = isHomeTabActive && isHomeTabPath(pathname);
-  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+
+  const [slideshowFirstFrameReady, setSlideshowFirstFrameReady] = useState(false);
+  const slideshowFirstFrameReadyRef = useRef(false);
+  const homeProductsBootstrappedRef = useRef(Boolean(homeSessionSnapshot));
+  const firstProductsRenderedLoggedRef = useRef(Boolean(homeSessionSnapshot?.products.length));
+  const homeReadyTimeLoggedRef = useRef(false);
+
+  const handleSlideshowFirstFrameReady = useCallback(() => {
+    if (slideshowFirstFrameReadyRef.current) return;
+    slideshowFirstFrameReadyRef.current = true;
+    setSlideshowFirstFrameReady(true);
+  }, []);
 
   const [allProducts, setAllProducts] = useState<ShopifyProduct[]>(
     () => homeSessionSnapshot?.allProducts ?? []
@@ -2175,11 +3079,11 @@ export default function HomeScreen() {
 
   const {
     addToCart,
-    cartCount,
     selectedCurrency = BASE_CURRENCY,
     convertPrice: convertCurrencyPrice,
     formatMoney: formatCurrencyMoney,
   } = useCart();
+  const { isAuthLoading } = useUser();
 
   const [loading, setLoading] = useState(!homeSessionSnapshot);
   const [refreshing, setRefreshing] = useState(false);
@@ -2190,9 +3094,9 @@ export default function HomeScreen() {
     () => homeSessionSnapshot?.hotBadgeSeed ?? getRandomSeed()
   );
   const [feedMixKey, setFeedMixKey] = useState(() => getRandomSeed());
-  const [balancedFeedProducts, setBalancedFeedProducts] = useState<ShopifyProduct[]>([]);
+
   const [visibleProductCount, setVisibleProductCount] = useState(
-    () => homeSessionSnapshot?.visibleProductCount ?? HOME_VISIBLE_PRODUCTS_STEP
+    () => homeSessionSnapshot?.visibleProductCount ?? HOME_INITIAL_VISIBLE_PRODUCTS
   );
   const [nextProductsCursor, setNextProductsCursor] = useState<string | null>(
     () => homeSessionSnapshot?.nextProductsCursor ?? null
@@ -2206,38 +3110,57 @@ export default function HomeScreen() {
     key: 0,
   });
   const [cameraVisible, setCameraVisible] = useState(false);
-  const [takingPicture, setTakingPicture] = useState(false);
+  const [galleryPreviewPhoto, setGalleryPreviewPhoto] = useState<CameraSearchPhoto | null>(null);
+
   const [visualSearchLoading, setVisualSearchLoading] = useState(false);
   const [visualSearchMode, setVisualSearchMode] = useState(false);
+  const [homeCollectionShortcuts, setHomeCollectionShortcuts] = useState<HomeCollectionShortcut[]>(
+    []
+  );
+  const [laceFrontProducts, setLaceFrontProducts] = useState<ShopifyProduct[]>(
+    () => homeSessionSnapshot?.laceFrontProducts ?? []
+  );
+  const [laceFrontLoading, setLaceFrontLoading] = useState(
+    () => !homeSessionSnapshot?.laceFrontProducts?.length
+  );
+  const [laceFrontVideosReady, setLaceFrontVideosReady] = useState(false);
+  const laceFrontProductsRef = useRef(laceFrontProducts);
+  const laceFrontReadyLoggedRef = useRef(false);
+  const laceFrontMountAtRef = useRef(perfNow());
 
   const isFetchingRef = React.useRef(false);
   const isFetchingMoreRef = React.useRef(false);
+  const isPrefetchingFeedRef = useRef(false);
   const loadMoreLockedRef = useRef(false);
   const lastLoadMoreAtRef = useRef(0);
+  const lastScrollPrefetchAtRef = useRef(0);
+  const firstFeedPrefetchDoneRef = useRef(Boolean(homeSessionSnapshot?.allProducts?.length));
+  const visibleProductCountRef = useRef(visibleProductCount);
   const allProductsRef = useRef<ShopifyProduct[]>([]);
   const nextProductsCursorRef = useRef<string | null>(nextProductsCursor);
   const hasMoreProductsRef = useRef(hasMoreProducts);
   const catalogDrainActiveRef = useRef(false);
+  const catalogDrainTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastCatalogDrainAtRef = useRef(0);
+  const homeUserScrollingRef = useRef(false);
+  const homePerfScreenSummaryLoggedRef = useRef({
+    filter: false,
+    visible: false,
+  });
   const homeFeedSessionRef = useRef(getHomeProductFeedSession());
   const enrichInFlightRef = useRef(false);
-  const balancedFeedMixKeyRef = useRef(feedMixKey);
   const feedMixKeyRef = useRef(feedMixKey);
-  const balancedFeedRef = useRef<ShopifyProduct[]>([]);
   const pendingRefreshSnapshotRef = useRef<{
     products: ShopifyProduct[];
     nextCursor: string | null;
     hasMore: boolean;
     mixKey: number;
-    balancedFeedProducts: ShopifyProduct[];
   } | null>(null);
   const filteredProductsLengthRef = useRef(0);
   const listRef = useRef<FlatList<ShopifyProduct>>(null);
-  const cameraRef = useRef<CameraView>(null);
+
   const homeScrollOffsetRef = useRef(homeSessionSnapshot?.scrollOffset ?? 0);
   const restoredHomeScrollRef = useRef(false);
-
-  const scale = useRef(new Animated.Value(1)).current;
-  const rotate = useRef(new Animated.Value(0)).current;
 
   const currencyConversionCountRef = useRef(0);
 
@@ -2299,6 +3222,45 @@ export default function HomeScreen() {
   }, [feedMixKey]);
 
   useEffect(() => {
+    return () => {
+      homeFeedSessionRef.current = startHomeProductFeedSession();
+      enrichInFlightRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    laceFrontProductsRef.current = laceFrontProducts;
+  }, [laceFrontProducts]);
+
+  useEffect(() => {
+    if (laceFrontVideosReady) return;
+
+    let mounted = true;
+    const markReady = (reason: string) => {
+      if (!mounted) return;
+      setLaceFrontVideosReady(true);
+      console.log('[NOOD lacefront] videos mounted', { reason });
+    };
+
+    const task = InteractionManager.runAfterInteractions(() => {
+      markReady('after-interactions');
+    });
+    const fallbackTimer = setTimeout(() => {
+      markReady('timeout-fallback');
+    }, 1800);
+
+    return () => {
+      mounted = false;
+      clearTimeout(fallbackTimer);
+      task.cancel?.();
+    };
+  }, [laceFrontVideosReady]);
+
+  useEffect(() => {
+    visibleProductCountRef.current = visibleProductCount;
+  }, [visibleProductCount]);
+
+  useEffect(() => {
     nextProductsCursorRef.current = nextProductsCursor;
   }, [nextProductsCursor]);
 
@@ -2311,8 +3273,9 @@ export default function HomeScreen() {
 
     homeSessionSnapshot = {
       allProducts,
-      products,
+      products: visualSearchMode ? products : allProducts,
       showcaseProducts,
+      laceFrontProducts,
       nextProductsCursor,
       hasMoreProducts,
       hotBadgeSeed,
@@ -2324,11 +3287,13 @@ export default function HomeScreen() {
     hasMoreProducts,
     homeContentReady,
     hotBadgeSeed,
+    laceFrontProducts,
     loading,
     nextProductsCursor,
     products,
     showcaseProducts,
     visibleProductCount,
+    visualSearchMode,
   ]);
 
   useEffect(() => {
@@ -2405,10 +3370,10 @@ export default function HomeScreen() {
       const oldPriceAmount = edge.node.compareAtPriceRange?.maxVariantPrice?.amount
         ? Number(edge.node.compareAtPriceRange.maxVariantPrice.amount)
         : null;
-      const currencyCode =
+      const currencyCode = normalizeCatalogCurrencyCode(
         edge.node.priceRange?.minVariantPrice?.currencyCode ||
-        edge.node.compareAtPriceRange?.maxVariantPrice?.currencyCode ||
-        BASE_CURRENCY;
+          edge.node.compareAtPriceRange?.maxVariantPrice?.currencyCode
+      );
       const collectionHandles =
         edge.node.collections?.edges?.map((c: any) => c.node?.handle).filter(Boolean) || [];
       const collectionTitles =
@@ -2419,15 +3384,14 @@ export default function HomeScreen() {
         matchedCollection,
         collectionTitles
       );
-      const firstVariant = edge.node.variants?.edges?.[0]?.node || null;
+      const firstVariant = getFirstPurchasableVariant(getVariantNodes(edge.node));
 
-      const product = {
+      const product: ShopifyProduct = {
         id: String(edge.node.id),
         title: edge.node.title,
         handle: edge.node.handle,
         brand: edge.node.vendor || '',
         category: productCategory,
-        description: edge.node.description || '',
         tags: Array.isArray(edge.node.tags) ? edge.node.tags : [],
         image: getOptimizedImageUrl(edge.node.featuredImage?.url),
         imageWidth: edge.node.featuredImage?.width ?? null,
@@ -2441,18 +3405,23 @@ export default function HomeScreen() {
         collectionTitle: collectionTitles[0] || matchedCollection,
         collectionHandles,
         collectionTitles,
-        availableForSale: Boolean(edge.node.availableForSale ?? firstVariant?.availableForSale ?? true),
+        availableForSale: resolveListProductAvailableForSale({
+          availableForSale: edge.node.availableForSale,
+          variantId: firstVariant?.id ? String(firstVariant.id) : undefined,
+        }),
         variantId: firstVariant?.id ? String(firstVariant.id) : undefined,
         variantTitle: firstVariant?.title ? String(firstVariant.title) : undefined,
       };
-      console.log('[NOOD product load] home all product first variant', {
-        title: edge.node.title,
-        handle: edge.node.handle,
-        productId: edge.node.id,
-        variantId: firstVariant?.id || '',
-        variantTitle: firstVariant?.title || '',
-      });
-      return product;
+      if (PRODUCT_LOAD_DEBUG) {
+        console.log('[NOOD product load] home all product first variant', {
+          title: edge.node.title,
+          handle: edge.node.handle,
+          productId: edge.node.id,
+          variantId: firstVariant?.id || '',
+          variantTitle: firstVariant?.title || '',
+        });
+      }
+      return slimHomeListProduct(product) as ShopifyProduct;
       })
       .filter((product): product is ShopifyProduct => Boolean(product));
   }, []);
@@ -2464,24 +3433,23 @@ export default function HomeScreen() {
         const oldPriceAmount = edge.node.compareAtPriceRange?.maxVariantPrice?.amount
           ? Number(edge.node.compareAtPriceRange.maxVariantPrice.amount)
           : null;
-        const currencyCode =
+        const currencyCode = normalizeCatalogCurrencyCode(
           edge.node.priceRange?.minVariantPrice?.currencyCode ||
-          edge.node.compareAtPriceRange?.maxVariantPrice?.currencyCode ||
-          BASE_CURRENCY;
+            edge.node.compareAtPriceRange?.maxVariantPrice?.currencyCode
+        );
         const collectionHandles =
           edge.node.collections?.edges?.map((c: any) => c.node?.handle).filter(Boolean) ||
           [collectionHandle];
         const collectionTitles =
           edge.node.collections?.edges?.map((c: any) => c.node?.title).filter(Boolean) || [];
-        const firstVariant = edge.node.variants?.edges?.[0]?.node || null;
+        const firstVariant = getFirstPurchasableVariant(getVariantNodes(edge.node));
 
-        const product = {
+        const product: ShopifyProduct = {
           id: String(edge.node.id),
           title: edge.node.title,
           handle: edge.node.handle,
           brand: edge.node.vendor || '',
           category: edge.node.productType || collectionHandle,
-          description: edge.node.description || '',
           tags: Array.isArray(edge.node.tags) ? edge.node.tags : [],
           image: getOptimizedImageUrl(edge.node.featuredImage?.url),
           imageWidth: edge.node.featuredImage?.width ?? null,
@@ -2495,18 +3463,23 @@ export default function HomeScreen() {
           collectionTitle: collectionTitles[0] || collectionHandle,
           collectionHandles,
           collectionTitles,
-          availableForSale: Boolean(edge.node.availableForSale ?? firstVariant?.availableForSale ?? true),
+          availableForSale: resolveListProductAvailableForSale({
+            availableForSale: edge.node.availableForSale,
+            variantId: firstVariant?.id ? String(firstVariant.id) : undefined,
+          }),
           variantId: firstVariant?.id ? String(firstVariant.id) : undefined,
           variantTitle: firstVariant?.title ? String(firstVariant.title) : undefined,
         };
-        console.log('[NOOD product load] home collection product first variant', {
-          title: edge.node.title,
-          handle: edge.node.handle,
-          productId: edge.node.id,
-          variantId: firstVariant?.id || '',
-          variantTitle: firstVariant?.title || '',
-        });
-        return product;
+        if (PRODUCT_LOAD_DEBUG) {
+          console.log('[NOOD product load] home collection product first variant', {
+            title: edge.node.title,
+            handle: edge.node.handle,
+            productId: edge.node.id,
+            variantId: firstVariant?.id || '',
+            variantTitle: firstVariant?.title || '',
+          });
+        }
+        return slimHomeListProduct(product) as ShopifyProduct;
       });
     },
     []
@@ -2520,33 +3493,159 @@ export default function HomeScreen() {
       mixKey = feedMixKeyRef.current
     ) => {
       const startedAt = perfNow();
-      homeLog('[HOME PERF] cache write start', {
-        type: 'home-products',
-        count: products.length,
-        time: startedAt,
-      });
-
-      await AsyncStorage.setItem(
-        HOME_PRODUCTS_CACHE_KEY,
-        JSON.stringify({
-          version: HOME_PRODUCTS_CACHE_VERSION,
-          products,
-          nextCursor: cursor,
-          hasMore,
-          mixKey,
-          savedAt: new Date().toISOString(),
-        } satisfies HomeProductsCache)
+      const beforeCount = products.length;
+      const { products: trimmedProducts, trimmedCount } = trimProductsForCache(
+        slimHomeListProducts(products) as ShopifyProduct[],
+        MAX_CACHED_HOME_PRODUCTS
       );
+      const payload = JSON.stringify({
+        version: HOME_PRODUCTS_CACHE_VERSION,
+        products: trimmedProducts as ShopifyProduct[],
+        nextCursor: cursor,
+        hasMore,
+        mixKey,
+        savedAt: new Date().toISOString(),
+      } satisfies HomeProductsCache);
+
+      let errorCode: string | null = null;
+
+      const writeOnce = async () => {
+        await AsyncStorage.setItem(HOME_PRODUCTS_CACHE_KEY, payload);
+      };
+
+      try {
+        await writeOnce();
+      } catch (error) {
+        if (!isStorageFullError(error)) {
+          console.log('Home products cache write error:', error);
+          return;
+        }
+
+        errorCode = 'SQLITE_FULL';
+        try {
+          await emergencyPruneCatalogStorage({ aggressive: true });
+          await writeOnce();
+          errorCode = null;
+        } catch (retryError) {
+          errorCode = isStorageFullError(retryError) ? 'SQLITE_FULL' : 'WRITE_FAILED';
+          console.log('Home products cache write error after cleanup:', retryError);
+          return;
+        }
+      }
 
       homeLog('[HOME PERF] cache write end', {
         type: 'home-products',
-        count: products.length,
+        count: trimmedProducts.length,
         durationMs: perfNow() - startedAt,
         time: perfNow(),
+      });
+
+      catalogCacheDebugSummary({
+        scope: 'home-products',
+        beforeCount,
+        insertCount: 1,
+        afterCount: trimmedProducts.length,
+        deletedOldRows: trimmedCount,
+        durationMs: perfNow() - startedAt,
+        errorCode,
       });
     },
     []
   );
+
+  const loadLaceFrontProducts = useCallback(
+    async (options: { fromCacheOnly?: boolean } = {}) => {
+      const startedAt = perfNow();
+
+      try {
+        const cachedProducts = await readLaceFrontProductsCache();
+        console.log('[NOOD lacefront] product cache count', cachedProducts.length);
+
+        if (cachedProducts.length) {
+          if (!laceFrontProductsRef.current.length) {
+            laceFrontProductsRef.current = cachedProducts;
+            setLaceFrontProducts(cachedProducts);
+          }
+          setLaceFrontLoading(false);
+        }
+
+        if (options.fromCacheOnly) {
+          if (!laceFrontReadyLoggedRef.current && laceFrontProductsRef.current.length) {
+            laceFrontReadyLoggedRef.current = true;
+            console.log(
+              '[NOOD lacefront] ready time ms',
+              Math.round(perfNow() - laceFrontMountAtRef.current)
+            );
+          }
+          return;
+        }
+
+        if (!laceFrontProductsRef.current.length && !cachedProducts.length) {
+          setLaceFrontLoading(true);
+        }
+
+        const json = await catalogFetch(COLLECTION_PRODUCTS_QUERY, {
+          handle: LACE_FRONT_COLLECTION_HANDLE,
+          first: LACE_FRONT_PRODUCTS_LIMIT,
+        });
+        const edges = json?.data?.collectionByHandle?.products?.edges || [];
+        const fetchedProducts = mapCollectionProducts(edges, LACE_FRONT_COLLECTION_HANDLE).slice(
+          0,
+          LACE_FRONT_PRODUCTS_LIMIT
+        );
+        console.log('[NOOD lacefront] backend product count', fetchedProducts.length);
+
+        const nextProducts =
+          fetchedProducts.length > 0
+            ? fetchedProducts
+            : laceFrontProductsRef.current.length
+              ? laceFrontProductsRef.current
+              : cachedProducts;
+
+        if (nextProducts.length) {
+          laceFrontProductsRef.current = nextProducts;
+          setLaceFrontProducts(nextProducts);
+          setShowcaseProducts((current) => ({
+            ...current,
+            [LACE_FRONT_COLLECTION_HANDLE]: nextProducts,
+          }));
+          await saveLaceFrontProductsCache(nextProducts);
+        }
+      } catch (error) {
+        console.log('[NOOD lacefront] backend fetch failed', String(error));
+        if (!laceFrontProductsRef.current.length) {
+          const cachedProducts = await readLaceFrontProductsCache();
+          if (cachedProducts.length) {
+            laceFrontProductsRef.current = cachedProducts;
+            setLaceFrontProducts(cachedProducts);
+          }
+        }
+      } finally {
+        setLaceFrontLoading(false);
+        if (!laceFrontReadyLoggedRef.current) {
+          laceFrontReadyLoggedRef.current = true;
+          console.log(
+            '[NOOD lacefront] ready time ms',
+            Math.round(perfNow() - laceFrontMountAtRef.current)
+          );
+        }
+        homeLog('[HOME PERF] lacefront refresh end', {
+          durationMs: perfNow() - startedAt,
+          count: laceFrontProductsRef.current.length,
+          time: perfNow(),
+        });
+      }
+    },
+    [mapCollectionProducts]
+  );
+
+  useEffect(() => {
+    laceFrontMountAtRef.current = perfNow();
+    void (async () => {
+      await loadLaceFrontProducts({ fromCacheOnly: true });
+      void loadLaceFrontProducts();
+    })();
+  }, [loadLaceFrontProducts]);
 
   const mixTrendingFromShowcase = useCallback(
     (showcase: Record<string, ShopifyProduct[]>, mixSeed = feedMixKeyRef.current) => {
@@ -2621,7 +3720,7 @@ export default function HomeScreen() {
 
     void AsyncStorage.setItem(
       HOME_SHOWCASE_CACHE_KEY,
-      JSON.stringify(nextShowcaseProducts satisfies HomeShowcaseCache)
+      JSON.stringify(slimShowcaseProducts(nextShowcaseProducts) satisfies HomeShowcaseCache)
     ).catch((error) => {
       console.log('Home showcase cache write error:', error);
     });
@@ -2643,7 +3742,6 @@ export default function HomeScreen() {
       nextCursor: nextProductsCursorRef.current,
       hasMore: hasMoreProductsRef.current,
       mixKey: feedMixKeyRef.current,
-      balancedFeedProducts: [...balancedFeedRef.current],
     };
   }, []);
 
@@ -2661,14 +3759,9 @@ export default function HomeScreen() {
 
     feedMixKeyRef.current = snapshot.mixKey;
     setFeedMixKey(snapshot.mixKey);
-    setAllProducts(snapshot.products);
-    setProducts(snapshot.products);
-    balancedFeedRef.current = snapshot.balancedFeedProducts.length
-      ? snapshot.balancedFeedProducts
-      : snapshot.products;
-    balancedFeedMixKeyRef.current = snapshot.mixKey;
-    setBalancedFeedProducts(balancedFeedRef.current);
-    allProductsRef.current = snapshot.products;
+    const memoryProducts = capHomeProductsForMemory(snapshot.products);
+    setAllProducts(memoryProducts);
+    allProductsRef.current = memoryProducts;
     setNextProductsCursor(snapshot.nextCursor);
     setHasMoreProducts(snapshot.hasMore);
     nextProductsCursorRef.current = snapshot.nextCursor;
@@ -2703,11 +3796,18 @@ export default function HomeScreen() {
       console.log(
         `[NOOD home] page request mixKey=${mixKey} cursor=${after ?? 'null'}`
       );
+      const fetchStartedAt = Date.now();
+      console.log('[NOOD home] backend fetch start', { cursor: after ?? 'null' });
 
       const feedResult = await fetchHomeProductFeedPath(path, {
         session,
         mixKey,
         manualRefresh,
+      });
+      console.log('[NOOD home] backend fetch end', {
+        durationMs: Date.now() - fetchStartedAt,
+        failed: feedResult.failed,
+        cancelled: feedResult.cancelled,
       });
 
       if (!isHomeProductFeedSessionActive(session)) {
@@ -2790,16 +3890,17 @@ export default function HomeScreen() {
         const uniqueProducts = page.products.filter((product) => !seen.has(product.id));
         if (!uniqueProducts.length) break;
 
-        const nextProducts = [...allProductsRef.current, ...uniqueProducts];
-        setAllProducts(nextProducts);
-        setProducts(nextProducts);
-        balancedFeedRef.current = nextProducts;
-        setBalancedFeedProducts(nextProducts);
+        const memoryProducts = capHomeProductsForMemory([
+          ...allProductsRef.current,
+          ...uniqueProducts,
+        ]);
+        allProductsRef.current = memoryProducts;
+        setAllProducts(memoryProducts);
         setHasMoreProducts(Boolean(page.hasNextPage && page.endCursor));
         setNextProductsCursor(page.endCursor);
 
         void persistHomeProductsCache(
-          nextProducts,
+          memoryProducts,
           page.endCursor,
           Boolean(page.hasNextPage && page.endCursor)
         ).catch((error) => {
@@ -2824,23 +3925,20 @@ export default function HomeScreen() {
       hasMore = false,
       options: { persist?: boolean } = {}
     ) => {
-      setAllProducts(nextProducts);
-      setProducts(nextProducts);
-      balancedFeedRef.current = nextProducts;
-      balancedFeedMixKeyRef.current = feedMixKeyRef.current;
-      setBalancedFeedProducts(nextProducts);
+      const memoryProducts = capHomeProductsForMemory(nextProducts);
+      setAllProducts(memoryProducts);
       setNextProductsCursor(cursor);
       setHasMoreProducts(hasMore);
-      allProductsRef.current = nextProducts;
+      allProductsRef.current = memoryProducts;
       nextProductsCursorRef.current = cursor;
       hasMoreProductsRef.current = hasMore;
       setHomeContentReady(true);
       setLoading(false);
       setRefreshing(false);
 
-      const shouldPersist = options.persist !== false && nextProducts.length > 0;
+      const shouldPersist = options.persist !== false && memoryProducts.length > 0;
       if (shouldPersist) {
-        void persistHomeProductsCache(nextProducts, cursor, hasMore).catch((error) => {
+        void persistHomeProductsCache(memoryProducts, cursor, hasMore).catch((error) => {
           console.log('Home products cache write error:', error);
         });
       }
@@ -2883,15 +3981,15 @@ export default function HomeScreen() {
         return { ...page, failed: true };
       }
 
-      const nextProducts = [...allProductsRef.current, ...uniqueProducts];
-      const addedCount = nextProducts.length - allProductsRef.current.length;
+      const beforeCount = allProductsRef.current.length;
+      const memoryProducts = capHomeProductsForMemory([
+        ...allProductsRef.current,
+        ...uniqueProducts,
+      ]);
+      const addedCount = memoryProducts.length - beforeCount;
 
-      setAllProducts(nextProducts);
-      setProducts(nextProducts);
-      balancedFeedRef.current = nextProducts;
-      balancedFeedMixKeyRef.current = feedMixKeyRef.current;
-      setBalancedFeedProducts(nextProducts);
-      allProductsRef.current = nextProducts;
+      allProductsRef.current = memoryProducts;
+      setAllProducts(memoryProducts);
 
       const nextHasMore = Boolean(page.hasNextPage && page.endCursor);
       setNextProductsCursor(page.endCursor);
@@ -2899,8 +3997,8 @@ export default function HomeScreen() {
       nextProductsCursorRef.current = page.endCursor;
       hasMoreProductsRef.current = nextHasMore;
 
-      if (nextProducts.length > 0) {
-        await persistHomeProductsCache(nextProducts, page.endCursor, nextHasMore);
+      if (memoryProducts.length > 0) {
+        await persistHomeProductsCache(memoryProducts, page.endCursor, nextHasMore);
       }
 
       console.log(
@@ -2912,14 +4010,43 @@ export default function HomeScreen() {
     [fetchStoreProductsPage, persistHomeProductsCache]
   );
 
+  const scheduleCatalogDrainRetry = useCallback(() => {
+    if (catalogDrainTimerRef.current) return;
+
+    catalogDrainTimerRef.current = setTimeout(() => {
+      catalogDrainTimerRef.current = null;
+      InteractionManager.runAfterInteractions(() => {
+        void drainRemainingCatalogPagesRef.current?.();
+      });
+    }, HOME_CATALOG_DRAIN_IDLE_DELAY_MS);
+  }, []);
+
+  const drainRemainingCatalogPagesRef = useRef<(() => Promise<void>) | null>(null);
+
   const drainRemainingCatalogPages = useCallback(async () => {
     if (catalogDrainActiveRef.current) return;
+
+    if (homeUserScrollingRef.current) {
+      scheduleCatalogDrainRetry();
+      return;
+    }
+
+    if (Date.now() - lastCatalogDrainAtRef.current < HOME_CATALOG_DRAIN_COOLDOWN_MS) {
+      scheduleCatalogDrainRetry();
+      return;
+    }
+
+    if (allProductsRef.current.length >= MAX_IN_MEMORY_HOME_PRODUCTS) {
+      console.log('[NOOD home] drain skipped in-memory product limit reached');
+      return;
+    }
 
     catalogDrainActiveRef.current = true;
 
     const preservedCursor = nextProductsCursorRef.current;
     const preservedHasMore = hasMoreProductsRef.current;
     let reachedCatalogEnd = false;
+    let pagesDrained = 0;
 
     try {
       if (!preservedHasMore || !preservedCursor) {
@@ -2927,16 +4054,21 @@ export default function HomeScreen() {
         return;
       }
 
-      while (hasMoreProductsRef.current && nextProductsCursorRef.current) {
-        if (isFetchingMoreRef.current) {
-          await new Promise((resolve) => setTimeout(resolve, 250));
-          continue;
+      while (
+        pagesDrained < HOME_CATALOG_DRAIN_MAX_PAGES_PER_RUN &&
+        hasMoreProductsRef.current &&
+        nextProductsCursorRef.current &&
+        allProductsRef.current.length < MAX_IN_MEMORY_HOME_PRODUCTS
+      ) {
+        if (homeUserScrollingRef.current || isFetchingMoreRef.current) {
+          break;
         }
 
         isFetchingMoreRef.current = true;
 
         try {
           const page = await appendStoreProductsPage(nextProductsCursorRef.current);
+          pagesDrained += 1;
           if (page.cancelled || page.failed) {
             break;
           }
@@ -2958,14 +4090,32 @@ export default function HomeScreen() {
         return;
       }
 
-      console.log('[NOOD home] drain skipped preserving pagination');
+      if (
+        hasMoreProductsRef.current &&
+        nextProductsCursorRef.current &&
+        allProductsRef.current.length < MAX_IN_MEMORY_HOME_PRODUCTS
+      ) {
+        scheduleCatalogDrainRetry();
+      } else {
+        console.log('[NOOD home] drain paused preserving pagination');
+      }
     } catch (error) {
+      if (isStorageFullError(error)) {
+        try {
+          await emergencyPruneCatalogStorage({ aggressive: true });
+        } catch (cleanupError) {
+          console.log('Home catalog drain cleanup error:', cleanupError);
+        }
+      }
       console.log('Home catalog drain error:', error);
       console.log('[NOOD home] drain skipped preserving pagination');
     } finally {
       catalogDrainActiveRef.current = false;
+      lastCatalogDrainAtRef.current = Date.now();
     }
-  }, [appendStoreProductsPage, persistHomeProductsCache]);
+  }, [appendStoreProductsPage, persistHomeProductsCache, scheduleCatalogDrainRetry]);
+
+  drainRemainingCatalogPagesRef.current = drainRemainingCatalogPages;
 
   const loadPreparedHomeFromCache = useCallback(async () => {
     console.log(`[NOOD home] cache version=V${HOME_PRODUCTS_CACHE_VERSION}`);
@@ -3034,19 +4184,19 @@ export default function HomeScreen() {
       setFeedMixKey(cachedMixKey);
     }
 
+    nextProducts = capHomeProductsForMemory(nextProducts);
+    nextShowcaseProducts = slimShowcaseProducts(nextShowcaseProducts);
+
+    console.log(`[NOOD home] cache products count=${nextProducts.length}`);
     console.log(`[NOOD home] startup cache loaded count=${nextProducts.length}`);
 
     setAllProducts(nextProducts);
-    setProducts(nextProducts);
     setShowcaseProducts(nextShowcaseProducts);
     setNextProductsCursor(nextCursor);
     setHasMoreProducts(nextHasMore);
     allProductsRef.current = nextProducts;
     nextProductsCursorRef.current = nextCursor;
     hasMoreProductsRef.current = nextHasMore;
-    balancedFeedRef.current = nextProducts;
-    balancedFeedMixKeyRef.current = feedMixKeyRef.current;
-    setBalancedFeedProducts(nextProducts);
     setHomeContentReady(true);
     setLoading(false);
 
@@ -3171,7 +4321,7 @@ export default function HomeScreen() {
         homeFeedSessionRef.current = startHomeProductFeedSession();
         enrichInFlightRef.current = false;
         setHotBadgeSeed(getRandomSeed());
-        setVisibleProductCount(HOME_VISIBLE_PRODUCTS_STEP);
+        setVisibleProductCount(HOME_INITIAL_VISIBLE_PRODUCTS);
         setRefreshing(true);
         if (!allProductsRef.current.length) {
           setLoading(true);
@@ -3187,31 +4337,19 @@ export default function HomeScreen() {
 
       try {
         const session = homeFeedSessionRef.current;
-        const shouldPrimeShowcaseWithFeed = !isRefresh && !hasExistingProducts;
-        const firstPage = shouldPrimeShowcaseWithFeed
-          ? (
-              await Promise.all([
-                loadHomeCollectionBundle(),
-                fetchStoreProductsPage(
-                  null,
-                  feedMixKeyRef.current,
-                  session,
-                  isRefresh
-                ),
-              ])
-            )[1]
-          : await fetchStoreProductsPage(
-              null,
-              feedMixKeyRef.current,
-              session,
-              isRefresh
-            );
+        const firstPage = await fetchStoreProductsPage(
+          null,
+          feedMixKeyRef.current,
+          session,
+          isRefresh
+        );
 
-        if (!shouldPrimeShowcaseWithFeed) {
+        const deferCollectionBundle = InteractionManager.runAfterInteractions(() => {
           void loadHomeCollectionBundle().catch((error) => {
             console.log('Home collection bundle background error:', error);
           });
-        }
+        });
+        void deferCollectionBundle;
 
         if (isRefresh && (firstPage.cancelled || firstPage.failed || !firstPage.products.length)) {
           const snapshot = pendingRefreshSnapshotRef.current;
@@ -3375,78 +4513,135 @@ export default function HomeScreen() {
     ]
   );
 
-  const loadNextProductsPage = useCallback(async () => {
-    if (
-      isFetchingMoreRef.current ||
-      !hasMoreProducts ||
-      !nextProductsCursor ||
-      searchText.trim() ||
-      selectedCollectionHandle !== 'all'
-    ) {
-      return;
-    }
+  const fetchAndAppendNextHomePage = useCallback(
+    async (options: { showLoader?: boolean; source?: string } = {}) => {
+      const showLoader = options.showLoader !== false;
+      const source = options.source || (showLoader ? 'load-more' : 'prefetch');
 
-    isFetchingMoreRef.current = true;
-    setLoadingMoreProducts(true);
-    const startedAt = Date.now();
-    const requestedCursor = nextProductsCursor;
+      if (
+        isFetchingMoreRef.current ||
+        !hasMoreProductsRef.current ||
+        !nextProductsCursorRef.current ||
+        searchText.trim() ||
+        selectedCollectionHandle !== 'all'
+      ) {
+        return { addedCount: 0, failed: true, skipped: true };
+      }
 
-    try {
-      const page = await appendStoreProductsPage(requestedCursor);
+      const startedAt = Date.now();
+      const requestedCursor = nextProductsCursorRef.current;
+      const beforeCount = allProductsRef.current.length;
 
-      if (page.cancelled || page.failed) {
+      if (__DEV__) {
+        console.log('[HOME_FEED_LOAD_MORE]', {
+          currentCount: beforeCount,
+          nextPage: requestedCursor,
+          isLoadingMore: isFetchingMoreRef.current,
+          hasMore: hasMoreProductsRef.current,
+          source,
+          startedAt,
+        });
+      }
+
+      isFetchingMoreRef.current = true;
+      if (showLoader) {
+        setLoadingMoreProducts(true);
+      } else {
+        isPrefetchingFeedRef.current = true;
+      }
+
+      try {
+        const page = await appendStoreProductsPage(requestedCursor);
+
+        if (page.cancelled || page.failed) {
+          return { addedCount: 0, failed: true, skipped: false };
+        }
+
+        const afterCount = allProductsRef.current.length;
+        const addedCount = Math.max(0, afterCount - beforeCount);
+
+        if (showLoader) {
+          setVisibleProductCount((current) =>
+            Math.min(Math.max(current + HOME_VISIBLE_PRODUCTS_STEP, afterCount), afterCount)
+          );
+        }
+
+        if (!page.hasNextPage) {
+          setNextProductsCursor(null);
+          setHasMoreProducts(false);
+          nextProductsCursorRef.current = null;
+          hasMoreProductsRef.current = false;
+          await persistHomeProductsCache(allProductsRef.current, null, false);
+        }
+
+        if (__DEV__) {
+          console.log('[HOME_FEED_APPEND_DONE]', {
+            beforeCount,
+            addedCount,
+            afterCount,
+            durationMs: Date.now() - startedAt,
+            source,
+          });
+        }
+
+        if (HOME_PROFILE_LOGS_ENABLED) {
+          logHomePerfSummary(`after next Shopify page (${source})`);
+        }
+
+        return { addedCount, failed: false, skipped: false };
+      } catch (error) {
+        console.log('Next feed page error:', error);
+        return { addedCount: 0, failed: true, skipped: false };
+      } finally {
+        if (showLoader) {
+          setLoadingMoreProducts(false);
+        } else {
+          isPrefetchingFeedRef.current = false;
+        }
+        isFetchingMoreRef.current = false;
+      }
+    },
+    [appendStoreProductsPage, persistHomeProductsCache, searchText, selectedCollectionHandle]
+  );
+
+  const prefetchNextFeedPage = useCallback(
+    (source = 'prefetch') => {
+      if (
+        isFetchingMoreRef.current ||
+        isPrefetchingFeedRef.current ||
+        !hasMoreProductsRef.current ||
+        !nextProductsCursorRef.current ||
+        searchText.trim() ||
+        selectedCollectionHandle !== 'all'
+      ) {
         return;
       }
 
-      const totalCount = allProductsRef.current.length;
-
-      setVisibleProductCount((current) => Math.max(current, totalCount));
-
-      if (!page.hasNextPage) {
-        setNextProductsCursor(null);
-        setHasMoreProducts(false);
-        nextProductsCursorRef.current = null;
-        hasMoreProductsRef.current = false;
-        await persistHomeProductsCache(allProductsRef.current, null, false);
+      const bufferRemaining =
+        filteredProductsLengthRef.current - visibleProductCountRef.current;
+      if (bufferRemaining > HOME_FEED_PREFETCH_BUFFER) {
+        return;
       }
 
-      if (__DEV__) {
-        console.log(
-          `[Home perf] next Shopify page: ${Date.now() - startedAt}ms, pageSize=${page.products.length}, total=${totalCount}`
-        );
-      }
-      if (HOME_PROFILE_LOGS_ENABLED) {
-        console.log(
-          '[Home perf] next Shopify page image sample',
-          page.products.slice(0, 5).map((item) => ({
-            handle: item.handle,
-            original: `${item.imageWidth ?? 'unknown'}x${item.imageHeight ?? 'unknown'}`,
-            requestedUrl: item.image,
-          }))
-        );
-        logHomePerfSummary('after next Shopify page');
-      }
-    } catch (error) {
-      console.log('Next feed page error:', error);
-    } finally {
-      setLoadingMoreProducts(false);
-      isFetchingMoreRef.current = false;
-    }
-  }, [
-    appendStoreProductsPage,
-    hasMoreProducts,
-    nextProductsCursor,
-    persistHomeProductsCache,
-    searchText,
-    selectedCollectionHandle,
-  ]);
+      void fetchAndAppendNextHomePage({ showLoader: false, source });
+    },
+    [fetchAndAppendNextHomePage, searchText, selectedCollectionHandle]
+  );
 
   useEffect(() => {
+    console.log('[NOOD home] screen mounted');
+    homePerfInvestigation.homeScreenStartAt = perfNow();
+
     let isMounted = true;
 
-    const loadHomeProducts = async () => {
+    const bootstrapHomeProducts = async () => {
       try {
         if (homeSessionSnapshot) {
+          console.log('[NOOD home] cache products count', homeSessionSnapshot.products.length);
+          homeProductsBootstrappedRef.current = true;
+          void ensureCatalogFreshness('launch').catch((error) => {
+            console.log('[NOOD home] background freshness check error:', error);
+          });
           void loadInitialFeed(false);
           return;
         }
@@ -3455,31 +4650,79 @@ export default function HomeScreen() {
         if (!isMounted) return;
 
         if (cacheResult.loaded) {
+          homeProductsBootstrappedRef.current = true;
+          void ensureCatalogFreshness('launch').catch((error) => {
+            console.log('[NOOD home] background freshness check error:', error);
+          });
+
           if (cacheResult.shouldResumeDrain) {
-            void drainRemainingCatalogPages();
+            InteractionManager.runAfterInteractions(() => {
+              if (!isMounted) return;
+              void drainRemainingCatalogPages();
+            });
           }
-          void loadInitialFeed(false, {
-            repairPagination: cacheResult.needsPaginationRepair,
+
+          InteractionManager.runAfterInteractions(() => {
+            if (!isMounted) return;
+            void loadInitialFeed(false, {
+              repairPagination: cacheResult.needsPaginationRepair,
+            });
           });
           return;
         }
 
+        console.log('[NOOD home] cache products count=0');
+        void ensureCatalogFreshness('launch').catch((error) => {
+          console.log('[NOOD home] background freshness check error:', error);
+        });
         await loadInitialFeed(false);
+        if (isMounted) {
+          homeProductsBootstrappedRef.current = true;
+        }
       } catch (error) {
         console.log('Home products load error:', error);
         if (isMounted) {
           setHomeContentReady(true);
           setLoading(false);
+          homeProductsBootstrappedRef.current = true;
         }
       }
     };
 
-    void loadHomeProducts();
+    void bootstrapHomeProducts();
+
+    const clearCacheSubscription = DeviceEventEmitter.addListener(
+      'clearNoodCatalogCache',
+      () => {
+        void clearCatalogCacheForDev().then((result) => {
+          console.log('[NOOD home] dev catalog cache cleared', result);
+        });
+      }
+    );
 
     return () => {
       isMounted = false;
+      clearCacheSubscription.remove();
+      if (catalogDrainTimerRef.current) {
+        clearTimeout(catalogDrainTimerRef.current);
+        catalogDrainTimerRef.current = null;
+      }
     };
   }, [drainRemainingCatalogPages, loadInitialFeed, loadPreparedHomeFromCache]);
+
+  useEffect(() => {
+    const fallbackTimer = setTimeout(() => {
+      if (slideshowFirstFrameReadyRef.current) return;
+      slideshowPerfLog('[NOOD slideshow perf] slideshow-first-frame-timeout-fallback', {
+        time: perfNow(),
+      });
+      handleSlideshowFirstFrameReady();
+    }, 3500);
+
+    return () => {
+      clearTimeout(fallbackTimer);
+    };
+  }, [handleSlideshowFirstFrameReady]);
 
   const getSavedHomeScrollOffset = useCallback(() => {
     return Math.max(
@@ -3510,11 +4753,27 @@ export default function HomeScreen() {
     };
   }, [getSavedHomeScrollOffset]);
 
+  const scrollHomeToTop = useCallback(() => {
+    homeScrollOffsetRef.current = 0;
+    if (homeSessionSnapshot) {
+      homeSessionSnapshot.scrollOffset = 0;
+    }
+    listRef.current?.scrollToOffset({ offset: 0, animated: true });
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
-      if (!allProductsRef.current.length) {
-        void loadInitialFeed(false);
-      }
+      if (!homeProductsBootstrappedRef.current) return;
+
+      void ensureCatalogFreshness('home-open')
+        .then((changed) => {
+          if (changed || !allProductsRef.current.length) {
+            void loadInitialFeed(false);
+          }
+        })
+        .catch((error) => {
+          console.log('[NOOD home] background freshness check error:', error);
+        });
     }, [loadInitialFeed])
   );
 
@@ -3542,54 +4801,13 @@ export default function HomeScreen() {
   }, [pathname, restoreHomeScroll]);
 
   useEffect(() => {
-    const tabNavigation = navigation.getParent();
-    if (!tabNavigation) return;
-
-    const unsubscribe = (tabNavigation as any).addListener(
-      'tabPress',
-      (event: { preventDefault?: () => void }) => {
-        if (!navigation.isFocused() || !shouldIgnoreHomeTabPress) return;
-        event.preventDefault?.();
-        restoreHomeScroll();
-      }
-    );
+    const unsubscribe = navigation.addListener('tabPress', () => {
+      if (!navigation.isFocused()) return;
+      scrollHomeToTop();
+    });
 
     return unsubscribe;
-  }, [navigation, restoreHomeScroll, shouldIgnoreHomeTabPress]);
-
-  useEffect(() => {
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.parallel([
-          Animated.timing(scale, {
-            toValue: 1.08,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-          Animated.timing(rotate, {
-            toValue: 1,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-        ]),
-        Animated.parallel([
-          Animated.timing(scale, {
-            toValue: 1,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-          Animated.timing(rotate, {
-            toValue: 0,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-        ]),
-      ])
-    );
-
-    loop.start();
-    return () => loop.stop();
-  }, [rotate, scale]);
+  }, [navigation, scrollHomeToTop]);
 
   const openProduct = useCallback((item: ShopifyProduct) => {
     logHomePerfSummary(`before opening product ${item.handle}`);
@@ -3600,9 +4818,14 @@ export default function HomeScreen() {
   }, [router]);
 
   const addHomeProductToCart = useCallback((item: ShopifyProduct) => {
+    if (resolveListProductSoldOut(item)) {
+      noodAlert('Sold out', 'This product is currently unavailable.');
+      return;
+    }
+
     if (!item.variantId) {
       console.log('[NOOD cart] missing variantId on home product', item);
-      Alert.alert('Product unavailable', 'This product is missing its Shopify variant. Please open the product and try again.');
+      noodAlert('Product unavailable', 'This product is missing its Shopify variant. Please open the product and try again.');
       return;
     }
 
@@ -3629,7 +4852,7 @@ export default function HomeScreen() {
     });
 
     if (added) {
-      Alert.alert('Added to cart', item.title);
+      noodAlert('Added to cart', item.title);
     }
   }, [addToCart]);
 
@@ -3666,124 +4889,122 @@ export default function HomeScreen() {
     return shuffleArray(matchedProducts.length ? matchedProducts : sourceProducts);
   }, []);
 
-  const openCameraSearch = useCallback(async () => {
-    const permission = cameraPermission?.granted
-      ? cameraPermission
-      : await requestCameraPermission();
+  const handlePickSearchImage = useCallback(async () => {
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert('Photo permission needed', 'Photo access is needed to search by image.');
+        return;
+      }
 
-    if (!permission.granted) {
-      Alert.alert(
-        'Camera permission needed',
-        'Please allow camera access to search by photo.'
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: false,
+        quality: 0.7,
+        base64: true,
+      });
+
+      if (result.canceled || !result.assets?.[0]) return;
+      const asset = result.assets[0];
+      setGalleryPreviewPhoto({
+        uri: asset.uri,
+        base64: asset.base64 || undefined,
+        mimeType: asset.mimeType || 'image/jpeg',
+        width: asset.width,
+        height: asset.height,
+      });
+    } catch (error) {
+      console.log('[NOOD home] library image search error', error);
+    }
+  }, []);
+
+  const handleChooseAnotherGalleryPhoto = useCallback(() => {
+    setGalleryPreviewPhoto(null);
+    requestAnimationFrame(() => {
+      void handlePickSearchImage();
+    });
+  }, [handlePickSearchImage]);
+
+  const openCameraSearch = useCallback(() => {
+    const openCamera = () => setCameraVisible(true);
+    const openPhotos = () => void handlePickSearchImage();
+
+    if (Platform.OS === 'ios') {
+      ActionSheetIOS.showActionSheetWithOptions(
+        {
+          title: 'Search by image',
+          options: ['Take Photo', 'Choose From Photos', 'Cancel'],
+          cancelButtonIndex: 2,
+        },
+        (buttonIndex) => {
+          if (buttonIndex === 0) openCamera();
+          if (buttonIndex === 1) openPhotos();
+        }
       );
       return;
     }
 
-    setCameraVisible(true);
-  }, [cameraPermission, requestCameraPermission]);
+    Alert.alert('Search by image', 'Choose how you want to search.', [
+      { text: 'Take Photo', onPress: openCamera },
+      { text: 'Choose From Photos', onPress: openPhotos },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
+  }, [handlePickSearchImage]);
 
-  const captureSearchPhoto = useCallback(async () => {
-    if (!cameraRef.current || takingPicture) return;
-
-    try {
-      setTakingPicture(true);
-      await cameraRef.current.takePictureAsync({
-        quality: 0.7,
-        skipProcessing: true,
-      });
-
-      setCameraVisible(false);
+  const handleUseCameraPhoto = useCallback(
+    async (photo: CameraSearchPhoto) => {
       setVisualSearchMode(true);
       setVisualSearchLoading(true);
       setSearchText('');
       setSelectedCollectionHandle('all');
       setProducts([]);
-      setVisibleProductCount(HOME_VISIBLE_PRODUCTS_STEP);
+      setVisibleProductCount(HOME_INITIAL_VISIBLE_PRODUCTS);
       listRef.current?.scrollToOffset({ offset: 0, animated: true });
 
-      setTimeout(() => {
-        const fallbackResults = getVisualSearchFallbackProducts();
-        setProducts(fallbackResults);
+      try {
+        const payload: any = await postBackendJson(
+          '/api/catalog/image-search',
+          {
+            imageBase64: photo.base64 || '',
+            image: photo.base64 || '',
+            base64: photo.base64 || '',
+            uri: photo.uri,
+            mimeType: photo.mimeType || 'image/jpeg',
+          },
+          { timeoutMs: 30000 }
+        );
+
+        const edges =
+          payload?.data?.products?.edges ||
+          payload?.products?.edges ||
+          payload?.matches ||
+          [];
+        const handles = edges
+          .map((edge: any) => String(edge?.node?.handle || edge?.handle || '').trim())
+          .filter(Boolean);
+        const sourceProducts = allProductsRef.current;
+        const matched = sourceProducts.filter((product) => handles.includes(product.handle));
+
+        setProducts(matched.length ? matched : getVisualSearchFallbackProducts());
+      } catch (error) {
+        console.log('Camera search error:', error);
+        setProducts(getVisualSearchFallbackProducts());
+      } finally {
         setVisualSearchLoading(false);
-      }, 900);
-    } catch (error) {
-      console.log('Camera search error:', error);
-      Alert.alert('Camera error', 'Could not take a picture. Please try again.');
-    } finally {
-      setTakingPicture(false);
-    }
-  }, [getVisualSearchFallbackProducts, takingPicture]);
-
-  useLayoutEffect(() => {
-    const shouldUseBalancedFeed =
-      selectedCollectionHandle === 'all' && !searchText.trim() && !visualSearchMode;
-
-    if (!shouldUseBalancedFeed) {
-      return;
-    }
-
-    const sourceProducts = allProducts.length > 0 ? allProducts : products;
-
-    if (!sourceProducts.length) {
-      balancedFeedRef.current = [];
-      setBalancedFeedProducts([]);
-      return;
-    }
-
-    const currentFeed = balancedFeedRef.current;
-    const currentIds = new Set(currentFeed.map((product) => product.id));
-    const sourceIds = new Set(sourceProducts.map((product) => product.id));
-    const mixKeyChanged = feedMixKey !== balancedFeedMixKeyRef.current;
-    const orderChanged =
-      sourceProducts.length !== currentFeed.length ||
-      sourceProducts.some((product, index) => product.id !== currentFeed[index]?.id);
-    const isSameIdSet =
-      sourceIds.size === currentIds.size &&
-      [...currentIds].every((productId) => sourceIds.has(productId));
-
-    if (isSameIdSet && !mixKeyChanged && !orderChanged && currentFeed.length > 0) {
-      const refreshedFeed = refreshBalancedHomeFeedProducts(currentFeed, sourceProducts);
-      const feedChanged = refreshedFeed.some(
-        (product, index) => product !== currentFeed[index]
-      );
-
-      if (feedChanged) {
-        balancedFeedRef.current = refreshedFeed;
-        setBalancedFeedProducts(refreshedFeed);
       }
-      return;
-    }
+    },
+    [getVisualSearchFallbackProducts]
+  );
 
-    homeLog('[HOME PERF] backend mixed feed applied', {
-      productCount: sourceProducts.length,
-      seed: feedMixKey,
-      mixKeyChanged,
-      orderChanged,
-      time: perfNow(),
-    });
-    balancedFeedRef.current = sourceProducts;
-    balancedFeedMixKeyRef.current = feedMixKey;
-    setBalancedFeedProducts(sourceProducts);
-  }, [
-    allProducts,
-    feedMixKey,
-    products,
-    searchText,
-    selectedCollectionHandle,
-    visualSearchMode,
-  ]);
+  const handleUseGalleryPhoto = useCallback(async () => {
+    const photo = galleryPreviewPhoto;
+    if (!photo) return;
+    setGalleryPreviewPhoto(null);
+    await handleUseCameraPhoto(photo);
+  }, [galleryPreviewPhoto, handleUseCameraPhoto]);
 
   const baseProducts = useMemo(() => {
-    const shouldUseBalancedFeed =
-      selectedCollectionHandle === 'all' && !searchText.trim() && !visualSearchMode;
-
-    const sourceProducts = shouldUseBalancedFeed
-      ? allProducts.length > 0
-        ? allProducts
-        : balancedFeedProducts.length > 0
-          ? balancedFeedProducts
-          : products
-      : products;
+    const sourceProducts = visualSearchMode ? products : allProducts;
 
     if (selectedCollectionHandle === 'all') {
       return sourceProducts;
@@ -3794,14 +5015,7 @@ export default function HomeScreen() {
         ? item.collectionHandles.includes(selectedCollectionHandle)
         : item.collectionHandle === selectedCollectionHandle
     );
-  }, [
-    allProducts,
-    balancedFeedProducts,
-    products,
-    searchText,
-    selectedCollectionHandle,
-    visualSearchMode,
-  ]);
+  }, [allProducts, products, selectedCollectionHandle, visualSearchMode]);
 
   const filteredProducts = useMemo(() => {
     const startedAt = perfNow();
@@ -3810,13 +5024,16 @@ export default function HomeScreen() {
       ? baseProducts
       : baseProducts.filter((item) => productMatchesSearch(item, trimmedSearch));
 
-    homeLog('[HOME PERF] product filter end', {
-      inputCount: baseProducts.length,
-      outputCount: result.length,
-      hasSearch: Boolean(trimmedSearch),
-      durationMs: perfNow() - startedAt,
-      time: perfNow(),
-    });
+    if (HOME_PERF_INVESTIGATION_ENABLED && !homePerfScreenSummaryLoggedRef.current.filter) {
+      homePerfScreenSummaryLoggedRef.current.filter = true;
+      homeLog('[HOME PERF] product filter end', {
+        inputCount: baseProducts.length,
+        outputCount: result.length,
+        hasSearch: Boolean(trimmedSearch),
+        durationMs: perfNow() - startedAt,
+        time: perfNow(),
+      });
+    }
 
     return result;
   }, [baseProducts, searchText]);
@@ -3824,36 +5041,73 @@ export default function HomeScreen() {
   const visibleProducts = useMemo(() => {
     const startedAt = perfNow();
     const result = filteredProducts.slice(0, visibleProductCount);
-    homeLog('[HOME PERF] visible product batch end', {
-      visibleCount: result.length,
-      totalFiltered: filteredProducts.length,
-      visibleProductCount,
-      durationMs: perfNow() - startedAt,
-      time: perfNow(),
-    });
+    if (HOME_PERF_INVESTIGATION_ENABLED && !homePerfScreenSummaryLoggedRef.current.visible) {
+      homePerfScreenSummaryLoggedRef.current.visible = true;
+      homeLog('[HOME PERF] visible product batch end', {
+        visibleCount: result.length,
+        totalFiltered: filteredProducts.length,
+        visibleProductCount,
+        durationMs: perfNow() - startedAt,
+        time: perfNow(),
+      });
+    }
     return result;
   }, [filteredProducts, visibleProductCount]);
-  const isPreparingHomeProducts = !homeContentReady || loading;
+  const isPreparingHomeProducts = loading && allProducts.length === 0;
   const homeListProducts = isPreparingHomeProducts ? [] : visibleProducts;
 
   useEffect(() => {
+    logMemoryPressureDebug({
+      screen: 'home',
+      homeProductCount: allProducts.length,
+      visibleProductCount,
+      cachedPageCount: Math.ceil(allProducts.length / PRODUCTS_PER_PAGE),
+      mountedVideoCount: homePerfInvestigation.videoMounts,
+      mountedImageCardCount:
+        homePerfInvestigation.productCardMounts + homePerfInvestigation.categoryCardMounts,
+      isAuthLoading,
+    });
+  }, [
+    allProducts.length,
+    visibleProductCount,
+    isAuthLoading,
+    homePerfInvestigation.categoryCardMounts,
+    homePerfInvestigation.productCardMounts,
+    homePerfInvestigation.videoMounts,
+  ]);
+
+  useEffect(() => {
+    if (!homeListProducts.length || firstProductsRenderedLoggedRef.current) return;
+    firstProductsRenderedLoggedRef.current = true;
+    console.log('[NOOD home] first products rendered', { count: homeListProducts.length });
+    if (!homeReadyTimeLoggedRef.current && homePerfInvestigation.homeScreenStartAt > 0) {
+      homeReadyTimeLoggedRef.current = true;
+      console.log(
+        `[NOOD home] total home ready time ${(perfNow() - homePerfInvestigation.homeScreenStartAt).toFixed(0)}ms`
+      );
+    }
+  }, [homeListProducts.length]);
+
+  useEffect(() => {
     if (!HOME_PERF_INVESTIGATION_ENABLED) return;
-    if (!homeContentReady || loading || !homeListProducts.length) return;
+    if (!homeListProducts.length) return;
     if (homePerfInvestigation.firstVisibleAt > 0) return;
 
     homePerfInvestigation.firstVisibleAt = perfNow();
     homeLog('[HOME PERF] first visible content', homePerfInvestigation.firstVisibleAt);
     logHomePerfInvestigationSummary('first-visible-products');
-  }, [homeContentReady, homeListProducts.length, loading]);
+  }, [homeListProducts.length]);
 
   useEffect(() => {
     filteredProductsLengthRef.current = filteredProducts.length;
   }, [filteredProducts.length]);
 
   useEffect(() => {
+    if (!homeContentReady || loading) return;
+
     const task = InteractionManager.runAfterInteractions(() => {
       filteredProducts
-        .slice(visibleProductCount, visibleProductCount + 10)
+        .slice(visibleProductCount, visibleProductCount + HOME_IMAGE_PREFETCH_AHEAD)
         .forEach((item) => {
           if (item.image) {
             ExpoImage.prefetch(item.image);
@@ -3861,61 +5115,137 @@ export default function HomeScreen() {
         });
     });
 
-    return () => task.cancel();
-  }, [filteredProducts, visibleProductCount]);
+    return () => task.cancel?.();
+  }, [filteredProducts, homeContentReady, loading, visibleProductCount]);
+
+  useEffect(() => {
+    if (!homeContentReady || loading || !allProducts.length || firstFeedPrefetchDoneRef.current) {
+      return;
+    }
+    if (searchText.trim() || selectedCollectionHandle !== 'all') {
+      return;
+    }
+    if (!hasMoreProductsRef.current || !nextProductsCursorRef.current) {
+      return;
+    }
+
+    firstFeedPrefetchDoneRef.current = true;
+
+    const task = InteractionManager.runAfterInteractions(() => {
+      prefetchNextFeedPage('first-render');
+    });
+
+    return () => task.cancel?.();
+  }, [
+    allProducts.length,
+    homeContentReady,
+    loading,
+    prefetchNextFeedPage,
+    searchText,
+    selectedCollectionHandle,
+  ]);
 
   const unlockLoadMoreSoon = useCallback(() => {
     setTimeout(() => {
       loadMoreLockedRef.current = false;
-    }, 350);
+    }, 300);
   }, []);
 
   const loadMoreVisibleProducts = useCallback(async () => {
-    if (loadMoreLockedRef.current || isPreparingHomeProducts) return;
+    if (loadMoreLockedRef.current || isPreparingHomeProducts) {
+      return;
+    }
 
     const now = Date.now();
-    if (now - lastLoadMoreAtRef.current < 650) return;
+    if (now - lastLoadMoreAtRef.current < HOME_FEED_LOAD_MORE_COOLDOWN_MS) {
+      return;
+    }
 
     loadMoreLockedRef.current = true;
     lastLoadMoreAtRef.current = now;
 
-    if (visibleProductCount < filteredProductsLengthRef.current) {
+    const currentCount = visibleProductCountRef.current;
+    const totalFiltered = filteredProductsLengthRef.current;
+    const bufferRemaining = totalFiltered - currentCount;
+
+    if (currentCount < totalFiltered) {
+      if (__DEV__) {
+        console.log('[HOME_FEED_LOAD_MORE]', {
+          currentCount,
+          nextPage: nextProductsCursorRef.current,
+          isLoadingMore: isFetchingMoreRef.current,
+          hasMore: hasMoreProductsRef.current,
+          source: 'reveal-buffer',
+          startedAt: now,
+        });
+      }
+
       setVisibleProductCount((current) => {
-        if (current >= filteredProductsLengthRef.current) return current;
-        return Math.min(current + HOME_VISIBLE_PRODUCTS_STEP, filteredProductsLengthRef.current);
+        if (current >= totalFiltered) return current;
+        return Math.min(current + HOME_VISIBLE_PRODUCTS_STEP, totalFiltered);
       });
+
+      if (bufferRemaining <= HOME_FEED_PREFETCH_BUFFER) {
+        prefetchNextFeedPage('on-end-reached-buffer-low');
+      }
+
+      unlockLoadMoreSoon();
+      return;
+    }
+
+    if (isFetchingMoreRef.current) {
       unlockLoadMoreSoon();
       return;
     }
 
     try {
-      await loadNextProductsPage();
+      await fetchAndAppendNextHomePage({ showLoader: true, source: 'on-end-reached' });
     } finally {
       unlockLoadMoreSoon();
     }
-  }, [isPreparingHomeProducts, loadNextProductsPage, unlockLoadMoreSoon, visibleProductCount]);
-  const canLoadMoreShopifyProducts =
-    !searchText.trim() && selectedCollectionHandle === 'all' && hasMoreProducts;
-  const hasMoreVisibleProducts =
-    !isPreparingHomeProducts &&
-    (visibleProductCount < filteredProducts.length ||
-      loadingMoreProducts ||
-      canLoadMoreShopifyProducts);
+  }, [
+    fetchAndAppendNextHomePage,
+    isPreparingHomeProducts,
+    prefetchNextFeedPage,
+    unlockLoadMoreSoon,
+  ]);
 
   const handleScrollBegin = useCallback(() => {
+    homeUserScrollingRef.current = true;
     if (HOME_PROFILE_LOGS_ENABLED) {
       console.log('[Home perf] scroll begin');
     }
   }, []);
 
-  const handleScroll = useCallback((event: any) => {
-    const offset = event?.nativeEvent?.contentOffset?.y ?? 0;
-    homeScrollOffsetRef.current = offset;
+  const handleScroll = useCallback(
+    (event: any) => {
+      const nativeEvent = event?.nativeEvent;
+      const offset = nativeEvent?.contentOffset?.y ?? 0;
+      homeScrollOffsetRef.current = offset;
 
-    if (homeSessionSnapshot) {
-      homeSessionSnapshot.scrollOffset = offset;
-    }
-  }, []);
+      if (!laceFrontVideosReady && offset >= HOME_LACE_FRONT_VIDEO_SCROLL_OFFSET) {
+        setLaceFrontVideosReady(true);
+      }
+
+      if (homeSessionSnapshot) {
+        homeSessionSnapshot.scrollOffset = offset;
+      }
+
+      const contentHeight = nativeEvent?.contentSize?.height ?? 0;
+      const layoutHeight = nativeEvent?.layoutMeasurement?.height ?? 0;
+      const distanceFromEnd = contentHeight - layoutHeight - offset;
+      const prefetchDistance = layoutHeight * 1.25;
+
+      if (
+        distanceFromEnd < prefetchDistance &&
+        Date.now() - lastScrollPrefetchAtRef.current > 900
+      ) {
+        lastScrollPrefetchAtRef.current = Date.now();
+        prefetchNextFeedPage('scroll-proximity');
+      }
+    },
+    [laceFrontVideosReady, prefetchNextFeedPage]
+  );
 
   const handleScrollEnd = useCallback((event?: any) => {
     const offset = event?.nativeEvent?.contentOffset?.y ?? homeScrollOffsetRef.current;
@@ -3925,6 +5255,7 @@ export default function HomeScreen() {
       homeSessionSnapshot.scrollOffset = offset;
     }
 
+    homeUserScrollingRef.current = false;
     logHomePerfSummary('after scroll');
   }, []);
 
@@ -3942,6 +5273,11 @@ export default function HomeScreen() {
     isFetchingMoreRef.current = false;
     catalogDrainActiveRef.current = false;
     loadMoreLockedRef.current = false;
+    homeUserScrollingRef.current = false;
+    if (catalogDrainTimerRef.current) {
+      clearTimeout(catalogDrainTimerRef.current);
+      catalogDrainTimerRef.current = null;
+    }
 
     if (allProductsRef.current.length) {
       captureRefreshFeedSnapshot();
@@ -3950,7 +5286,8 @@ export default function HomeScreen() {
 
     feedMixKeyRef.current = nextMixKey;
     setFeedMixKey(nextMixKey);
-    setVisibleProductCount(HOME_VISIBLE_PRODUCTS_STEP);
+    firstFeedPrefetchDoneRef.current = false;
+    setVisibleProductCount(HOME_INITIAL_VISIBLE_PRODUCTS);
     setRefreshing(true);
 
     if (!allProductsRef.current.length) {
@@ -3959,7 +5296,10 @@ export default function HomeScreen() {
     }
 
     listRef.current?.scrollToOffset({ offset: 0, animated: true });
-    void loadInitialFeed(true);
+    void (async () => {
+      await ensureCatalogFreshness('pull');
+      await loadInitialFeed(true);
+    })();
   }, [captureRefreshFeedSnapshot, loadInitialFeed]);
 
   useEffect(() => {
@@ -3970,8 +5310,9 @@ export default function HomeScreen() {
   const openSearchScreen = useCallback(() => {
     homeSessionSnapshot = {
       allProducts,
-      products,
+      products: visualSearchMode ? products : allProducts,
       showcaseProducts,
+      laceFrontProducts,
       nextProductsCursor,
       hasMoreProducts,
       hotBadgeSeed,
@@ -3983,11 +5324,13 @@ export default function HomeScreen() {
     allProducts,
     hasMoreProducts,
     hotBadgeSeed,
+    laceFrontProducts,
     nextProductsCursor,
     products,
     router,
     showcaseProducts,
     visibleProductCount,
+    visualSearchMode,
   ]);
 
   const showRewardsInSlideshow = useCallback(() => {
@@ -4004,61 +5347,69 @@ export default function HomeScreen() {
     });
   }, []);
 
-  const renderTopHeader = () => (
-    <View
-      style={styles.headerWrap}
-      onLayout={() => {
-        if (homePerfInvestigation.topHeaderMounted) return;
-        homePerfInvestigation.topHeaderMounted = true;
-        homeLog('[HOME PERF] header mounted', perfNow());
-      }}
-    >
-      <TouchableOpacity activeOpacity={0.85} onPress={refreshHome}>
-        <Image
-          source={require('../../assets/images/nood-brand-logo.png')}
-          style={styles.logo}
-          resizeMode="contain"
-          fadeDuration={0}
-        />
-      </TouchableOpacity>
-
-      <TouchableOpacity
-        style={styles.searchBox}
-        activeOpacity={0.95}
-        onPress={openSearchScreen}
-      >
-        <TextInput
-          placeholder="Search products"
-          placeholderTextColor="#666"
-          style={styles.input}
-          value=""
-          editable={false}
-          onPressIn={openSearchScreen}
-        />
-
-        <View style={styles.searchIconButton}>
-          <TouchableOpacity
-            style={styles.searchBarIconTap}
-            activeOpacity={0.8}
-            onPress={openCameraSearch}
-          >
-            <Ionicons
-              name="camera-outline"
-              size={20}
-              color="#000"
-              style={styles.cameraIcon}
-            />
-          </TouchableOpacity>
-          <Ionicons
-            name="search"
-            size={22}
-            color="#000"
-            onPress={openSearchScreen}
-          />
-        </View>
-      </TouchableOpacity>
-    </View>
+  const openCollectionShortcut = useCallback(
+    (handle: string) => {
+      router.push({
+        pathname: '/collection/[handle]',
+        params: { handle, from: 'home' },
+      });
+    },
+    [router]
   );
+
+  const openCollectionFromShowcase = useCallback(
+    (handle: string) => {
+      router.push({
+        pathname: '/collection/[handle]',
+        params: { handle, from: 'home' },
+      });
+    },
+    [router]
+  );
+
+  const openLaceFrontCollection = useCallback(() => {
+    router.push({
+      pathname: '/collection/[handle]',
+      params: { handle: 'lacefront', from: 'home' },
+    });
+  }, [router]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadHomeCollectionShortcuts = async () => {
+      try {
+        const cachedRaw = await AsyncStorage.getItem(HOME_CATEGORIES_CACHE_KEY);
+        let records = extractCollectionsFromCategoriesCache(cachedRaw);
+
+        if (!records.length) {
+          records = await fetchHomeCollectionRecords();
+        }
+
+        if (cancelled) return;
+
+        const shortcuts = buildHomeCollectionShortcuts(records);
+        if (shortcuts.length || !records.length) {
+          setHomeCollectionShortcuts(shortcuts);
+          return;
+        }
+
+        const fetchedRecords = await fetchHomeCollectionRecords();
+        if (cancelled) return;
+        setHomeCollectionShortcuts(buildHomeCollectionShortcuts(fetchedRecords));
+      } catch {
+        if (!cancelled) {
+          setHomeCollectionShortcuts([]);
+        }
+      }
+    };
+
+    void loadHomeCollectionShortcuts();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const showTrendingNow = useCallback(() => {
     const mixStartedAt = perfNow();
@@ -4075,7 +5426,7 @@ export default function HomeScreen() {
     enrichInFlightRef.current = false;
     feedMixKeyRef.current = nextMixKey;
     setFeedMixKey(nextMixKey);
-    setVisibleProductCount(HOME_VISIBLE_PRODUCTS_STEP);
+    setVisibleProductCount(HOME_INITIAL_VISIBLE_PRODUCTS);
     listRef.current?.scrollToOffset({ offset: 0, animated: true });
 
     const hasShowcaseData = HOME_SHOWCASE_SECTIONS.some(
@@ -4114,133 +5465,64 @@ export default function HomeScreen() {
     showcaseProducts,
   ]);
 
-  const renderCollectionShowcase = useCallback(
-    (title: string, handle: string) => {
-      const collectionProducts =
-        showcaseProducts[handle] && showcaseProducts[handle].length
-          ? showcaseProducts[handle]
-          : allProducts.filter((item) =>
-              item.collectionHandles?.length
-                ? item.collectionHandles.includes(handle)
-                : item.collectionHandle === handle
-            );
-
-      if (!collectionProducts.length) {
-        return null;
-      }
-
-      return (
-        <View style={styles.showcaseWrap}>
-          <View style={styles.showcaseHeaderRow}>
-            <Text style={styles.showcaseTitle}>{title}</Text>
-
-            <TouchableOpacity
-              activeOpacity={0.85}
-              onPress={() =>
-                router.push({
-                  pathname: '/collection/[handle]',
-                  params: { handle, from: 'home' },
-                })
-              }
-            >
-              <Text style={styles.viewAllText}>View All →</Text>
-            </TouchableOpacity>
-          </View>
-
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.showcaseRow}
-            removeClippedSubviews={false}
-          >
-            {collectionProducts.slice(0, 10).map((item) => {
-              const badgeKey = `${handle}-${item.id}`;
-              const showHotBadge = shouldShowHotBadge(badgeKey, hotBadgeSeed);
-
-              return (
-                <CategoryCard
-                  key={badgeKey}
-                  item={item}
-                  badgeKey={badgeKey}
-                  showHotBadge={showHotBadge}
-                  hotBadgeSeed={hotBadgeSeed}
-                  displayPrice={getDisplayPrice(item)}
-                  onOpen={openProduct}
-                />
-              );
-            })}
-          </ScrollView>
-        </View>
-      );
-    },
-    [allProducts, getDisplayPrice, hotBadgeSeed, openProduct, router, showcaseProducts]
+  const scrollableHeader = useMemo(
+    () => (
+      <HomeScrollableHeader
+        visualSearchLoading={visualSearchLoading}
+        visualSearchMode={visualSearchMode}
+        searchText={searchText}
+        homeCollectionShortcuts={homeCollectionShortcuts}
+        showcaseProducts={showcaseProducts}
+        allProducts={allProducts}
+        hotBadgeSeed={hotBadgeSeed}
+        laceFrontProducts={laceFrontProducts}
+        laceFrontLoading={laceFrontLoading}
+        laceFrontVideosReady={laceFrontVideosReady}
+        requestedSlideIndex={requestedHeroSlide.index}
+        requestedSlideKey={requestedHeroSlide.key}
+        getDisplayPrice={getDisplayPrice}
+        onShowTrendingNow={showTrendingNow}
+        onShowRewardsInSlideshow={showRewardsInSlideshow}
+        onOpenCollectionShortcut={openCollectionShortcut}
+        onOpenProduct={openProduct}
+        onViewAllCollection={openCollectionFromShowcase}
+        onLaceFrontSeeMore={openLaceFrontCollection}
+        onSlideshowFirstFrameReady={handleSlideshowFirstFrameReady}
+      />
+    ),
+    [
+      allProducts,
+      getDisplayPrice,
+      handleSlideshowFirstFrameReady,
+      homeCollectionShortcuts,
+      hotBadgeSeed,
+      laceFrontLoading,
+      laceFrontProducts,
+      laceFrontVideosReady,
+      openCollectionFromShowcase,
+      openCollectionShortcut,
+      openLaceFrontCollection,
+      openProduct,
+      requestedHeroSlide.index,
+      requestedHeroSlide.key,
+      searchText,
+      showcaseProducts,
+      showRewardsInSlideshow,
+      showTrendingNow,
+      visualSearchLoading,
+      visualSearchMode,
+    ]
   );
 
-  const scrollableHeader = useMemo(() => {
-    homeLog('[HOME PERF] scrollable header built', perfNow());
+  const homeListExtraData = useMemo(
+    () => ({ hotBadgeSeed, selectedCurrency }),
+    [hotBadgeSeed, selectedCurrency]
+  );
 
-    if (visualSearchLoading) {
-      return (
-        <View style={styles.visualSearchStatusWrap}>
-          <NoodSpinner size={42} />
-          <Text style={styles.visualSearchStatusText}>Searching similar items...</Text>
-        </View>
-      );
-    }
-
-    if (visualSearchMode) {
-      return (
-        <View style={styles.feedHeaderWrap}>
-          <Text style={styles.feedHeaderTitle}>Similar items</Text>
-        </View>
-      );
-    }
-
-    if (searchText.trim()) return null;
-
-    return (
-      <>
-        <View style={styles.homeTopInfoRow}>
-          <TouchableOpacity style={styles.homePill} activeOpacity={0.9} onPress={showTrendingNow}>
-            <Text style={styles.homePillText}>Trending now</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.homePill}
-            activeOpacity={0.92}
-            onPress={showRewardsInSlideshow}
-          >
-            <Text style={styles.homePillText}>Rewards</Text>
-          </TouchableOpacity>
-        </View>
-        <Banner />
-        <HomeSlideshow
-          requestedSlideIndex={requestedHeroSlide.index}
-          requestedSlideKey={requestedHeroSlide.key}
-        />
-
-        {renderCollectionShowcase('Men', 'clothing')}
-        {renderCollectionShowcase('Women', 'women')}
-        {renderCollectionShowcase('Kids', 'kids')}
-        {renderCollectionShowcase('Shoes', 'shoes')}
-        {renderCollectionShowcase('Electronics', 'electronics')}
-        <LaceFrontVideoSection />
-
-        <View style={styles.feedHeaderWrap}>
-          <Text style={styles.feedHeaderTitle}>Trending now</Text>
-        </View>
-      </>
-    );
-  }, [
-    renderCollectionShowcase,
-    requestedHeroSlide.index,
-    requestedHeroSlide.key,
-    searchText,
-    showRewardsInSlideshow,
-    showTrendingNow,
-    visualSearchLoading,
-    visualSearchMode,
-  ]);
+  const keyExtractor = useCallback(
+    (item: ShopifyProduct) => `${item.id}-${item.handle}`,
+    []
+  );
 
   const renderItem = useCallback(
     ({ item }: { item: ShopifyProduct }) => (
@@ -4257,7 +5539,7 @@ export default function HomeScreen() {
   );
 
   const listFooterComponent = useMemo(() => {
-    if (!hasMoreVisibleProducts) {
+    if (!loadingMoreProducts) {
       return <View style={styles.homeBottomSpacer} />;
     }
 
@@ -4266,7 +5548,7 @@ export default function HomeScreen() {
         <NoodSpinner size={34} />
       </View>
     );
-  }, [hasMoreVisibleProducts]);
+  }, [loadingMoreProducts]);
 
   const listEmptyComponent = useMemo(() => {
     if (visualSearchLoading) return null;
@@ -4307,23 +5589,28 @@ export default function HomeScreen() {
 
   return (
     <SafeAreaView style={styles.container} edges={['top', 'left', 'right']}>
-      {renderTopHeader()}
+      <HomeTopHeader
+        onRefresh={refreshHome}
+        onOpenSearch={openSearchScreen}
+        onOpenCamera={openCameraSearch}
+      />
 
       <FlatList
         ref={listRef}
         data={homeListProducts}
-        keyExtractor={(item) => `${item.id}-${item.handle}`}
+        keyExtractor={keyExtractor}
         numColumns={2}
         renderItem={renderItem}
-        extraData={`${hotBadgeSeed}-${selectedCurrency}`}
+        extraData={homeListExtraData}
         ListHeaderComponent={scrollableHeader}
         onLayout={() => {
           if (homePerfInvestigation.homeListMounted) return;
           homePerfInvestigation.homeListMounted = true;
           homeLog('[HOME PERF] FlatList mounted', perfNow());
           homeLog('[HOME PERF] android list config', {
-            removeClippedSubviews: false,
+            removeClippedSubviews: HOME_LIST_REMOVE_CLIPPED_SUBVIEWS,
             initialNumToRender: 8,
+            onEndReachedThreshold: HOME_END_REACHED_THRESHOLD,
             listType: 'FlatList',
             time: perfNow(),
           });
@@ -4332,7 +5619,7 @@ export default function HomeScreen() {
         columnWrapperStyle={styles.columnWrap}
         showsVerticalScrollIndicator={false}
         scrollsToTop={false}
-        removeClippedSubviews={false}
+        removeClippedSubviews={HOME_LIST_REMOVE_CLIPPED_SUBVIEWS}
         initialNumToRender={8}
         maxToRenderPerBatch={8}
         updateCellsBatchingPeriod={50}
@@ -4343,7 +5630,7 @@ export default function HomeScreen() {
         onMomentumScrollEnd={handleScrollEnd}
         onScrollEndDrag={handleScrollEnd}
         onEndReached={loadMoreVisibleProducts}
-        onEndReachedThreshold={0.35}
+        onEndReachedThreshold={HOME_END_REACHED_THRESHOLD}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -4358,71 +5645,51 @@ export default function HomeScreen() {
       />
 
       <Modal
-        visible={cameraVisible}
-        animationType="slide"
+        visible={Boolean(galleryPreviewPhoto)}
+        animationType="fade"
         presentationStyle="fullScreen"
-        onRequestClose={() => setCameraVisible(false)}
+        onRequestClose={() => setGalleryPreviewPhoto(null)}
       >
-        <View style={styles.cameraScreen}>
-          <CameraView ref={cameraRef} style={styles.cameraPreview} facing="back" />
+        <View style={styles.galleryPreviewScreen}>
+          <Image
+            source={{ uri: galleryPreviewPhoto?.uri || '' }}
+            style={styles.galleryPreviewImage}
+            resizeMode="contain"
+          />
 
-          <SafeAreaView style={styles.cameraControls}>
-            <TouchableOpacity
-              style={styles.cameraCloseButton}
-              activeOpacity={0.85}
-              onPress={() => setCameraVisible(false)}
-            >
-              <Ionicons name="close" size={28} color="#fff" />
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.cameraCaptureButton}
-              activeOpacity={0.85}
-              onPress={captureSearchPhoto}
-              disabled={takingPicture}
-            >
-              {takingPicture ? (
-                <NoodSpinner size={32} />
-              ) : (
-                <View style={styles.cameraCaptureInner} />
-              )}
-            </TouchableOpacity>
+          <SafeAreaView style={styles.galleryPreviewControls}>
+            <Text style={styles.galleryPreviewTitle}>Use this photo?</Text>
+            <View style={styles.galleryPreviewActions}>
+              <TouchableOpacity
+                style={styles.gallerySecondaryButton}
+                activeOpacity={0.9}
+                onPress={handleChooseAnotherGalleryPhoto}
+              >
+                <Text style={styles.gallerySecondaryButtonText}>Choose Another</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.galleryPrimaryButton}
+                activeOpacity={0.9}
+                onPress={() => void handleUseGalleryPhoto()}
+              >
+                <Text style={styles.galleryPrimaryButtonText}>Use Photo</Text>
+              </TouchableOpacity>
+            </View>
           </SafeAreaView>
         </View>
       </Modal>
 
-      <Animated.View
-        style={[
-          styles.cartWrap,
-          {
-            transform: [
-              { scale },
-              {
-                rotate: rotate.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: ['0deg', '6deg'],
-                }),
-              },
-            ],
-          },
-        ]}
-      >
-        <TouchableOpacity
-          style={styles.floatingCartButton}
-          onPress={() => router.push('/(tabs)/cart')}
-          activeOpacity={0.92}
-        >
-          {cartCount > 0 && (
-            <View style={styles.floatingCartBadge}>
-              <Text style={styles.floatingCartBadgeText}>{cartCount}</Text>
-            </View>
-          )}
-
-          <Ionicons name="cart-outline" size={28} color="#9b9b9b" style={styles.floatingCartIcon} />
-          <Text style={styles.floatingCartText}>Cart</Text>
-          <Text style={styles.floatingCartSubText}>Fast checkout</Text>
-        </TouchableOpacity>
-      </Animated.View>
+      <CameraSearchModal
+        visible={cameraVisible}
+        onClose={() => setCameraVisible(false)}
+        onUsePhoto={(photo) => void handleUseCameraPhoto(photo)}
+        onChooseAnother={() => {
+          setCameraVisible(false);
+          requestAnimationFrame(() => {
+            void handlePickSearchImage();
+          });
+        }}
+      />
     </SafeAreaView>
   );
 }
@@ -4560,10 +5827,27 @@ const styles = StyleSheet.create({
 
   homeTopInfoRow: {
     flexDirection: 'row',
-    justifyContent: 'flex-start',
     alignItems: 'center',
-    paddingHorizontal: 14,
+    paddingLeft: 14,
+    paddingRight: 0,
     paddingBottom: 10,
+  },
+
+  homeTopInfoFixed: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flexShrink: 0,
+  },
+
+  homeCollectionScroll: {
+    flex: 1,
+    marginLeft: 10,
+  },
+
+  homeCollectionScrollContent: {
+    alignItems: 'center',
+    paddingRight: 14,
     gap: 10,
   },
 
@@ -5245,17 +6529,37 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
   },
 
+  laceFrontHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+    paddingRight: 4,
+  },
+
+  laceFrontLoadingWrap: {
+    minHeight: 168,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 24,
+  },
+
   laceFrontTitle: {
     fontSize: 34,
     fontWeight: '500',
     color: '#111',
-    marginBottom: 8,
+    marginBottom: 0,
+  },
+
+  laceFrontVideoPosterEmpty: {
+    backgroundColor: '#eee',
   },
 
   laceFrontGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 12,
+    marginTop: 12,
   },
 
   laceFrontVideoCard: {
@@ -5267,6 +6571,12 @@ const styles = StyleSheet.create({
   },
 
   laceFrontVideo: {
+    width: '100%',
+    height: '100%',
+  },
+
+  laceFrontVideoFallback: {
+    ...StyleSheet.absoluteFillObject,
     width: '100%',
     height: '100%',
   },
@@ -5396,6 +6706,63 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: '#111',
   },
+  galleryPreviewScreen: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+  galleryPreviewImage: {
+    flex: 1,
+    width: '100%',
+  },
+  galleryPreviewControls: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    paddingHorizontal: 22,
+    paddingBottom: 28,
+    paddingTop: 18,
+    backgroundColor: 'rgba(0, 0, 0, 0.72)',
+  },
+  galleryPreviewTitle: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '800',
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  galleryPreviewActions: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  gallerySecondaryButton: {
+    flex: 1,
+    minHeight: 48,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.35)',
+  },
+  gallerySecondaryButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  galleryPrimaryButton: {
+    flex: 1,
+    minHeight: 48,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#ff6a00',
+  },
+  galleryPrimaryButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '800',
+  },
   feedFooterLoading: {
     height: 78,
     alignItems: 'center',
@@ -5485,6 +6852,9 @@ const styles = StyleSheet.create({
     color: '#666',
     fontWeight: '600',
   },
+  soldTextUnavailable: {
+    color: '#b42318',
+  },
 
   cartButton: {
     width: 34,
@@ -5512,63 +6882,6 @@ const styles = StyleSheet.create({
   emptyText: {
     fontSize: 14,
     color: '#666',
-  },
-
-  cartWrap: {
-    position: 'absolute',
-    right: 14,
-    bottom: 24,
-    zIndex: 50,
-  },
-
-  floatingCartButton: {
-    width: 110,
-    height: 140,
-    borderRadius: 55,
-    backgroundColor: '#fff',
-    borderWidth: 3,
-    borderColor: '#eda344',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  floatingCartBadge: {
-    position: 'absolute',
-    top: -5,
-    right: -5,
-    backgroundColor: '#ff8a00',
-    borderRadius: 14,
-    paddingHorizontal: 6,
-    height: 28,
-    justifyContent: 'center',
-    minWidth: 28,
-  },
-
-  floatingCartBadgeText: {
-    color: '#fff',
-    fontWeight: '800',
-    textAlign: 'center',
-  },
-
-  floatingCartIcon: {
-    marginBottom: 5,
-  },
-
-  floatingCartText: {
-    fontSize: 20,
-    fontWeight: '800',
-    color: '#ff8a00',
-  },
-
-  floatingCartSubText: {
-    fontSize: 11,
-    backgroundColor: '#fdf0dd',
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    borderRadius: 999,
-    marginTop: 6,
-    color: '#b97b1f',
-    fontWeight: '700',
   },
 
   loadingText: {

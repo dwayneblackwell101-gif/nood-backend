@@ -1,6 +1,24 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Localization from 'expo-localization';
+import {
+  buildCustomerDisplayName,
+  clearCustomerProfile,
+  getCustomerProfile,
+  mapShopifyCustomerToProfile,
+  saveCustomerProfile,
+} from '../utils/customer-profile';
+import { fetchShopifyCustomerAccountProfile } from '../utils/shopify-customer-account-api';
+import {
+  clearShopifyAuthTokens,
+  ensureValidShopifySession,
+  getValidAccessToken,
+  shopifyCustomerLogout,
+} from '../utils/shopify-auth-tokens';
+import { logAuthFlowDebug } from '../utils/auth-flow-debug';
+import { logAuthRestartCheck } from '../utils/auth-restart-debug';
+import { isAppBootstrapComplete } from '../utils/app-bootstrap';
+import { applyPendingReferralAttribution } from '../utils/referral-attribution';
 
 export type UserSettings = {
   country: string;
@@ -13,6 +31,7 @@ export type UserSettings = {
 type UserContextType = {
   settings: UserSettings;
   isReady: boolean;
+  isAuthLoading: boolean;
   isSignedIn: boolean;
   profileId: string;
   displayName: string;
@@ -164,9 +183,48 @@ function getLanguageFromDevice(): string {
   }
 }
 
+async function refreshStoredCustomerProfile(): Promise<string> {
+  const accessToken = await getValidAccessToken();
+  if (!accessToken) {
+    return '';
+  }
+
+  const existingProfile = await getCustomerProfile();
+  const shopifyCustomer = await fetchShopifyCustomerAccountProfile(accessToken);
+
+  if (!shopifyCustomer) {
+    return buildCustomerDisplayName(existingProfile || {}) || existingProfile?.displayName || '';
+  }
+
+  const profile = mapShopifyCustomerToProfile(shopifyCustomer, existingProfile || undefined);
+  await saveCustomerProfile(profile);
+  return buildCustomerDisplayName(profile) || profile.displayName;
+}
+
+async function clearLocalSignedInState(
+  guestProfileId: string,
+  setters: {
+    setIsSignedIn: (value: boolean) => void;
+    setProfileId: (value: string) => void;
+    setDisplayNameState: (value: string) => void;
+  }
+) {
+  await Promise.all([
+    clearShopifyAuthTokens(),
+    clearCustomerProfile(),
+    AsyncStorage.removeItem(DISPLAY_NAME_KEY),
+    AsyncStorage.setItem(SIGNED_IN_KEY, 'false'),
+  ]);
+
+  setters.setIsSignedIn(false);
+  setters.setProfileId(guestProfileId);
+  setters.setDisplayNameState('NOOD Shopper');
+}
+
 export function UserProvider({ children }: { children: React.ReactNode }) {
   const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
   const [isReady, setIsReady] = useState(false);
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
   const [isSignedIn, setIsSignedIn] = useState(false);
   const [profileId, setProfileId] = useState('');
   const [displayName, setDisplayNameState] = useState('NOOD Shopper');
@@ -199,16 +257,14 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
 
   const initializeSettings = useCallback(async () => {
     try {
-      const [saved, savedSignIn, savedGuestProfileId, savedMemberProfileId, savedDisplayName] = await Promise.all([
-        AsyncStorage.getItem(STORAGE_KEY),
-        AsyncStorage.getItem(SIGNED_IN_KEY),
-        AsyncStorage.getItem(GUEST_PROFILE_ID_KEY),
-        AsyncStorage.getItem(MEMBER_PROFILE_ID_KEY),
-        AsyncStorage.getItem(DISPLAY_NAME_KEY),
-      ]);
-
-      const nextIsSignedIn = savedSignIn === 'true';
-      setIsSignedIn(nextIsSignedIn);
+      const [saved, savedSignIn, savedGuestProfileId, savedMemberProfileId, savedDisplayName] =
+        await Promise.all([
+          AsyncStorage.getItem(STORAGE_KEY),
+          AsyncStorage.getItem(SIGNED_IN_KEY),
+          AsyncStorage.getItem(GUEST_PROFILE_ID_KEY),
+          AsyncStorage.getItem(MEMBER_PROFILE_ID_KEY),
+          AsyncStorage.getItem(DISPLAY_NAME_KEY),
+        ]);
 
       const guestProfileId = savedGuestProfileId || createProfileId('guest');
       const memberProfileId = savedMemberProfileId || createProfileId('member');
@@ -218,8 +274,37 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
         savedMemberProfileId ? Promise.resolve() : AsyncStorage.setItem(MEMBER_PROFILE_ID_KEY, memberProfileId),
       ]);
 
+      let nextIsSignedIn = savedSignIn === 'true';
+      let nextDisplayName = savedDisplayName || 'NOOD Shopper';
+
+      if (nextIsSignedIn) {
+        const sessionStatus = await ensureValidShopifySession();
+
+        if (sessionStatus !== 'valid') {
+          console.log('[AUTH] session invalid on launch — clearing signed-in state', sessionStatus);
+          await clearLocalSignedInState(guestProfileId, {
+            setIsSignedIn,
+            setProfileId,
+            setDisplayNameState,
+          });
+          nextIsSignedIn = false;
+          nextDisplayName = 'NOOD Shopper';
+        } else {
+          const refreshedDisplayName = await refreshStoredCustomerProfile();
+          if (refreshedDisplayName) {
+            nextDisplayName = refreshedDisplayName;
+            await AsyncStorage.setItem(DISPLAY_NAME_KEY, refreshedDisplayName);
+          }
+        }
+      }
+
+      setIsSignedIn(nextIsSignedIn);
       setProfileId(nextIsSignedIn ? memberProfileId : guestProfileId);
-      setDisplayNameState(savedDisplayName || 'NOOD Shopper');
+      setDisplayNameState(nextDisplayName);
+
+      if (nextIsSignedIn && memberProfileId) {
+        void applyPendingReferralAttribution(memberProfileId);
+      }
 
       if (saved) {
         const parsed = JSON.parse(saved) as Partial<UserSettings>;
@@ -344,24 +429,58 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     await AsyncStorage.setItem(DISPLAY_NAME_KEY, safeName);
   };
 
-  const markSignedIn = async (nextDisplayName?: string) => {
-    const existingMemberProfileId = await AsyncStorage.getItem(MEMBER_PROFILE_ID_KEY);
-    const nextMemberProfileId = existingMemberProfileId || createProfileId('member');
+  const markSignedIn = useCallback(async (nextDisplayName?: string) => {
+    setIsAuthLoading(true);
+    logAuthFlowDebug('mark-signed-in-start', {
+      signedIn: false,
+      detail: { currentProfileId: profileId || '(empty)' },
+    });
+    logAuthRestartCheck({
+      step: 'mark-signed-in-start',
+      isAppBootstrapping: !isAppBootstrapComplete(),
+      isAuthLoading: true,
+      signedIn: false,
+    });
 
-    if (!existingMemberProfileId) {
-      await AsyncStorage.setItem(MEMBER_PROFILE_ID_KEY, nextMemberProfileId);
+    try {
+      const existingMemberProfileId = await AsyncStorage.getItem(MEMBER_PROFILE_ID_KEY);
+      const nextMemberProfileId = existingMemberProfileId || createProfileId('member');
+
+      if (!existingMemberProfileId) {
+        await AsyncStorage.setItem(MEMBER_PROFILE_ID_KEY, nextMemberProfileId);
+      }
+
+      setIsSignedIn(true);
+      setProfileId(nextMemberProfileId);
+      await AsyncStorage.setItem(SIGNED_IN_KEY, 'true');
+
+      if (nextDisplayName) {
+        const safeName = nextDisplayName.trim() || 'NOOD Shopper';
+        setDisplayNameState(safeName);
+        await AsyncStorage.setItem(DISPLAY_NAME_KEY, safeName);
+      }
+
+      console.log('[AUTH] verified sign in — UserContext updated');
+      logAuthFlowDebug('mark-signed-in-done', {
+        signedIn: true,
+        detail: { profileId: nextMemberProfileId },
+      });
+      logAuthRestartCheck({
+        step: 'mark-signed-in-done',
+        isAppBootstrapping: !isAppBootstrapComplete(),
+        isAuthLoading: false,
+        signedIn: true,
+        detail: { profileId: nextMemberProfileId },
+      });
+      void applyPendingReferralAttribution(nextMemberProfileId);
+    } finally {
+      setIsAuthLoading(false);
     }
-
-    setIsSignedIn(true);
-    setProfileId(nextMemberProfileId);
-    await AsyncStorage.setItem(SIGNED_IN_KEY, 'true');
-
-    if (nextDisplayName) {
-      await setDisplayName(nextDisplayName);
-    }
-  };
+  }, [profileId]);
 
   const signOut = async () => {
+    await shopifyCustomerLogout();
+
     const existingGuestProfileId = await AsyncStorage.getItem(GUEST_PROFILE_ID_KEY);
     const nextGuestProfileId = existingGuestProfileId || createProfileId('guest');
 
@@ -369,9 +488,15 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
       await AsyncStorage.setItem(GUEST_PROFILE_ID_KEY, nextGuestProfileId);
     }
 
+    await clearShopifyAuthTokens();
+    await clearCustomerProfile();
+    await AsyncStorage.removeItem(DISPLAY_NAME_KEY);
+
     setIsSignedIn(false);
     setProfileId(nextGuestProfileId);
+    setDisplayNameState('NOOD Shopper');
     await AsyncStorage.setItem(SIGNED_IN_KEY, 'false');
+    console.log('[AUTH] sign out cleared');
   };
 
   return (
@@ -379,6 +504,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
       value={{
         settings,
         isReady,
+        isAuthLoading,
         isSignedIn,
         profileId,
         displayName,

@@ -7,20 +7,30 @@ import {
   FlatList,
   Image,
   TouchableOpacity,
-  Animated,
   TextInput,
-  Alert,
   BackHandler,
   RefreshControl,
 } from 'react-native';
+import { Image as ExpoImage } from 'expo-image';
+import {
+  CATALOG_LIST_END_REACHED_THRESHOLD,
+  CATALOG_LIST_PROPS,
+} from '../../components/catalog/ListPerf';
 import { useFocusEffect, useLocalSearchParams, router } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCart } from '../../context/CartContext';
-import { BASE_CURRENCY } from '../../utils/currency';
-import { catalogFetch } from '../../utils/catalog';
+import { BASE_CURRENCY, normalizeCatalogCurrencyCode } from '../../utils/currency';
+import { catalogFetch, ensureCatalogFreshness } from '../../utils/catalog';
 import { buildProductRouteParams } from '../../utils/product-navigation';
+import {
+  getProductAvailabilityLabel,
+  resolveListProductAvailableForSale,
+  resolveListProductSoldOut,
+} from '../../utils/product-availability';
+import { noodAlert } from '../../utils/nood-alert';
 import NoodSpinner from '../../components/NoodSpinner';
+import { useScreenPerfReporter } from '../../utils/screen-perf';
 
 const COLLECTION_IMAGE_PLACEHOLDER = 'https://via.placeholder.com/600x700.png?text=No+Image';
 const COLLECTION_PRODUCTS_CACHE_PREFIX = 'NOOD_COLLECTION_PRODUCTS_CACHE_V2';
@@ -47,6 +57,7 @@ const COLLECTION_PRODUCTS_QUERY = `
             id
             title
             handle
+            availableForSale
             featuredImage {
               url
             }
@@ -61,6 +72,7 @@ const COLLECTION_PRODUCTS_QUERY = `
                 node {
                   id
                   title
+                  availableForSale
                   price {
                     amount
                     currencyCode
@@ -89,6 +101,8 @@ type CollectionProduct = {
   currencyCode: string;
   variantId?: string;
   variantTitle?: string;
+  availableForSale?: boolean;
+  variants?: { edges?: any[] };
 };
 
 async function shopifyFetch(query: string, variables?: Record<string, any>) {
@@ -98,28 +112,93 @@ async function shopifyFetch(query: string, variables?: Record<string, any>) {
 function mapCollectionProduct(node: any): CollectionProduct {
   const variant = node?.variants?.edges?.[0]?.node || null;
   const priceAmount = Number(variant?.price?.amount || node?.priceRange?.minVariantPrice?.amount || 0);
-  console.log('[NOOD product load] collection product first variant', {
-    title: node?.title || 'Product',
-    handle: node?.handle || '',
-    productId: node?.id || '',
-    variantId: variant?.id || '',
-    variantTitle: variant?.title || '',
-  });
 
-  return {
+  const mapped: CollectionProduct = {
     id: String(node?.id || ''),
     title: String(node?.title || 'Product'),
     handle: String(node?.handle || ''),
     image: getCollectionImageUri(node?.featuredImage?.url),
     priceAmount,
-    currencyCode:
-      variant?.price?.currencyCode ||
-      node?.priceRange?.minVariantPrice?.currencyCode ||
-      BASE_CURRENCY,
+    currencyCode: normalizeCatalogCurrencyCode(
+      variant?.price?.currencyCode || node?.priceRange?.minVariantPrice?.currencyCode
+    ),
     variantId: variant?.id ? String(variant.id) : undefined,
     variantTitle: variant?.title ? String(variant.title) : undefined,
+    variants: node?.variants?.edges?.length ? node.variants : undefined,
+    availableForSale: Boolean(node?.availableForSale ?? variant?.availableForSale ?? true),
   };
+  mapped.availableForSale = resolveListProductAvailableForSale(mapped);
+  return mapped;
 }
+
+type CollectionProductCardProps = {
+  item: CollectionProduct;
+  displayPrice: string;
+  onOpen: (item: CollectionProduct) => void;
+  onAddToCart: (item: CollectionProduct) => void;
+};
+
+function collectionProductCardPropsAreEqual(
+  prev: CollectionProductCardProps,
+  next: CollectionProductCardProps
+) {
+  return (
+    prev.item.id === next.item.id &&
+    prev.item.handle === next.item.handle &&
+    prev.item.image === next.item.image &&
+    prev.item.title === next.item.title &&
+    prev.item.priceAmount === next.item.priceAmount &&
+    prev.item.variantId === next.item.variantId &&
+    prev.item.availableForSale === next.item.availableForSale &&
+    prev.displayPrice === next.displayPrice &&
+    prev.onOpen === next.onOpen &&
+    prev.onAddToCart === next.onAddToCart
+  );
+}
+
+const CollectionProductCard = React.memo(function CollectionProductCard({
+  item,
+  displayPrice,
+  onOpen,
+  onAddToCart,
+}: CollectionProductCardProps) {
+  const image = getCollectionImageUri(item.image);
+  const isSoldOut = resolveListProductSoldOut(item);
+
+  return (
+    <TouchableOpacity
+      style={styles.card}
+      onPress={() => onOpen(item)}
+      activeOpacity={0.92}
+    >
+      <ExpoImage
+        source={{ uri: image }}
+        style={styles.image}
+        contentFit="cover"
+        cachePolicy="memory-disk"
+        recyclingKey={image}
+        transition={0}
+      />
+
+      <Text numberOfLines={2} style={styles.name}>
+        {item.title}
+      </Text>
+
+      <Text style={styles.price}>{displayPrice}</Text>
+      {isSoldOut ? (
+        <Text style={styles.stockUnavailableText}>{getProductAvailabilityLabel(item)}</Text>
+      ) : null}
+
+      <TouchableOpacity
+        style={styles.smallCartBtn}
+        onPress={() => onAddToCart(item)}
+      >
+        <Ionicons name="cart-outline" size={20} color="#111" />
+        <Ionicons name="add" size={14} color="#111" style={styles.smallCartPlus} />
+      </TouchableOpacity>
+    </TouchableOpacity>
+  );
+}, collectionProductCardPropsAreEqual);
 
 export default function CollectionScreen() {
   const { handle, from } = useLocalSearchParams<{ handle?: string; from?: string }>();
@@ -134,15 +213,12 @@ export default function CollectionScreen() {
   const [search, setSearch] = useState('');
   const [sortMode, setSortMode] = useState<'default' | 'price-low' | 'price-high' | 'name'>('default');
   const {
-    cartCount,
     addToCart,
     selectedCurrency = BASE_CURRENCY,
     convertPrice,
     formatMoney,
   } = useCart();
 
-  const scale = useRef(new Animated.Value(1)).current;
-  const rotate = useRef(new Animated.Value(0)).current;
   const isFetchingRef = useRef(false);
   const isFetchingMoreRef = useRef(false);
   const productsRef = useRef<CollectionProduct[]>([]);
@@ -321,7 +397,7 @@ export default function CollectionScreen() {
       } catch (err) {
         console.log(err);
         if (!productsRef.current.length) {
-          Alert.alert('Error', 'Failed to load collection.');
+          noodAlert('Error', 'Failed to load collection.');
         }
       } finally {
         setLoading(false);
@@ -393,42 +469,17 @@ export default function CollectionScreen() {
       if (!collectionHandle) return;
       await loadCollectionFromCache(collectionHandle);
       void loadCollectionProducts(false);
+      void ensureCatalogFreshness('collection')
+        .then((changed) => {
+          if (changed) {
+            void loadCollectionProducts(true);
+          }
+        })
+        .catch((error) => {
+          console.log('[NOOD catalog] collection freshness check error', error);
+        });
     })();
   }, [handle, loadCollectionFromCache, loadCollectionProducts]);
-
-  useEffect(() => {
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.parallel([
-          Animated.timing(scale, {
-            toValue: 1.08,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-          Animated.timing(rotate, {
-            toValue: 1,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-        ]),
-        Animated.parallel([
-          Animated.timing(scale, {
-            toValue: 1,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-          Animated.timing(rotate, {
-            toValue: 0,
-            duration: 700,
-            useNativeDriver: true,
-          }),
-        ]),
-      ])
-    );
-
-    loop.start();
-    return () => loop.stop();
-  }, [rotate, scale]);
 
   const cleanTitle = String(collectionTitle || handle || '')
     .replace('-collection', '')
@@ -463,7 +514,7 @@ export default function CollectionScreen() {
   }, [products, search, sortMode]);
 
   const handleFilterPress = () => {
-    Alert.alert('Filters', 'Filter options can be added next.');
+    noodAlert('Filters', 'Filter options can be added next.');
   };
 
   const handleSortPress = () => {
@@ -493,6 +544,77 @@ export default function CollectionScreen() {
         selectedCurrency
       ),
     [convertPrice, formatMoney, getVariantPrice, selectedCurrency]
+  );
+
+  const displayPriceById = useMemo(() => {
+    const map = new Map<string, string>();
+    filteredProducts.forEach((item) => {
+      map.set(item.id, getDisplayPrice(item));
+    });
+    return map;
+  }, [filteredProducts, getDisplayPrice]);
+
+  const handleOpenCollectionProduct = useCallback(
+    (item: CollectionProduct) => {
+      router.push({
+        pathname: '/product/[handle]',
+        params: buildProductRouteParams(item, {
+          from: from || 'collection',
+        }),
+      });
+    },
+    [from]
+  );
+
+  const handleAddCollectionProductToCart = useCallback(
+    (item: CollectionProduct) => {
+      if (resolveListProductSoldOut(item)) return;
+      if (!item.variantId) return;
+
+      const image = getCollectionImageUri(item.image);
+      addToCart({
+        id: item.variantId,
+        productId: item.id.toString(),
+        variantId: item.variantId,
+        title: item.title,
+        handle: item.handle,
+        variantTitle: item.variantTitle || 'Default Title',
+        price: getVariantPrice(item),
+        currencyCode: item.currencyCode || BASE_CURRENCY,
+        baseCurrency: item.currencyCode || BASE_CURRENCY,
+        image,
+        quantity: 1,
+      });
+    },
+    [addToCart, getVariantPrice]
+  );
+
+  const collectionKeyExtractor = useCallback((item: CollectionProduct) => item.id, []);
+
+  const renderCollectionItem = useCallback(
+    ({ item }: { item: CollectionProduct }) => (
+      <CollectionProductCard
+        item={item}
+        displayPrice={displayPriceById.get(item.id) || getDisplayPrice(item)}
+        onOpen={handleOpenCollectionProduct}
+        onAddToCart={handleAddCollectionProductToCart}
+      />
+    ),
+    [displayPriceById, getDisplayPrice, handleAddCollectionProductToCart, handleOpenCollectionProduct]
+  );
+
+  const handleLoadMoreCollection = useCallback(() => {
+    void loadMoreCollectionProducts();
+  }, [loadMoreCollectionProducts]);
+
+  useScreenPerfReporter(
+    'collection',
+    {
+      itemCount: filteredProducts.length,
+      isFetching: loading || loadingMore,
+      isRefreshing: refreshing,
+    },
+    [filteredProducts.length, loading, loadingMore, refreshing]
   );
 
   if (loading) {
@@ -561,85 +683,27 @@ export default function CollectionScreen() {
       <FlatList
         data={filteredProducts}
         numColumns={2}
-        keyExtractor={(item) => item.id.toString()}
+        keyExtractor={collectionKeyExtractor}
+        renderItem={renderCollectionItem}
         columnWrapperStyle={styles.row}
         contentContainerStyle={styles.listContent}
+        {...CATALOG_LIST_PROPS}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
             onRefresh={() => {
-              void loadCollectionProducts(true);
+              void (async () => {
+                await ensureCatalogFreshness('collection');
+                await loadCollectionProducts(true);
+              })();
             }}
             tintColor="#ff6a00"
             colors={['#ff6a00']}
             progressBackgroundColor="#ffffff"
           />
         }
-        renderItem={({ item }) => {
-          const image = getCollectionImageUri(item.image);
-
-          return (
-            <TouchableOpacity
-              style={styles.card}
-              onPress={() =>
-                router.push({
-                  pathname: '/product/[handle]',
-                  params: buildProductRouteParams(item, {
-                    from: from || 'collection',
-                  }),
-                })
-              }
-              activeOpacity={0.92}
-            >
-              <Image source={{ uri: image }} style={styles.image} />
-
-              <Text numberOfLines={2} style={styles.name}>
-                {item.title}
-              </Text>
-
-              <Text style={styles.price}>{getDisplayPrice(item)}</Text>
-
-              <TouchableOpacity
-                style={styles.smallCartBtn}
-                onPress={() => {
-                  if (!item.variantId) {
-                    console.log('[NOOD cart] missing variantId on collection product', item);
-                    return;
-                  }
-
-                  console.log('[NOOD cart] collection Add to Cart selected variant', {
-                    title: item.title,
-                    handle: item.handle,
-                    productId: item.id,
-                    variantId: item.variantId,
-                    variantTitle: item.variantTitle || 'Default Title',
-                  });
-
-                  addToCart({
-                    id: item.variantId,
-                    productId: item.id.toString(),
-                    variantId: item.variantId,
-                    title: item.title,
-                    handle: item.handle,
-                    variantTitle: item.variantTitle || 'Default Title',
-                    price: getVariantPrice(item),
-                    currencyCode: item.currencyCode || BASE_CURRENCY,
-                    baseCurrency: item.currencyCode || BASE_CURRENCY,
-                    image,
-                    quantity: 1,
-                  });
-                }}
-              >
-                <Ionicons name="cart-outline" size={20} color="#111" />
-                <Ionicons name="add" size={14} color="#111" style={styles.smallCartPlus} />
-              </TouchableOpacity>
-            </TouchableOpacity>
-          );
-        }}
-        onEndReachedThreshold={0.35}
-        onEndReached={() => {
-          void loadMoreCollectionProducts();
-        }}
+        onEndReachedThreshold={CATALOG_LIST_END_REACHED_THRESHOLD}
+        onEndReached={handleLoadMoreCollection}
         ListFooterComponent={
           loadingMore ? (
             <View style={styles.footerLoader}>
@@ -653,38 +717,6 @@ export default function CollectionScreen() {
           </View>
         }
       />
-
-      <Animated.View
-        style={[
-          styles.cartWrap,
-          {
-            transform: [
-              { scale },
-              {
-                rotate: rotate.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: ['0deg', '6deg'],
-                }),
-              },
-            ],
-          },
-        ]}
-      >
-        <TouchableOpacity
-          style={styles.cartButton}
-          onPress={() => router.push('/(tabs)/cart')}
-        >
-          {cartCount > 0 && (
-            <View style={styles.badge}>
-              <Text style={styles.badgeText}>{cartCount}</Text>
-            </View>
-          )}
-
-          <Text style={styles.icon}>🛒</Text>
-          <Text style={styles.cartText}>Cart</Text>
-          <Text style={styles.subText}>Fast checkout</Text>
-        </TouchableOpacity>
-      </Animated.View>
     </View>
   );
 }
@@ -846,6 +878,12 @@ const styles = StyleSheet.create({
     color: '#111',
   },
 
+  stockUnavailableText: {
+    fontSize: 12,
+    color: '#b42318',
+    fontWeight: '700',
+    marginTop: 2,
+  },
   price: {
     fontSize: 14,
     fontWeight: '800',
@@ -892,63 +930,5 @@ const styles = StyleSheet.create({
   footerLoader: {
     paddingVertical: 24,
     alignItems: 'center',
-  },
-
-  cartWrap: {
-    position: 'absolute',
-    right: 14,
-    bottom: 24,
-    zIndex: 50,
-  },
-
-  cartButton: {
-    width: 110,
-    height: 140,
-    borderRadius: 55,
-    backgroundColor: '#fff',
-    borderWidth: 3,
-    borderColor: '#eda344',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  badge: {
-    position: 'absolute',
-    top: -5,
-    right: -5,
-    backgroundColor: '#ff8a00',
-    borderRadius: 14,
-    paddingHorizontal: 6,
-    height: 28,
-    justifyContent: 'center',
-    minWidth: 28,
-  },
-
-  badgeText: {
-    color: '#fff',
-    fontWeight: '800',
-    textAlign: 'center',
-  },
-
-  icon: {
-    fontSize: 24,
-    marginBottom: 5,
-  },
-
-  cartText: {
-    fontSize: 20,
-    fontWeight: '800',
-    color: '#ff8a00',
-  },
-
-  subText: {
-    fontSize: 11,
-    backgroundColor: '#fdf0dd',
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    borderRadius: 999,
-    marginTop: 6,
-    color: '#b97b1f',
-    fontWeight: '700',
   },
 });

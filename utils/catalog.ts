@@ -4,27 +4,82 @@ import {
   getBackendJson,
   isBackendAbortError,
 } from './backend';
-
-const PRODUCT_FEED_TIMEOUT_MS = 60000;
-const COLLECTION_PRODUCTS_TIMEOUT_MS = 60000;
+import {
+  catalogCacheDebugSummary,
+  emergencyPruneCatalogStorage,
+  isStorageFullError,
+} from './catalog-cache';
+import { CATALOG_CACHE_DEBUG } from './debug-flags';
+const PRODUCT_FEED_TIMEOUT_MS = 25000;
+const COLLECTION_PRODUCTS_TIMEOUT_MS = 25000;
 const SEARCH_CATALOG_TIMEOUT_MS = 30000;
 
 let homeProductFeedSession = 0;
 let activeHomeProductFeedController: AbortController | null = null;
 const lastSuccessfulProductFeedPages = new Map<string, CatalogJson>();
+const MAX_MEMORY_PRODUCT_FEED_PAGES = 8;
+
+function rememberProductFeedPage(cacheKey: string, payload: CatalogJson) {
+  if (!cacheKey) return;
+  if (lastSuccessfulProductFeedPages.has(cacheKey)) {
+    lastSuccessfulProductFeedPages.delete(cacheKey);
+  }
+  lastSuccessfulProductFeedPages.set(cacheKey, payload);
+  while (lastSuccessfulProductFeedPages.size > MAX_MEMORY_PRODUCT_FEED_PAGES) {
+    const oldestKey = lastSuccessfulProductFeedPages.keys().next().value;
+    if (!oldestKey) break;
+    lastSuccessfulProductFeedPages.delete(oldestKey);
+  }
+}
 
 const CATALOG_LOCAL_CACHE_PREFIX = 'NOOD_CATALOG_LOCAL_V2_SLIM';
 const LEGACY_CATALOG_CACHE_PREFIX = 'NOOD_CATALOG_LOCAL_V1';
 const CATALOG_CACHE_INDEX_KEY = `${CATALOG_LOCAL_CACHE_PREFIX}:__index__`;
+export const CATALOG_BACKEND_VERSION_STORAGE_KEY = 'NOOD_CATALOG_BACKEND_VERSION';
+const CATALOG_BACKEND_VERSION_KEY = CATALOG_BACKEND_VERSION_STORAGE_KEY;
+const HOME_PRODUCTS_CACHE_KEY = 'NOOD_HOME_PRODUCTS_CACHE_V2';
+const SEARCH_PRODUCTS_CACHE_KEY = 'NOOD_SEARCH_PRODUCTS_CACHE_V1';
+const CATEGORIES_CACHE_KEY = 'NOOD_CATEGORIES_CACHE_V19_MEN_EXPLICIT';
+const CATEGORIES_IMAGE_CACHE_KEY = 'NOOD_CATEGORIES_IMAGE_URLS_V20';
+const CATEGORY_TRENDING_CACHE_KEY = 'NOOD_CATEGORY_TRENDING_CACHE_V1';
+const LEGACY_CATEGORIES_CACHE_KEYS = [
+  'NOOD_CATEGORIES_CACHE_V17_SHOPIFY_MENU_AUTO',
+  'NOOD_CATEGORIES_CACHE_V18_VERSIONED',
+];
+const COLLECTION_PRODUCTS_CACHE_PREFIX = 'NOOD_COLLECTION_PRODUCTS_CACHE_V2';
+const CATALOG_VERSION_CHECK_TTL_MS = 8000;
+const CATALOG_VERSION_REQUEST_TIMEOUT_MS = 5000;
+
+type CatalogFreshnessScope =
+  | 'launch'
+  | 'home-open'
+  | 'pull'
+  | 'category'
+  | 'search'
+  | 'product-detail'
+  | 'collection'
+  | 'fetch'
+  | 'home-feed';
+
+let catalogFreshnessInFlight: Promise<boolean> | null = null;
+
+type CatalogVersionInfo = {
+  catalogVersion: number;
+  catalogUpdatedAt: string | null;
+  lastSyncAt: string | null;
+};
+
+let cachedBackendCatalogVersion: CatalogVersionInfo | null = null;
+let lastCatalogVersionCheckAt = 0;
 
 let legacyCatalogCleanupStarted = false;
 
 const MAX_CACHE_ENTRIES = 20;
 const MAX_PRODUCTS_PER_LIST = 48;
-const MAX_ENTRY_BYTES = 100_000;
-const MAX_TOTAL_CACHE_BYTES = 1_200_000;
-const MAX_PRODUCT_DETAIL_IMAGES = 8;
-const MAX_PRODUCT_DETAIL_VARIANTS = 40;
+const MAX_ENTRY_BYTES = 300_000;
+const MAX_TOTAL_CACHE_BYTES = 2_000_000;
+const MAX_PRODUCT_DETAIL_IMAGES = 30;
+const MAX_PRODUCT_DETAIL_VARIANTS = 250;
 const MAX_PRODUCT_DETAIL_HTML = 12_000;
 
 type CatalogJson = {
@@ -61,6 +116,13 @@ function resolveCatalogRequestTimeoutMs(path: string, override?: number) {
     return SEARCH_CATALOG_TIMEOUT_MS;
   }
 
+  if (
+    path.startsWith('/api/catalog/collections') ||
+    path.startsWith('/api/catalog/menus/')
+  ) {
+    return 12000;
+  }
+
   return 20000;
 }
 
@@ -72,21 +134,207 @@ type CacheIndexEntry = {
 };
 
 function catalogCacheLog(message: string, detail?: Record<string, unknown>) {
-  if (__DEV__) {
+  if (CATALOG_CACHE_DEBUG) {
     console.log(message, detail);
-  } else if (message.includes('skipped/cleaned')) {
+    return;
+  }
+
+  if (
+    !__DEV__ &&
+    (message.includes('skipped/cleaned') || message.includes('[NOOD app catalog]'))
+  ) {
     console.log(message, detail);
   }
 }
 
-function isStorageFullError(error: unknown) {
-  const message = String((error as any)?.message || error || '').toLowerCase();
-  return (
-    message.includes('sqlite_full') ||
-    message.includes('disk is full') ||
-    message.includes('code 13') ||
-    message.includes('quota')
-  );
+export async function fetchBackendCatalogVersion(
+  force = false
+): Promise<CatalogVersionInfo | null> {
+  if (
+    !force &&
+    cachedBackendCatalogVersion &&
+    Date.now() - lastCatalogVersionCheckAt < CATALOG_VERSION_CHECK_TTL_MS
+  ) {
+    return cachedBackendCatalogVersion;
+  }
+
+  try {
+    const payload = (await getBackendJson('/api/catalog/version', {
+      catalog: true,
+      timeoutMs: CATALOG_VERSION_REQUEST_TIMEOUT_MS,
+    })) as Record<string, unknown>;
+
+    cachedBackendCatalogVersion = {
+      catalogVersion: Number(payload?.catalogVersion) || 0,
+      catalogUpdatedAt: String(payload?.catalogUpdatedAt || '') || null,
+      lastSyncAt: String(payload?.lastSyncAt || '') || null,
+    };
+    lastCatalogVersionCheckAt = Date.now();
+    return cachedBackendCatalogVersion;
+  } catch (error) {
+    catalogCacheLog('[NOOD app catalog] version check failed', {
+      error: String((error as any)?.message || error),
+    });
+    return null;
+  }
+}
+
+export async function getStoredCatalogVersion(): Promise<number> {
+  try {
+    const raw = await AsyncStorage.getItem(CATALOG_BACKEND_VERSION_KEY);
+    return Number(raw) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function setStoredCatalogVersion(version: number) {
+  await AsyncStorage.setItem(CATALOG_BACKEND_VERSION_KEY, String(Math.max(0, Number(version) || 0)));
+}
+
+export async function hasBackendCatalogChanged(force = false): Promise<boolean> {
+  const backend = await fetchBackendCatalogVersion(force);
+  if (!backend) {
+    return false;
+  }
+
+  const stored = await getStoredCatalogVersion();
+  return backend.catalogVersion > stored;
+}
+
+async function invalidateStaleCatalogCaches() {
+  const index = await readCacheIndex();
+  const keysToRemove = index
+    .filter((entry) => {
+      const path = entry.path;
+      if (path.includes('/api/catalog/products?')) return true;
+      if (path.includes('/api/catalog/search')) return true;
+      if (path.includes('/collections/') && path.includes('/products')) return true;
+      if (
+        path.includes('/api/catalog/products/') &&
+        !path.includes('recommendations')
+      ) {
+        return true;
+      }
+      return false;
+    })
+    .map((entry) => entry.key);
+
+  if (keysToRemove.length) {
+    await removeCatalogCacheKeys(keysToRemove);
+    const nextIndex = index.filter((entry) => !keysToRemove.includes(entry.key));
+    await writeCacheIndex(nextIndex);
+  }
+
+  lastSuccessfulProductFeedPages.clear();
+
+  try {
+    const { clearProductDetailCache } = await import('./product-data');
+    await clearProductDetailCache();
+  } catch {
+    // ignore product detail cache clear errors
+  }
+
+  try {
+    const allKeys = await AsyncStorage.getAllKeys();
+    const auxiliaryKeys = [
+      HOME_PRODUCTS_CACHE_KEY,
+      SEARCH_PRODUCTS_CACHE_KEY,
+      CATEGORIES_CACHE_KEY,
+      CATEGORY_TRENDING_CACHE_KEY,
+      ...LEGACY_CATEGORIES_CACHE_KEYS,
+      ...allKeys.filter((key) => key.startsWith(`${COLLECTION_PRODUCTS_CACHE_PREFIX}_`)),
+    ];
+    await AsyncStorage.multiRemove([...new Set(auxiliaryKeys)]);
+  } catch (error) {
+    catalogCacheLog('[NOOD app catalog] auxiliary cache clear failed', {
+      error: String((error as any)?.message || error),
+    });
+  }
+
+  console.log('[NOOD app catalog] local cache refreshed', {
+    removedEntries: keysToRemove.length,
+  });
+}
+
+async function handleCatalogVersionChange(
+  scope: CatalogFreshnessScope,
+  versions: { backendVersion: number; storedVersion: number; catalogUpdatedAt?: string | null }
+) {
+  console.log('[NOOD app catalog] backend version changed', {
+    scope,
+    backendVersion: versions.backendVersion,
+    storedVersion: versions.storedVersion,
+    catalogUpdatedAt: versions.catalogUpdatedAt ?? null,
+  });
+
+  await invalidateStaleCatalogCaches();
+  await setStoredCatalogVersion(versions.backendVersion);
+}
+
+async function runCatalogVersionCheck(
+  scope: CatalogFreshnessScope,
+  options: { force?: boolean; refreshOnChange?: boolean; logCheck?: boolean } = {}
+): Promise<boolean> {
+  const force = Boolean(options.force);
+  const refreshOnChange = options.refreshOnChange !== false;
+  const logCheck = options.logCheck !== false;
+
+  if (logCheck) {
+    console.log('[NOOD app catalog] checking backend version', { scope });
+  }
+
+  const backend = await fetchBackendCatalogVersion(force);
+  const stored = await getStoredCatalogVersion();
+  const backendVersion = backend?.catalogVersion ?? stored;
+
+  if (!backend || backendVersion <= stored) {
+    if (logCheck) {
+      console.log('[NOOD app catalog] version unchanged', {
+        scope,
+        backendVersion,
+        storedVersion: stored,
+      });
+    }
+    return false;
+  }
+
+  if (refreshOnChange) {
+    await handleCatalogVersionChange(scope, {
+      backendVersion,
+      storedVersion: stored,
+      catalogUpdatedAt: backend.catalogUpdatedAt,
+    });
+  }
+
+  return true;
+}
+
+export async function ensureCatalogFreshness(
+  scope: CatalogFreshnessScope = 'launch'
+): Promise<boolean> {
+  if (catalogFreshnessInFlight) {
+    return catalogFreshnessInFlight;
+  }
+
+  catalogFreshnessInFlight = runCatalogVersionCheck(scope, {
+    force: true,
+    refreshOnChange: true,
+  }).finally(() => {
+    catalogFreshnessInFlight = null;
+  });
+
+  return catalogFreshnessInFlight;
+}
+
+export async function peekCatalogFreshness(
+  scope: CatalogFreshnessScope = 'fetch'
+): Promise<boolean> {
+  return runCatalogVersionCheck(scope, {
+    force: false,
+    refreshOnChange: true,
+    logCheck: false,
+  });
 }
 
 function buildStorageKey(cacheKey: string) {
@@ -132,6 +380,33 @@ function trimText(value: unknown, maxLength: number) {
   return String(value || '').slice(0, maxLength);
 }
 
+function slimVariantNode(node: any) {
+  return {
+    id: trimText(node?.id, 120),
+    title: trimText(node?.title, 80),
+    availableForSale: Boolean(node?.availableForSale ?? true),
+    quantityAvailable: node?.quantityAvailable ?? null,
+    price: node?.price
+      ? {
+          amount: trimText(node?.price?.amount || '0', 24),
+          currencyCode: trimText(node?.price?.currencyCode || 'USD', 8),
+        }
+      : undefined,
+    selectedOptions: Array.isArray(node?.selectedOptions)
+      ? node.selectedOptions.slice(0, 6).map((option: any) => ({
+          name: trimText(option?.name, 40),
+          value: trimText(option?.value, 80),
+        }))
+      : [],
+    image: node?.image?.url
+      ? {
+          url: trimText(node.image.url, 512),
+          altText: trimText(node?.image?.altText, 120),
+        }
+      : null,
+  };
+}
+
 function slimListProductNode(node: any, collectionHandle = '') {
   const firstVariant = node?.variants?.edges?.[0]?.node || null;
   const price = node?.priceRange?.minVariantPrice || firstVariant?.price || null;
@@ -160,14 +435,14 @@ function slimListProductNode(node: any, collectionHandle = '') {
     priceRange: {
       minVariantPrice: {
         amount: trimText(price?.amount || '0', 24),
-        currencyCode: trimText(price?.currencyCode || 'TTD', 8),
+        currencyCode: trimText(price?.currencyCode || 'USD', 8),
       },
     },
     compareAtPriceRange: compareAt
       ? {
           maxVariantPrice: {
             amount: trimText(compareAt, 24),
-            currencyCode: trimText(price?.currencyCode || 'TTD', 8),
+            currencyCode: trimText(price?.currencyCode || 'USD', 8),
           },
         }
       : { maxVariantPrice: null },
@@ -184,18 +459,9 @@ function slimListProductNode(node: any, collectionHandle = '') {
         })),
     },
     variants: {
-      edges: firstVariant?.id
-        ? [
-            {
-              node: {
-                id: trimText(firstVariant.id, 120),
-                title: trimText(firstVariant.title, 80),
-                availableForSale: Boolean(firstVariant.availableForSale ?? true),
-                quantityAvailable: firstVariant?.quantityAvailable ?? null,
-              },
-            },
-          ]
-        : [],
+      edges: (node?.variants?.edges || [])
+        .slice(0, MAX_PRODUCT_DETAIL_VARIANTS)
+        .map((edge: any) => ({ node: slimVariantNode(edge?.node) })),
     },
   };
 }
@@ -238,23 +504,9 @@ function slimProductDetail(product: any) {
     };
   });
 
-  const variants = (product?.variants?.edges || []).slice(0, MAX_PRODUCT_DETAIL_VARIANTS).map((edge: any) => ({
-    node: {
-      id: trimText(edge?.node?.id, 120),
-      title: trimText(edge?.node?.title, 80),
-      availableForSale: Boolean(edge?.node?.availableForSale ?? true),
-      price: {
-        amount: trimText(edge?.node?.price?.amount || '0', 24),
-        currencyCode: trimText(edge?.node?.price?.currencyCode || 'TTD', 8),
-      },
-      selectedOptions: Array.isArray(edge?.node?.selectedOptions)
-        ? edge.node.selectedOptions.slice(0, 6).map((option: any) => ({
-            name: trimText(option?.name, 40),
-            value: trimText(option?.value, 80),
-          }))
-        : [],
-    },
-  }));
+  const variants = (product?.variants?.edges || [])
+    .slice(0, MAX_PRODUCT_DETAIL_VARIANTS)
+    .map((edge: any) => ({ node: slimVariantNode(edge?.node) }));
 
   return {
     id: trimText(product?.id, 120),
@@ -269,7 +521,7 @@ function slimProductDetail(product: any) {
     images: { edges: images },
     media: { edges: media },
     priceRange: product?.priceRange || {
-      minVariantPrice: { amount: '0', currencyCode: 'TTD' },
+      minVariantPrice: { amount: '0', currencyCode: 'USD' },
     },
     variants: { edges: variants },
   };
@@ -373,7 +625,7 @@ async function removeCatalogCacheKeys(keys: string[]) {
 
 async function cleanupCatalogCache(options: { aggressive?: boolean } = {}) {
   const index = await readCacheIndex();
-  if (!index.length) return;
+  if (!index.length) return 0;
 
   const aggressive = Boolean(options.aggressive);
   const sorted = [...index].sort((a, b) => a.ts - b.ts);
@@ -396,7 +648,7 @@ async function cleanupCatalogCache(options: { aggressive?: boolean } = {}) {
     runningTotal -= oldest.bytes;
   }
 
-  if (!keysToRemove.length) return;
+  if (!keysToRemove.length) return 0;
 
   await removeCatalogCacheKeys(keysToRemove);
   const nextIndex = remaining.filter((entry) => !keysToRemove.includes(entry.key));
@@ -405,6 +657,7 @@ async function cleanupCatalogCache(options: { aggressive?: boolean } = {}) {
     removedEntries: keysToRemove.length,
     remainingEntries: nextIndex.length,
   });
+  return keysToRemove.length;
 }
 
 async function readLocalCatalogCache(cacheKey: string) {
@@ -421,6 +674,12 @@ async function readLocalCatalogCache(cacheKey: string) {
 
 async function writeLocalCatalogCache(cacheKey: string, path: string, payload: CatalogJson) {
   if (!cacheKey || !payload?.data) return;
+
+  const startedAt = Date.now();
+  const beforeIndex = await readCacheIndex();
+  const beforeCount = beforeIndex.length;
+  let deletedOldRows = 0;
+  let errorCode: string | null = null;
 
   const slimData = slimCatalogPayload(path, payload.data);
   if (!slimData) {
@@ -451,14 +710,14 @@ async function writeLocalCatalogCache(cacheKey: string, path: string, payload: C
   const storageKey = buildStorageKey(cacheKey);
 
   const persist = async () => {
-    await cleanupCatalogCache();
+    deletedOldRows += await cleanupCatalogCache();
     const index = await readCacheIndex();
     const withoutCurrent = index.filter((entry) => entry.key !== storageKey);
     const projectedTotal =
       withoutCurrent.reduce((sum, entry) => sum + entry.bytes, 0) + bytes;
 
     if (projectedTotal > MAX_TOTAL_CACHE_BYTES || withoutCurrent.length >= MAX_CACHE_ENTRIES) {
-      await cleanupCatalogCache({ aggressive: true });
+      deletedOldRows += await cleanupCatalogCache({ aggressive: true });
     }
 
     await AsyncStorage.setItem(storageKey, serialized);
@@ -471,28 +730,70 @@ async function writeLocalCatalogCache(cacheKey: string, path: string, payload: C
       .slice(0, MAX_CACHE_ENTRIES);
 
     await writeCacheIndex(nextIndex);
+    return nextIndex.length;
   };
 
   try {
-    await persist();
+    const afterCount = await persist();
+    catalogCacheDebugSummary({
+      scope: 'catalog-local',
+      beforeCount,
+      insertCount: 1,
+      afterCount,
+      deletedOldRows,
+      durationMs: Date.now() - startedAt,
+      errorCode,
+    });
   } catch (error) {
     if (!isStorageFullError(error)) {
+      errorCode = 'WRITE_FAILED';
       catalogCacheLog('[NOOD catalog] local cache skipped/cleaned because storage full', {
         reason: 'write-failed',
         path,
         error: String((error as any)?.message || error),
       });
+      catalogCacheDebugSummary({
+        scope: 'catalog-local',
+        beforeCount,
+        insertCount: 0,
+        afterCount: beforeCount,
+        deletedOldRows,
+        durationMs: Date.now() - startedAt,
+        errorCode,
+      });
       return;
     }
 
+    errorCode = 'SQLITE_FULL';
+
     try {
-      await cleanupCatalogCache({ aggressive: true });
-      await persist();
+      deletedOldRows += (await emergencyPruneCatalogStorage({ aggressive: true })).deletedOldRows;
+      const afterCount = await persist();
+      errorCode = null;
+      catalogCacheDebugSummary({
+        scope: 'catalog-local',
+        beforeCount,
+        insertCount: 1,
+        afterCount,
+        deletedOldRows,
+        durationMs: Date.now() - startedAt,
+        errorCode,
+      });
     } catch (retryError) {
+      errorCode = isStorageFullError(retryError) ? 'SQLITE_FULL' : 'WRITE_FAILED';
       catalogCacheLog('[NOOD catalog] local cache skipped/cleaned because storage full', {
         reason: 'write-failed-after-cleanup',
         path,
         error: String((retryError as any)?.message || retryError),
+      });
+      catalogCacheDebugSummary({
+        scope: 'catalog-local',
+        beforeCount,
+        insertCount: 0,
+        afterCount: beforeCount,
+        deletedOldRows,
+        durationMs: Date.now() - startedAt,
+        errorCode,
       });
     }
   }
@@ -622,6 +923,12 @@ export async function fetchHomeProductFeedPath(
   const manualRefresh = Boolean(options.manualRefresh);
   const mixKey = options.mixKey;
 
+  if (!manualRefresh) {
+    void peekCatalogFreshness('home-feed').catch(() => {
+      // Freshness refresh runs in background and must not block cached feed rendering.
+    });
+  }
+
   const cacheKey = normalizeCacheKey(
     mixKey !== undefined && path.startsWith('/api/catalog/products?')
       ? `${path}&mixKey=${encodeURIComponent(String(mixKey))}`
@@ -676,8 +983,13 @@ export async function fetchHomeProductFeedPath(
 
       const resolvedCacheKey = normalizeCacheKey(resolvedPath);
       if (payload?.data && resolvedCacheKey) {
-        lastSuccessfulProductFeedPages.set(resolvedCacheKey, payload);
+        rememberProductFeedPage(resolvedCacheKey, payload);
         void writeLocalCatalogCache(resolvedCacheKey, resolvedPath, payload);
+      }
+
+      const backendVersion = await fetchBackendCatalogVersion();
+      if (backendVersion) {
+        await setStoredCatalogVersion(backendVersion.catalogVersion);
       }
 
       return payload;
@@ -817,6 +1129,11 @@ async function refreshCatalogFromBackend(
     void writeLocalCatalogCache(cacheKey, path, payload);
   }
 
+  const backendVersion = await fetchBackendCatalogVersion();
+  if (backendVersion) {
+    await setStoredCatalogVersion(backendVersion.catalogVersion);
+  }
+
   return {
     data: payload.data,
     errors: payload.errors,
@@ -824,6 +1141,8 @@ async function refreshCatalogFromBackend(
     success: payload.success,
   };
 }
+
+export { clearCatalogCacheForDev } from './catalog-cache';
 
 export async function clearCatalogProductListCache() {
   try {
@@ -861,6 +1180,7 @@ export async function fetchCatalogPath(
     !options.skipLocalCache &&
     !shouldSkipLocalCache(path) &&
     !isProductFeed;
+
   const cached = canUseLocalCache ? await readLocalCatalogCache(cacheKey) : null;
   const cachedProductCount =
     path.includes('/api/catalog/products') && !path.includes('/api/catalog/products/')
@@ -868,6 +1188,12 @@ export async function fetchCatalogPath(
       : null;
   const hasUsableProductCache = cachedProductCount === null || cachedProductCount > 0;
   const backendRefresh = refreshCatalogFromBackend(path, cacheKey, options.timeoutMs);
+
+  if (canUseLocalCache) {
+    void peekCatalogFreshness('fetch').catch(() => {
+      // Version refresh must not block cache-first catalog reads.
+    });
+  }
 
   if (cached?.data && hasUsableProductCache) {
     void backendRefresh.catch(() => {});

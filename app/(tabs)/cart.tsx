@@ -1,22 +1,33 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Animated,
+  FlatList,
   Image,
+  RefreshControl,
   SafeAreaView,
-  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
+import { Image as ExpoImage } from 'expo-image';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import { router, useFocusEffect } from 'expo-router';
+import { router, useFocusEffect, useNavigation } from 'expo-router';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCart } from '../../context/CartContext';
+import { useWishlist } from '../../context/WishlistContext';
 import { useHistoryEvents } from '../../context/HistoryContext';
+import { useUser } from '../../context/UserContext';
+import type { CatalogListProduct } from '../../utils/catalog-product-mapper';
+import { loadCartRecommendations } from '../../utils/cart-recommendations';
+import { SHOPIFY_CHECKOUT_CURRENCY } from '../../utils/checkout-totals';
 import { BASE_CURRENCY } from '../../utils/currency';
+import { resolveCustomerStorageKey } from '../../utils/customer-storage';
+import { buildProductRouteParams } from '../../utils/product-navigation';
 import NoodSpinner from '../../components/NoodSpinner';
-import { catalogFetch } from '../../utils/catalog';
+import NoodSwipeableRow from '../../components/NoodSwipeableRow';
+import { CATALOG_LIST_PROPS } from '../../components/catalog/ListPerf';
+import { NOOD_REFRESH_CONTROL_PROPS } from '../../utils/navigation-gestures';
+import { useScreenPerfReporter } from '../../utils/screen-perf';
 
 const COLORS = {
   bg: '#f7f2eb',
@@ -36,95 +47,250 @@ const WIPAY_LOGO =
 const PAYPAL_LOGO =
   'https://cdn.shopify.com/s/files/1/0663/2099/0292/files/paypal-logo-symbol-icon-transparent-png-701751695036660okg9nooua3.png?v=1781243217';
 const CART_IMAGE_PLACEHOLDER = 'https://via.placeholder.com/600x700.png?text=No+Image';
-const WISHLIST_STORAGE_KEY = 'NOOD_WISHLIST';
-const CART_RECOMMENDATIONS_CACHE_KEY = 'NOOD_CART_RECOMMENDATIONS_CACHE_V1';
+const CART_RECOMMENDATIONS_FOCUS_MS = 60000;
+let cartScrollOffsetSnapshot = 0;
 
-type RecommendedProduct = {
-  id: string;
-  title: string;
-  handle: string;
-  image: string;
-  price: string;
+type CartRecommendationCardProps = {
+  product: CatalogListProduct;
+  priceLabel: string;
+  onOpen: (product: CatalogListProduct) => void;
+  onAddToCart: (product: CatalogListProduct) => void;
 };
 
-let cartScrollOffsetSnapshot = 0;
-let cartRecommendedProductsSnapshot: RecommendedProduct[] = [];
-let cartRecommendedProductsSnapshotKey = '';
+const CartRecommendationCard = React.memo(function CartRecommendationCard({
+  product,
+  priceLabel,
+  onOpen,
+  onAddToCart,
+}: CartRecommendationCardProps) {
+  return (
+    <View style={styles.recommendCard}>
+      <TouchableOpacity activeOpacity={0.9} onPress={() => onOpen(product)}>
+        <ExpoImage
+          source={{ uri: getCartImageUri(product.image) }}
+          style={styles.recommendImage}
+          contentFit="cover"
+          cachePolicy="memory-disk"
+          recyclingKey={product.image || product.id}
+          transition={0}
+        />
+        <Text style={styles.recommendTitle} numberOfLines={2}>
+          {product.title}
+        </Text>
+        <Text style={styles.recommendPrice}>{priceLabel}</Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={styles.recommendAddBtn}
+        activeOpacity={0.88}
+        onPress={() => onAddToCart(product)}
+      >
+        <Ionicons name="cart-outline" size={16} color={COLORS.orangeDeep} />
+      </TouchableOpacity>
+    </View>
+  );
+});
+
+type CartLineItemProps = {
+  item: any;
+  convertedPrice: number;
+  lineTotal: number;
+  variantLine: string | null;
+  selectedCurrency: string;
+  onOpen: (item: any) => void;
+  onDecrease: (item: any) => void;
+  onIncrease: (item: any) => void;
+  onRemove: (id: string, size?: string, color?: string) => void;
+  onSave: (item: any) => void;
+  formatMoney: (amount: number, currency: string) => string;
+};
+
+const CartLineItem = React.memo(function CartLineItem({
+  item,
+  convertedPrice,
+  lineTotal,
+  variantLine,
+  selectedCurrency,
+  onOpen,
+  onDecrease,
+  onIncrease,
+  onRemove,
+  onSave,
+  formatMoney,
+}: CartLineItemProps) {
+  return (
+    <NoodSwipeableRow
+      style={styles.cartCard}
+      leftActions={[
+        {
+          key: 'save',
+          label: 'Save',
+          icon: 'heart-outline',
+          backgroundColor: '#ff6a00',
+          onPress: () => void onSave(item),
+        },
+      ]}
+      rightActions={[
+        {
+          key: 'remove',
+          label: 'Remove',
+          icon: 'trash-outline',
+          backgroundColor: '#d9480f',
+          onPress: () => onRemove(String(item.id), item.size, item.color),
+        },
+      ]}
+    >
+      <TouchableOpacity activeOpacity={0.9} onPress={() => onOpen(item)}>
+        <ExpoImage
+          source={{ uri: getCartImageUri(item.image) }}
+          style={styles.image}
+          contentFit="cover"
+          cachePolicy="memory-disk"
+          recyclingKey={getCartImageUri(item.image)}
+          transition={0}
+        />
+      </TouchableOpacity>
+
+      <View style={styles.cardContent}>
+        <View style={styles.cardTopRow}>
+          <View style={styles.titleWrap}>
+            <Text style={styles.title} numberOfLines={2}>
+              {item.title}
+            </Text>
+
+            {variantLine ? <Text style={styles.variantLine}>{variantLine}</Text> : null}
+          </View>
+
+          <TouchableOpacity
+            style={styles.removeButton}
+            activeOpacity={0.85}
+            onPress={() => onRemove(String(item.id), item.size, item.color)}
+          >
+            <Ionicons name="trash-outline" size={18} color={COLORS.muted} />
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.priceRow}>
+          <View>
+            <Text style={styles.priceLabel}>Price</Text>
+            <Text style={styles.price}>{formatMoney(convertedPrice, selectedCurrency)}</Text>
+          </View>
+          <View style={styles.lineTotalWrap}>
+            <Text style={styles.priceLabel}>Qty {item.quantity || 1}</Text>
+            <Text style={styles.lineTotal}>
+              {formatMoney(lineTotal, selectedCurrency)}
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.actionsRow}>
+          <View style={styles.qtyControl}>
+            <TouchableOpacity style={styles.qtyButton} onPress={() => onDecrease(item)}>
+              <Ionicons name="remove" size={16} color={COLORS.text} />
+            </TouchableOpacity>
+            <Text style={styles.qty}>{item.quantity}</Text>
+            <TouchableOpacity style={styles.qtyButton} onPress={() => onIncrease(item)}>
+              <Ionicons name="add" size={16} color={COLORS.text} />
+            </TouchableOpacity>
+          </View>
+
+          <TouchableOpacity
+            style={styles.saveButton}
+            activeOpacity={0.88}
+            onPress={() => void onSave(item)}
+          >
+            <Ionicons name="heart-outline" size={16} color={COLORS.orangeDeep} />
+            <Text style={styles.saveButtonText}>Save for later</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </NoodSwipeableRow>
+  );
+});
 
 function getCartImageUri(uri?: string | null) {
   const trimmed = String(uri || '').trim();
   return trimmed.length > 0 ? trimmed : CART_IMAGE_PLACEHOLDER;
 }
 
-const RECOMMENDED_PRODUCTS_QUERY = `
-  query GetRecommendedProducts($first: Int!) {
-    products(first: $first, sortKey: CREATED_AT, reverse: true) {
-      edges {
-        node {
-          id
-          title
-          handle
-          featuredImage {
-            url
-          }
-          priceRange {
-            minVariantPrice {
-              amount
-            }
-          }
-        }
-      }
-    }
+function getVariantDetailsLine(item: any): string | null {
+  const parts: string[] = [];
+  const color = String(item?.color || '').trim();
+  const size = String(item?.size || '').trim();
+  const variantTitle = String(item?.variantTitle || '').trim();
+
+  if (color) parts.push(`Color: ${color}`);
+  if (size) parts.push(`Size: ${size}`);
+
+  if (!parts.length && variantTitle && variantTitle !== 'Default Title') {
+    return variantTitle;
   }
-`;
+
+  return parts.length ? parts.join(' | ') : null;
+}
 
 export default function CartScreen() {
+  const navigation = useNavigation();
+  const insets = useSafeAreaInsets();
   const {
     cartItems = [],
     balanceFormatted,
     balanceConverted = 0,
+    addToCart,
     removeFromCart,
     updateQuantity,
     convertPrice,
     formatMoney,
     selectedCurrency,
+    orders = [],
+    checkoutTotals,
   } = useCart();
   const { addHistoryEvent } = useHistoryEvents();
-  const [recommendedProducts, setRecommendedProducts] = useState<RecommendedProduct[]>(
-    () => cartRecommendedProductsSnapshot
+  const { addToWishlist } = useWishlist();
+  const { profileId, isSignedIn, isReady } = useUser();
+  const customerKey = useMemo(
+    () => resolveCustomerStorageKey(profileId || '', '', isSignedIn),
+    [isSignedIn, profileId]
   );
-  const [loadingRecommendations, setLoadingRecommendations] = useState(
-    !cartRecommendedProductsSnapshot.length
-  );
+  const [recommendedProducts, setRecommendedProducts] = useState<CatalogListProduct[]>([]);
+  const [loadingRecommendations, setLoadingRecommendations] = useState(true);
   const [confirmationMessage, setConfirmationMessage] = useState('');
-  const promoBounce = useRef(new Animated.Value(0)).current;
-  const scrollRef = useRef<ScrollView | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  type CartLineEntry = {
+    item: any;
+    key: string;
+    convertedPrice: number;
+    lineTotal: number;
+    variantLine: string | null;
+  };
+  const scrollRef = useRef<FlatList<CartLineEntry> | null>(null);
   const restoredScrollRef = useRef(false);
-
-  const subtotal = useMemo(() => {
-    return cartItems.reduce((sum: number, item: any) => {
-      const price = Number(item?.price || 0);
-      const qty = Number(item?.quantity || 1);
-      const converted = convertPrice(
-        price,
-        item?.baseCurrency || BASE_CURRENCY,
-        selectedCurrency
-      );
-
-      return sum + converted * qty;
-    }, 0);
-  }, [cartItems, selectedCurrency, convertPrice]);
+  const lastRecommendationsFocusRef = useRef(0);
+  const hasCartItems = cartItems.length > 0;
+  const bottomBarHeight = 84 + Math.max(insets.bottom, 8);
 
   const itemCount = useMemo(() => {
     return cartItems.reduce((sum: number, item: any) => sum + Number(item?.quantity || 0), 0);
   }, [cartItems]);
 
-  const discountStatusText =
-    itemCount >= 3
-      ? 'Automatic discount unlocked'
-      : 'Add 3+ items to unlock automatic discount';
+  const orderTotal = checkoutTotals.total;
+  const displayOrderTotal = useMemo(
+    () => convertPrice(orderTotal, SHOPIFY_CHECKOUT_CURRENCY, selectedCurrency),
+    [convertPrice, orderTotal, selectedCurrency]
+  );
+  const walletBalanceTtd = useMemo(
+    () => convertPrice(Number(balanceConverted || 0), selectedCurrency, SHOPIFY_CHECKOUT_CURRENCY),
+    [balanceConverted, convertPrice, selectedCurrency]
+  );
+  const walletCanCover = walletBalanceTtd >= orderTotal && orderTotal > 0;
 
-  const walletCanCover = Number(balanceConverted || 0) >= subtotal && subtotal > 0;
+  const visibleRecommendations = useMemo(() => {
+    const cartHandles = new Set(
+      cartItems.map((item: any) => String(item?.handle || '').trim()).filter(Boolean)
+    );
+    return recommendedProducts.filter(
+      (product) => product.handle && !cartHandles.has(product.handle)
+    );
+  }, [cartItems, recommendedProducts]);
 
   useEffect(() => {
     if (!confirmationMessage) return;
@@ -138,193 +304,114 @@ export default function CartScreen() {
 
     restoredScrollRef.current = true;
     requestAnimationFrame(() => {
-      scrollRef.current?.scrollTo({
-        y: cartScrollOffsetSnapshot,
+      scrollRef.current?.scrollToOffset({
+        offset: cartScrollOffsetSnapshot,
         animated: false,
       });
     });
   }, [cartItems.length]);
 
-  useFocusEffect(
-    React.useCallback(() => {
-      promoBounce.setValue(0);
-      const animation = Animated.loop(
-        Animated.sequence([
-          Animated.timing(promoBounce, {
-            toValue: 1,
-            duration: 650,
-            useNativeDriver: true,
-          }),
-          Animated.timing(promoBounce, {
-            toValue: 0,
-            duration: 650,
-            useNativeDriver: true,
-          }),
-        ])
-      );
-      animation.start();
+  const loadRecommendations = useCallback(async () => {
+    if (!isReady) return;
 
-      return () => {
-        animation.stop();
-      };
-    }, [promoBounce])
+    setLoadingRecommendations(true);
+    try {
+      const result = await loadCartRecommendations({
+        profileId: profileId || 'guest',
+        isSignedIn,
+        cartItems,
+        orders,
+      });
+      setRecommendedProducts(result.products);
+    } catch (error) {
+      console.log('Cart recommendations load error:', error);
+      setRecommendedProducts([]);
+    } finally {
+      setLoadingRecommendations(false);
+    }
+  }, [cartItems, isReady, isSignedIn, orders, profileId]);
+
+  const recommendationsFingerprint = useMemo(
+    () =>
+      [
+        profileId || 'guest',
+        isSignedIn ? '1' : '0',
+        cartItems
+          .map((item: any) => `${item?.handle || item?.id || ''}:${item?.quantity || 1}`)
+          .sort()
+          .join('|'),
+        orders
+          .map((order: any) => String(order?.id || ''))
+          .sort()
+          .join('|'),
+      ].join('::'),
+    [cartItems, isSignedIn, orders, profileId]
+  );
+  const recommendationsFingerprintRef = useRef('');
+
+  useFocusEffect(
+    useCallback(() => {
+      const now = Date.now();
+      const fingerprintChanged = recommendationsFingerprintRef.current !== recommendationsFingerprint;
+      const shouldRefresh =
+        fingerprintChanged || now - lastRecommendationsFocusRef.current >= CART_RECOMMENDATIONS_FOCUS_MS;
+
+      if (!shouldRefresh) return;
+
+      recommendationsFingerprintRef.current = recommendationsFingerprint;
+      lastRecommendationsFocusRef.current = now;
+      void loadRecommendations();
+    }, [loadRecommendations, recommendationsFingerprint])
   );
 
-  const promoBounceStyle = {
-    transform: [
-      {
-        translateY: promoBounce.interpolate({
-          inputRange: [0, 1],
-          outputRange: [0, -6],
-        }),
-      },
-      {
-        scale: promoBounce.interpolate({
-          inputRange: [0, 1],
-          outputRange: [1, 1.04],
-        }),
-      },
-    ],
-  };
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await loadRecommendations();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadRecommendations]);
 
   useEffect(() => {
-    let isMounted = true;
+    const unsubscribe = (navigation as any).addListener('tabPress', () => {
+      if (!navigation.isFocused()) return;
+      cartScrollOffsetSnapshot = 0;
+      restoredScrollRef.current = true;
+      scrollRef.current?.scrollToOffset({ offset: 0, animated: true });
+    });
 
-    const mapRecommendationProducts = (
-      edges: any[],
-      cartHandles: Set<string>
-    ): RecommendedProduct[] =>
-      (edges || [])
-        .map((edge: any) => ({
-          id: String(edge?.node?.id || ''),
-          title: edge?.node?.title || 'Product',
-          handle: edge?.node?.handle || '',
-          image:
-            edge?.node?.featuredImage?.url ||
-            'https://via.placeholder.com/600x700.png?text=No+Image',
-          price: formatMoney(
-            Number(edge?.node?.priceRange?.minVariantPrice?.amount || 0),
-            selectedCurrency
-          ),
-        }))
-        .filter((product: RecommendedProduct) => product.handle && !cartHandles.has(product.handle))
-        .slice(0, 8);
+    return unsubscribe;
+  }, [navigation]);
 
-    const loadRecommendations = async () => {
-      const cartHandlesKey = cartItems
-        .map((item: any) => String(item?.handle || ''))
-        .sort()
-        .join('|');
-      const cartHandles = new Set(cartItems.map((item: any) => String(item?.handle || '')));
-      let showedCache = false;
+  const increaseQty = useCallback(
+    (item: any) => {
+      updateQuantity(String(item.id), (item.quantity || 1) + 1, item.size, item.color);
+    },
+    [updateQuantity]
+  );
 
-      if (
-        cartRecommendedProductsSnapshot.length &&
-        cartRecommendedProductsSnapshotKey === cartHandlesKey
-      ) {
-        if (isMounted) {
-          setRecommendedProducts(cartRecommendedProductsSnapshot);
-          setLoadingRecommendations(false);
-        }
-        showedCache = true;
-      } else {
-        try {
-          const cachedRaw = await AsyncStorage.getItem(CART_RECOMMENDATIONS_CACHE_KEY);
-          if (cachedRaw) {
-            const parsed = JSON.parse(cachedRaw) as {
-              products?: RecommendedProduct[];
-              cartHandlesKey?: string;
-            };
-            if (
-              Array.isArray(parsed.products) &&
-              parsed.products.length &&
-              (!parsed.cartHandlesKey || parsed.cartHandlesKey === cartHandlesKey)
-            ) {
-              if (isMounted) {
-                setRecommendedProducts(parsed.products);
-                setLoadingRecommendations(false);
-              }
-              showedCache = true;
-            }
-          }
-        } catch (error) {
-          console.log('Cart recommendations cache read error:', error);
-        }
+  const decreaseQty = useCallback(
+    (item: any) => {
+      const nextQty = (item.quantity || 1) - 1;
+
+      if (nextQty <= 0) {
+        removeFromCart(String(item.id), item.size, item.color);
+        return;
       }
 
-      try {
-        const json = await catalogFetch(RECOMMENDED_PRODUCTS_QUERY, { first: 12 });
-        const mapped = mapRecommendationProducts(json?.data?.products?.edges || [], cartHandles);
+      updateQuantity(String(item.id), nextQty, item.size, item.color);
+    },
+    [removeFromCart, updateQuantity]
+  );
 
-        if (isMounted) {
-          cartRecommendedProductsSnapshot = mapped;
-          cartRecommendedProductsSnapshotKey = cartHandlesKey;
-          setRecommendedProducts(mapped);
-        }
-
-        await AsyncStorage.setItem(
-          CART_RECOMMENDATIONS_CACHE_KEY,
-          JSON.stringify({
-            products: mapped,
-            cartHandlesKey,
-            savedAt: new Date().toISOString(),
-          })
-        );
-      } catch (error) {
-        console.log('Cart recommendations error:', error);
-        if (isMounted && !showedCache) {
-          setRecommendedProducts([]);
-        }
-      } finally {
-        if (isMounted) {
-          setLoadingRecommendations(false);
-        }
-      }
-    };
-
-    loadRecommendations();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [cartItems, formatMoney, selectedCurrency]);
-
-  const increaseQty = (item: any) => {
-    updateQuantity(String(item.id), (item.quantity || 1) + 1, item.size, item.color);
-  };
-
-  const decreaseQty = (item: any) => {
-    const nextQty = (item.quantity || 1) - 1;
-
-    if (nextQty <= 0) {
-      removeFromCart(String(item.id), item.size, item.color);
-      return;
-    }
-
-    updateQuantity(String(item.id), nextQty, item.size, item.color);
-  };
-
-  const saveForLater = async (item: any) => {
+  const saveForLater = useCallback(async (item: any) => {
     try {
-      const savedWishlist = await AsyncStorage.getItem(WISHLIST_STORAGE_KEY);
-      const parsedWishlist = savedWishlist ? JSON.parse(savedWishlist) : [];
-      const wishlistItems = Array.isArray(parsedWishlist) ? parsedWishlist : [];
-      const itemKey = String(item?.handle || item?.id || '');
-      const alreadySaved = wishlistItems.some(
-        (wishlistItem: any) => String(wishlistItem?.handle || wishlistItem?.id || '') === itemKey
-      );
-
-      if (!alreadySaved) {
-        const nextWishlist = [
-          {
-            ...item,
-            quantity: 1,
-            savedAt: new Date().toISOString(),
-          },
-          ...wishlistItems,
-        ];
-        await AsyncStorage.setItem(WISHLIST_STORAGE_KEY, JSON.stringify(nextWishlist));
+      if (!customerKey) {
+        return;
       }
+
+      const { alreadySaved } = await addToWishlist(item);
 
       removeFromCart(String(item.id), item.size, item.color);
       void addHistoryEvent({
@@ -337,99 +424,158 @@ export default function CartScreen() {
           product: item,
         },
       });
-      setConfirmationMessage('Moved to Wishlist');
+      setConfirmationMessage(alreadySaved ? 'Already in Wishlist' : 'Moved to Wishlist');
     } catch (error) {
       console.log('Save for later error:', error);
       setConfirmationMessage('Could not save item');
     }
-  };
+  }, [addHistoryEvent, addToWishlist, customerKey, removeFromCart]);
 
-  const handleCheckout = () => {
-    if (!cartItems.length) return;
+  const goToCheckout = (method?: 'wallet' | 'wipay' | 'paypal') => {
+    if (!hasCartItems) return;
     void addHistoryEvent({
       type: 'checkout',
       title: 'Checkout started',
       description: `${cartItems.length} item${cartItems.length === 1 ? '' : 's'} in checkout.`,
-      amount: subtotal,
-      currency: selectedCurrency,
+      amount: orderTotal,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
       status: 'started',
       metadata: {
         items: cartItems,
+        method: method || 'checkout',
       },
     });
-    router.push('/checkout');
+    router.push({
+      pathname: '/checkout',
+      params: method ? { method } : {},
+    } as any);
   };
 
-  const openProduct = (handle?: string) => {
+  const openProduct = useCallback((item: any) => {
+    const handle = String(item?.handle || '').trim();
     if (!handle) return;
+
     router.push({
       pathname: '/product/[handle]',
-      params: { handle },
+      params: buildProductRouteParams(item, { from: 'cart' }) as any,
     });
-  };
+  }, []);
 
-  const openRecommended = (handle?: string) => {
-    if (handle) {
-      openProduct(handle);
+  const handleAddRecommendedToCart = useCallback((product: CatalogListProduct) => {
+    const added = addToCart({
+      ...product,
+      price: product.priceAmount,
+      baseCurrency: product.currencyCode || BASE_CURRENCY,
+    });
+
+    if (added) {
+      setConfirmationMessage(`${product.title} added to cart`);
       return;
     }
-    router.push('/(tabs)/categories');
+
+    openProduct(product);
+  }, [addToCart, openProduct]);
+
+  const handleCartScroll = useCallback((event: any) => {
+    cartScrollOffsetSnapshot = event.nativeEvent.contentOffset.y;
+  }, []);
+
+  const cartLineItems = useMemo(
+    () =>
+      cartItems.map((item: any, index: number) => {
+        const convertedPrice = convertPrice(
+          Number(item.price || 0),
+          item?.baseCurrency || BASE_CURRENCY,
+          selectedCurrency
+        );
+
+        return {
+          item,
+          key: `${item.id}-${item.size || 'default'}-${item.color || 'default'}-${index}`,
+          convertedPrice,
+          lineTotal: convertedPrice * Number(item.quantity || 1),
+          variantLine: getVariantDetailsLine(item),
+        };
+      }),
+    [cartItems, convertPrice, selectedCurrency]
+  );
+
+  const recommendationPriceById = useMemo(() => {
+    const map = new Map<string, string>();
+    visibleRecommendations.forEach((product) => {
+      map.set(
+        product.id || product.handle,
+        formatMoney(
+          convertPrice(
+            Number(product.priceAmount || 0),
+            product.currencyCode || BASE_CURRENCY,
+            selectedCurrency
+          ),
+          selectedCurrency
+        )
+      );
+    });
+    return map;
+  }, [convertPrice, formatMoney, selectedCurrency, visibleRecommendations]);
+
+  const renderRecommendationItem = useCallback(
+    ({ item }: { item: CatalogListProduct }) => (
+      <CartRecommendationCard
+        product={item}
+        priceLabel={recommendationPriceById.get(item.id || item.handle) || ''}
+        onOpen={openProduct}
+        onAddToCart={handleAddRecommendedToCart}
+      />
+    ),
+    [handleAddRecommendedToCart, openProduct, recommendationPriceById]
+  );
+
+  const recommendationKeyExtractor = useCallback(
+    (item: CatalogListProduct) => item.id || item.handle,
+    []
+  );
+
+  const handleWalletPress = () => {
+    if (walletCanCover) {
+      goToCheckout('wallet');
+      return;
+    }
+
+    router.push('/account/wallet' as any);
   };
 
-  if (!cartItems.length) {
-    return (
-      <SafeAreaView style={styles.screen}>
-        <View style={styles.emptyWrap}>
-          <View style={styles.emptyIconCircle}>
-            <Ionicons name="bag-handle-outline" size={42} color={COLORS.orange} />
-          </View>
-          <Text style={styles.emptyTitle}>Your cart is empty</Text>
-          <Text style={styles.emptySubtitle}>
-            Add products to review WiPay, PayPal, and fast checkout options here.
-          </Text>
-          <TouchableOpacity
-            style={styles.emptyButton}
-            activeOpacity={0.9}
-            onPress={() => router.push('/(tabs)/categories')}
-          >
-            <Text style={styles.emptyButtonText}>Start shopping</Text>
-          </TouchableOpacity>
-        </View>
-      </SafeAreaView>
-    );
-  }
+  const cartKeyExtractor = useCallback((entry: CartLineEntry) => entry.key, []);
 
-  return (
-    <SafeAreaView style={styles.screen}>
-      <ScrollView
-        ref={scrollRef}
-        style={styles.scroll}
-        contentContainerStyle={styles.scrollContent}
-        showsVerticalScrollIndicator={false}
-        scrollEventThrottle={16}
-        onScroll={(event) => {
-          cartScrollOffsetSnapshot = event.nativeEvent.contentOffset.y;
-        }}
-      >
-        <View style={styles.topOffer}>
-          <View style={styles.topOfferLeft}>
-            <Ionicons name="shield-checkmark-outline" size={18} color="#ffffff" />
-            <Text style={styles.topOfferText}>All data is safeguarded</Text>
-          </View>
-          <Text style={styles.topOfferBadge}>Secure</Text>
-        </View>
+  const renderCartLineItem = useCallback(
+    ({ item: entry }: { item: CartLineEntry }) => (
+      <CartLineItem
+        item={entry.item}
+        convertedPrice={entry.convertedPrice}
+        lineTotal={entry.lineTotal}
+        variantLine={entry.variantLine}
+        selectedCurrency={selectedCurrency}
+        onOpen={openProduct}
+        onDecrease={decreaseQty}
+        onIncrease={increaseQty}
+        onRemove={removeFromCart}
+        onSave={saveForLater}
+        formatMoney={formatMoney}
+      />
+    ),
+    [
+      decreaseQty,
+      formatMoney,
+      increaseQty,
+      openProduct,
+      removeFromCart,
+      saveForLater,
+      selectedCurrency,
+    ]
+  );
 
-        <View style={styles.shippingBanner}>
-          <View style={styles.shippingBannerLeft}>
-            <Ionicons name="car-outline" size={22} color="#ffffff" />
-            <View>
-              <Text style={styles.shippingTitle}>Free door-to-door shipping for you</Text>
-              <Text style={styles.shippingSubtitle}>Secure checkout with tracked shipping</Text>
-            </View>
-          </View>
-          <Text style={styles.shippingOffer}>Exclusive</Text>
-        </View>
-
+  const cartListHeader = useMemo(
+    () => (
+      <>
         {confirmationMessage ? (
           <View style={styles.confirmationToast}>
             <Ionicons name="checkmark-circle" size={17} color={COLORS.green} />
@@ -437,93 +583,111 @@ export default function CartScreen() {
           </View>
         ) : null}
 
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Cart</Text>
-          <Text style={styles.sectionMeta}>
-            {itemCount} item{itemCount === 1 ? '' : 's'}
-          </Text>
-        </View>
+        {!hasCartItems ? (
+          <View style={styles.emptyCard}>
+            <View style={styles.emptyIconCircle}>
+              <Ionicons name="bag-handle-outline" size={36} color={COLORS.orange} />
+            </View>
+            <Text style={styles.emptyTitle}>Your cart is empty</Text>
+            <Text style={styles.emptySubtitle}>
+              Browse products, save favorites, and check out with WiPay, PayPal, or Wallet.
+            </Text>
+            <TouchableOpacity
+              style={styles.emptyButton}
+              activeOpacity={0.9}
+              onPress={() => router.push('/(tabs)/categories')}
+            >
+              <Text style={styles.emptyButtonText}>Browse products</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <>
+            <View style={styles.topOffer}>
+              <View style={styles.topOfferLeft}>
+                <Ionicons name="shield-checkmark-outline" size={18} color="#ffffff" />
+                <Text style={styles.topOfferText}>All data is safeguarded</Text>
+              </View>
+              <Text style={styles.topOfferBadge}>Secure</Text>
+            </View>
 
-        {cartItems.map((item: any, index: number) => {
-          const convertedPrice = convertPrice(
-            Number(item.price || 0),
-            item?.baseCurrency || BASE_CURRENCY,
-            selectedCurrency
-          );
-          const lineTotal = convertedPrice * Number(item.quantity || 1);
-
-          return (
-            <View key={`${item.id}-${item.size || 'default'}-${index}`} style={styles.cartCard}>
-              <TouchableOpacity activeOpacity={0.9} onPress={() => openProduct(item.handle)}>
-                <Image source={{ uri: getCartImageUri(item.image) }} style={styles.image} />
-              </TouchableOpacity>
-
-              <View style={styles.cardContent}>
-                <View style={styles.cardTopRow}>
-                  <View style={styles.titleWrap}>
-                    <Text style={styles.title} numberOfLines={2}>
-                      {item.title}
-                    </Text>
-
-                    <View style={styles.metaRow}>
-                      {item.size ? (
-                        <View style={styles.metaPill}>
-                          <Text style={styles.metaPillText}>Size {item.size}</Text>
-                        </View>
-                      ) : null}
-                      <View style={styles.metaPill}>
-                        <Text style={styles.metaPillText}>Ready to ship</Text>
-                      </View>
-                    </View>
-                  </View>
-
-                  <TouchableOpacity
-                    style={styles.removeButton}
-                    activeOpacity={0.85}
-                    onPress={() => removeFromCart(String(item.id), item.size, item.color)}
-                  >
-                    <Ionicons name="trash-outline" size={18} color={COLORS.muted} />
-                  </TouchableOpacity>
-                </View>
-
-                <View style={styles.priceRow}>
-                  <Text style={styles.price}>{formatMoney(convertedPrice, selectedCurrency)}</Text>
-                  <Text style={styles.lineTotal}>
-                    Total {formatMoney(lineTotal, selectedCurrency)}
+            <View style={styles.shippingBanner}>
+              <View style={styles.shippingBannerLeft}>
+                <Ionicons name="car-outline" size={22} color="#ffffff" />
+                <View>
+                  <Text style={styles.shippingTitle}>Free door-to-door shipping for you</Text>
+                  <Text style={styles.shippingSubtitle}>Secure checkout with tracked shipping</Text>
+                  <Text style={styles.deliveryEstimate}>
+                    Delivery estimate shown at checkout
                   </Text>
                 </View>
-
-                <View style={styles.actionsRow}>
-                  <View style={styles.qtyControl}>
-                    <TouchableOpacity style={styles.qtyButton} onPress={() => decreaseQty(item)}>
-                      <Ionicons name="remove" size={16} color={COLORS.text} />
-                    </TouchableOpacity>
-                    <Text style={styles.qty}>{item.quantity}</Text>
-                    <TouchableOpacity style={styles.qtyButton} onPress={() => increaseQty(item)}>
-                      <Ionicons name="add" size={16} color={COLORS.text} />
-                    </TouchableOpacity>
-                  </View>
-
-                  <TouchableOpacity
-                    style={styles.saveButton}
-                    activeOpacity={0.88}
-                    onPress={() => void saveForLater(item)}
-                  >
-                    <Ionicons name="heart-outline" size={16} color={COLORS.orangeDeep} />
-                    <Text style={styles.saveButtonText}>Save for later</Text>
-                  </TouchableOpacity>
-                </View>
               </View>
+              <Text style={styles.shippingOffer}>Exclusive</Text>
             </View>
-          );
-        })}
 
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Cart</Text>
+              <Text style={styles.sectionMeta}>
+                {itemCount} item{itemCount === 1 ? '' : 's'}
+              </Text>
+            </View>
+          </>
+        )}
+      </>
+    ),
+    [confirmationMessage, hasCartItems, itemCount]
+  );
+
+  const renderRecommendations = useMemo(
+    () => (
+      <View style={styles.recommendSection}>
+        <Text style={[styles.summaryTitle, styles.recommendTitlePad]}>Recommended for you</Text>
+        <Text style={styles.recommendSubtitle}>
+          {hasCartItems
+            ? 'Add something extra before you check out.'
+            : 'Popular picks to get you started.'}
+        </Text>
+
+        {loadingRecommendations ? (
+          <View style={styles.recommendLoadingWrap}>
+            <NoodSpinner size={38} />
+          </View>
+        ) : visibleRecommendations.length > 0 ? (
+          <FlatList
+            horizontal
+            data={visibleRecommendations}
+            keyExtractor={recommendationKeyExtractor}
+            renderItem={renderRecommendationItem}
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.recommendRow}
+            initialNumToRender={4}
+            maxToRenderPerBatch={4}
+            windowSize={5}
+            removeClippedSubviews
+          />
+        ) : (
+          <Text style={styles.recommendEmptyText}>More products will show here soon.</Text>
+        )}
+      </View>
+    ),
+    [
+      hasCartItems,
+      loadingRecommendations,
+      recommendationKeyExtractor,
+      renderRecommendationItem,
+      visibleRecommendations,
+    ]
+  );
+
+  const cartListFooter = useMemo(
+    () => (
+      <>
+        {hasCartItems ? (
         <View style={styles.summaryCard}>
           <Text style={styles.summaryTitle}>Order Summary</Text>
 
           <View style={styles.summaryRow}>
-            <Text style={styles.summaryLabel}>Item total</Text>
-            <Text style={styles.summaryValue}>{formatMoney(subtotal, selectedCurrency)}</Text>
+            <Text style={styles.summaryLabel}>Items subtotal</Text>
+            <Text style={styles.summaryValue}>{formatMoney(displayOrderTotal, selectedCurrency)}</Text>
           </View>
 
           <View style={styles.summaryRow}>
@@ -531,23 +695,26 @@ export default function CartScreen() {
             <Text style={styles.summaryGreen}>FREE</Text>
           </View>
 
-          <View style={styles.summaryRow}>
-            <Text style={styles.summaryLabel}>Discount</Text>
-            <Text style={styles.summaryOrange}>{discountStatusText}</Text>
-          </View>
-
           <View style={styles.summaryDivider} />
 
           <View style={styles.summaryRow}>
             <Text style={styles.summaryTotalLabel}>Total</Text>
-            <Text style={styles.summaryTotalValue}>{formatMoney(subtotal, selectedCurrency)}</Text>
+            <Text style={styles.summaryTotalValue}>
+              {formatMoney(displayOrderTotal, selectedCurrency)}
+            </Text>
           </View>
         </View>
+        ) : null}
 
+        {hasCartItems ? (
         <View style={styles.paymentCard}>
           <Text style={styles.summaryTitle}>Express Checkout</Text>
 
-          <TouchableOpacity style={styles.walletButton} activeOpacity={0.92} onPress={handleCheckout}>
+          <TouchableOpacity
+            style={[styles.walletButton, !walletCanCover && styles.walletButtonDisabled]}
+            activeOpacity={walletCanCover ? 0.92 : 1}
+            onPress={handleWalletPress}
+          >
             <View style={styles.paymentButtonLeft}>
               <View style={styles.logoBadgeWallet}>
                 <Ionicons name="wallet-outline" size={20} color={COLORS.green} />
@@ -557,6 +724,11 @@ export default function CartScreen() {
                 <Text style={styles.paymentButtonSubtitleDark}>
                   Available: {balanceFormatted || formatMoney(0, selectedCurrency)}
                 </Text>
+                {!walletCanCover ? (
+                  <Text style={styles.walletInsufficientText}>
+                    Insufficient balance — Top up
+                  </Text>
+                ) : null}
               </View>
             </View>
             <Text style={[styles.walletStatus, walletCanCover ? styles.walletStatusReady : styles.walletStatusLow]}>
@@ -564,7 +736,7 @@ export default function CartScreen() {
             </Text>
           </TouchableOpacity>
 
-          <TouchableOpacity style={styles.wipayButton} activeOpacity={0.92} onPress={handleCheckout}>
+          <TouchableOpacity style={styles.wipayButton} activeOpacity={0.92} onPress={() => goToCheckout('wipay')}>
             <View style={styles.paymentButtonLeft}>
               <View style={styles.logoBadgeLight}>
                 <Image source={{ uri: WIPAY_LOGO }} style={styles.wipayLogo} resizeMode="contain" />
@@ -588,7 +760,7 @@ export default function CartScreen() {
             <Ionicons name="arrow-forward" size={18} color="#fff" />
           </TouchableOpacity>
 
-          <TouchableOpacity style={styles.paypalButton} activeOpacity={0.92} onPress={handleCheckout}>
+          <TouchableOpacity style={styles.paypalButton} activeOpacity={0.92} onPress={() => goToCheckout('paypal')}>
             <View style={styles.paymentButtonLeft}>
               <View style={styles.logoBadgeDark}>
                 <Image source={{ uri: PAYPAL_LOGO }} style={styles.paypalLogo} resizeMode="contain" />
@@ -601,76 +773,85 @@ export default function CartScreen() {
             <Ionicons name="arrow-forward" size={18} color={COLORS.paypal} />
           </TouchableOpacity>
 
-          <TouchableOpacity style={styles.primaryCheckoutButton} activeOpacity={0.92} onPress={handleCheckout}>
-            <Text style={styles.primaryCheckoutTitle}>Checkout</Text>
-            <Text style={styles.primaryCheckoutSubtitle}>
-              Continue with all payment methods
-            </Text>
-          </TouchableOpacity>
         </View>
+        ) : null}
 
-        <View style={styles.recommendSection}>
-          <Text style={styles.summaryTitle}>Recommended for you</Text>
-          <Text style={styles.recommendSubtitle}>
-            Add something extra before you check out.
-          </Text>
+        {renderRecommendations}
+      </>
+    ),
+    [
+      balanceFormatted,
+      displayOrderTotal,
+      formatMoney,
+      handleWalletPress,
+      hasCartItems,
+      renderRecommendations,
+      selectedCurrency,
+      walletCanCover,
+    ]
+  );
 
-          {loadingRecommendations ? (
-            <View style={styles.recommendLoadingWrap}>
-              <NoodSpinner size={38} />
-            </View>
-          ) : recommendedProducts.length > 0 ? (
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.recommendRow}
-            >
-              {recommendedProducts.map((product) => (
-                <TouchableOpacity
-                  key={product.id}
-                  style={styles.recommendCard}
-                  activeOpacity={0.9}
-                  onPress={() => openRecommended(product.handle)}
-                >
-                  <Image source={{ uri: getCartImageUri(product.image) }} style={styles.recommendImage} />
-                  <Text style={styles.recommendTitle} numberOfLines={2}>
-                    {product.title}
-                  </Text>
-                  <Text style={styles.recommendPrice}>{product.price}</Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-          ) : (
-            <Text style={styles.recommendEmptyText}>More products will show here soon.</Text>
-          )}
-        </View>
+  useScreenPerfReporter(
+    'cart',
+    {
+      itemCount: cartItems.length,
+      isFetching: loadingRecommendations,
+      isRefreshing: refreshing,
+    },
+    [cartItems.length, loadingRecommendations, refreshing]
+  );
 
-        <View style={styles.bottomGap} />
-      </ScrollView>
+  return (
+    <SafeAreaView style={styles.screen}>
+      <FlatList
+        ref={scrollRef}
+        data={hasCartItems ? cartLineItems : []}
+        keyExtractor={cartKeyExtractor}
+        renderItem={renderCartLineItem}
+        ListHeaderComponent={cartListHeader}
+        ListFooterComponent={cartListFooter}
+        style={styles.scroll}
+        contentContainerStyle={[
+          styles.scrollContent,
+          { paddingBottom: hasCartItems ? bottomBarHeight + 24 : 28 },
+        ]}
+        showsVerticalScrollIndicator={false}
+        nestedScrollEnabled
+        onScroll={handleCartScroll}
+        scrollEventThrottle={16}
+        {...CATALOG_LIST_PROPS}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={() => void handleRefresh()}
+            {...NOOD_REFRESH_CONTROL_PROPS}
+          />
+        }
+      />
 
-      <View style={styles.bottomBar}>
+      {hasCartItems ? (
+      <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 12) }]}>
         <View style={styles.promoTabWrap}>
-          <Animated.View style={promoBounceStyle}>
-            <TouchableOpacity
-              style={styles.promoTab}
-              activeOpacity={0.92}
-              onPress={() => router.push('/account/rewards' as any)}
-            >
-              <Ionicons name="gift-outline" size={15} color="#fff" />
-              <Text style={styles.promoTabText}>Rewards</Text>
-            </TouchableOpacity>
-          </Animated.View>
+          <TouchableOpacity
+            style={styles.promoTab}
+            activeOpacity={0.92}
+            onPress={() => router.push('/account/rewards' as any)}
+          >
+            <Ionicons name="gift-outline" size={15} color="#fff" />
+            <Text style={styles.promoTabText}>Rewards</Text>
+          </TouchableOpacity>
         </View>
 
         <View>
           <Text style={styles.bottomTotalLabel}>Total</Text>
-          <Text style={styles.bottomTotalValue}>{formatMoney(subtotal, selectedCurrency)}</Text>
+          <Text style={styles.bottomTotalValue}>{formatMoney(displayOrderTotal, selectedCurrency)}</Text>
         </View>
 
-        <TouchableOpacity style={styles.bottomCheckoutButton} activeOpacity={0.92} onPress={handleCheckout}>
+        <TouchableOpacity style={styles.bottomCheckoutButton} activeOpacity={0.92} onPress={() => goToCheckout()}>
           <Text style={styles.bottomCheckoutText}>Checkout</Text>
         </TouchableOpacity>
       </View>
+      ) : null}
     </SafeAreaView>
   );
 }
@@ -744,6 +925,13 @@ const styles = StyleSheet.create({
     color: '#eee9ff',
     fontWeight: '700',
   },
+  deliveryEstimate: {
+    marginLeft: 10,
+    marginTop: 4,
+    fontSize: 11,
+    color: '#ddd5ff',
+    fontWeight: '600',
+  },
   shippingOffer: {
     color: '#ffffff',
     fontWeight: '900',
@@ -816,23 +1004,12 @@ const styles = StyleSheet.create({
     lineHeight: 28,
     color: COLORS.text,
   },
-  metaRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    marginTop: 10,
-  },
-  metaPill: {
-    backgroundColor: COLORS.orangeSoft,
-    borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    marginRight: 8,
-    marginBottom: 6,
-  },
-  metaPillText: {
-    color: COLORS.orangeDeep,
-    fontSize: 12,
-    fontWeight: '800',
+  variantLine: {
+    marginTop: 8,
+    fontSize: 13,
+    lineHeight: 18,
+    color: COLORS.muted,
+    fontWeight: '700',
   },
   removeButton: {
     width: 38,
@@ -849,15 +1026,24 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     gap: 8,
   },
+  priceLabel: {
+    fontSize: 11,
+    color: COLORS.muted,
+    fontWeight: '700',
+    marginBottom: 2,
+  },
   price: {
     color: COLORS.orangeDeep,
     fontWeight: '900',
     fontSize: 22,
   },
+  lineTotalWrap: {
+    alignItems: 'flex-end',
+  },
   lineTotal: {
     color: COLORS.text,
-    fontSize: 14,
-    fontWeight: '800',
+    fontSize: 18,
+    fontWeight: '900',
   },
   actionsRow: {
     flexDirection: 'row',
@@ -1039,6 +1225,16 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
+  walletButtonDisabled: {
+    opacity: 0.72,
+    borderColor: '#eadfff',
+  },
+  walletInsufficientText: {
+    marginTop: 4,
+    fontSize: 11,
+    fontWeight: '800',
+    color: COLORS.orangeDeep,
+  },
   wipayLogo: {
     width: 48,
     height: 48,
@@ -1100,26 +1296,6 @@ const styles = StyleSheet.create({
   walletStatusLow: {
     color: COLORS.orangeDeep,
   },
-  primaryCheckoutButton: {
-    marginTop: 14,
-    minHeight: 66,
-    borderRadius: 18,
-    backgroundColor: '#1a1714',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 16,
-  },
-  primaryCheckoutTitle: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: '900',
-  },
-  primaryCheckoutSubtitle: {
-    color: '#d4ccc5',
-    fontSize: 12,
-    fontWeight: '700',
-    marginTop: 4,
-  },
   recommendSection: {
     backgroundColor: COLORS.card,
     borderRadius: 22,
@@ -1127,6 +1303,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.line,
     marginBottom: 12,
+    marginTop: 4,
+  },
+  recommendTitlePad: {
+    paddingHorizontal: 16,
   },
   recommendSubtitle: {
     fontSize: 13,
@@ -1143,6 +1323,20 @@ const styles = StyleSheet.create({
   recommendCard: {
     width: 170,
     marginRight: 14,
+    position: 'relative',
+  },
+  recommendAddBtn: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#ffd9c6',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   recommendImage: {
     width: '100%',
@@ -1173,9 +1367,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: COLORS.muted,
     fontWeight: '700',
-  },
-  bottomGap: {
-    height: 100,
   },
   bottomBar: {
     position: 'absolute',
@@ -1244,24 +1435,27 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '900',
   },
-  emptyWrap: {
-    flex: 1,
+  emptyCard: {
+    backgroundColor: COLORS.card,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: COLORS.line,
     alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 24,
-    backgroundColor: COLORS.bg,
+    paddingHorizontal: 22,
+    paddingVertical: 28,
+    marginBottom: 14,
   },
   emptyIconCircle: {
-    width: 88,
-    height: 88,
-    borderRadius: 44,
+    width: 72,
+    height: 72,
+    borderRadius: 36,
     backgroundColor: COLORS.orangeSoft,
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 18,
+    marginBottom: 14,
   },
   emptyTitle: {
-    fontSize: 28,
+    fontSize: 24,
     fontWeight: '900',
     color: COLORS.text,
     textAlign: 'center',

@@ -1,6 +1,5 @@
 import React, { useMemo, useState } from 'react';
 import {
-  Alert,
   Modal,
   Platform,
   SafeAreaView,
@@ -16,6 +15,7 @@ import { useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { useUser } from '../../context/UserContext';
 import { ShippingAddress, useAddressBook } from '../../context/AddressContext';
+import { noodAlert } from '../../utils/nood-alert';
 
 const EMPTY_FORM = {
   fullName: '',
@@ -24,6 +24,7 @@ const EMPTY_FORM = {
   address2: '',
   city: '',
   region: '',
+  country: '',
   postalCode: '',
   notes: '',
   isDefault: false,
@@ -31,12 +32,13 @@ const EMPTY_FORM = {
 
 type AddressFormState = typeof EMPTY_FORM;
 
-export default function AddressScreen() {
+function AddressContent() {
   const router = useRouter();
-  const { settings, isSignedIn } = useUser();
+  const { settings } = useUser();
   const {
     addresses,
     loadingAddresses,
+    isDeviceLocal,
     addAddress,
     updateAddress,
     deleteAddress,
@@ -47,6 +49,7 @@ export default function AddressScreen() {
   const [editingAddress, setEditingAddress] = useState<ShippingAddress | null>(null);
   const [form, setForm] = useState<AddressFormState>({
     ...EMPTY_FORM,
+    country: settings.country || '',
     region: settings.country || '',
   });
 
@@ -62,7 +65,8 @@ export default function AddressScreen() {
     setEditingAddress(null);
     setForm({
       ...EMPTY_FORM,
-      region: settings.country || '',
+      country: settings.country || '',
+      region: '',
       isDefault: addresses.length === 0,
     });
     setModalVisible(true);
@@ -77,6 +81,7 @@ export default function AddressScreen() {
       address2: address.address2 || '',
       city: address.city,
       region: address.region,
+      country: address.country || address.region || '',
       postalCode: address.postalCode || '',
       notes: address.notes || '',
       isDefault: address.isDefault,
@@ -98,7 +103,8 @@ export default function AddressScreen() {
     if (!form.phone.trim()) return 'Enter a phone number.';
     if (!form.address1.trim()) return 'Enter address line 1.';
     if (!form.city.trim()) return 'Enter the city or town.';
-    if (!form.region.trim()) return 'Enter the region or country.';
+    if (!form.region.trim()) return 'Enter the region, state, or parish.';
+    if (!form.country.trim()) return 'Enter the country.';
     return '';
   };
 
@@ -106,7 +112,7 @@ export default function AddressScreen() {
     const error = validateForm();
 
     if (error) {
-      Alert.alert('Address needed', error);
+      noodAlert('Address needed', error);
       return;
     }
 
@@ -118,6 +124,7 @@ export default function AddressScreen() {
       address2: form.address2.trim(),
       city: form.city.trim(),
       region: form.region.trim(),
+      country: form.country.trim(),
       postalCode: form.postalCode.trim(),
       notes: form.notes.trim(),
     };
@@ -134,12 +141,7 @@ export default function AddressScreen() {
   const confirmDelete = (address: ShippingAddress) => {
     const runDelete = () => void deleteAddress(address.id);
 
-    if (Platform.OS === 'web' && typeof window !== 'undefined') {
-      if (window.confirm('Delete this address?')) runDelete();
-      return;
-    }
-
-    Alert.alert('Delete address?', 'This removes the address from this device.', [
+    noodAlert('Delete address?', 'This removes the address from this device.', [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete', style: 'destructive', onPress: runDelete },
     ]);
@@ -150,6 +152,7 @@ export default function AddressScreen() {
     address.address2,
     address.city,
     address.region,
+    address.country,
     address.postalCode,
   ].filter(Boolean);
 
@@ -173,7 +176,7 @@ export default function AddressScreen() {
             <View style={styles.cardTitleWrap}>
               <Text style={styles.heading}>Address book</Text>
               <Text style={styles.description}>
-                Manage shipping addresses and choose the default for checkout.
+                Add a shipping address to make checkout faster.
               </Text>
             </View>
             <View style={styles.countBadge}>
@@ -181,17 +184,14 @@ export default function AddressScreen() {
             </View>
           </View>
 
-          {!isSignedIn ? (
-            <View style={styles.guestNotice}>
-              <Ionicons name="person-circle-outline" size={20} color="#5c31ff" />
-              <Text style={styles.guestNoticeText}>Sign in to save addresses across devices.</Text>
+          {isDeviceLocal ? (
+            <View style={styles.deviceNotice}>
+              <Ionicons name="phone-portrait-outline" size={18} color="#ff6a00" />
+              <Text style={styles.deviceNoticeText}>
+                Addresses are saved on this device. Sign in later to sync them to your account.
+              </Text>
             </View>
           ) : null}
-
-          <TouchableOpacity style={styles.actionButton} activeOpacity={0.9} onPress={openAddModal}>
-            <Ionicons name="add-circle-outline" size={20} color="#fff" />
-            <Text style={styles.actionButtonText}>Add new address</Text>
-          </TouchableOpacity>
 
           {loadingAddresses ? (
             <View style={styles.emptyCard}>
@@ -202,57 +202,68 @@ export default function AddressScreen() {
               <Ionicons name="location-outline" size={42} color="#ff6a00" />
               <Text style={styles.emptyTitle}>No saved addresses yet</Text>
               <Text style={styles.emptyText}>Add a shipping address to make checkout faster.</Text>
+              <TouchableOpacity style={styles.emptyButton} activeOpacity={0.9} onPress={openAddModal}>
+                <Ionicons name="add-circle-outline" size={18} color="#fff" />
+                <Text style={styles.emptyButtonText}>Add new address</Text>
+              </TouchableOpacity>
             </View>
           ) : (
-            addresses.map((address) => (
-              <View key={address.id} style={styles.addressCard}>
-                <View style={styles.addressTopRow}>
-                  <View style={styles.addressLabelWrap}>
-                    <Ionicons
-                      name={address.isDefault ? 'checkmark-circle' : 'location-outline'}
-                      size={18}
-                      color={address.isDefault ? '#5c31ff' : '#ff6a00'}
-                    />
-                    <Text style={styles.addressLabel}>
-                      {address.isDefault ? 'Default shipping' : 'Shipping address'}
-                    </Text>
-                  </View>
-                  {address.id === defaultAddressId ? (
-                    <View style={styles.badge}>
-                      <Text style={styles.badgeText}>Default</Text>
+            <>
+              <TouchableOpacity style={styles.actionButton} activeOpacity={0.9} onPress={openAddModal}>
+                <Ionicons name="add-circle-outline" size={20} color="#fff" />
+                <Text style={styles.actionButtonText}>Add new address</Text>
+              </TouchableOpacity>
+
+              {addresses.map((address) => (
+                <View key={address.id} style={styles.addressCard}>
+                  <View style={styles.addressTopRow}>
+                    <View style={styles.addressLabelWrap}>
+                      <Ionicons
+                        name={address.isDefault ? 'checkmark-circle' : 'location-outline'}
+                        size={18}
+                        color={address.isDefault ? '#5c31ff' : '#ff6a00'}
+                      />
+                      <Text style={styles.addressLabel}>
+                        {address.isDefault ? 'Default shipping' : 'Shipping address'}
+                      </Text>
                     </View>
+                    {address.id === defaultAddressId ? (
+                      <View style={styles.badge}>
+                        <Text style={styles.badgeText}>Default</Text>
+                      </View>
+                    ) : null}
+                  </View>
+
+                  <Text style={styles.addressName}>{address.fullName}</Text>
+                  <Text style={styles.addressLine}>{address.phone}</Text>
+                  {renderAddressLines(address).map((line) => (
+                    <Text key={`${address.id}-${line}`} style={styles.addressLine}>
+                      {line}
+                    </Text>
+                  ))}
+                  {!!address.notes ? (
+                    <Text style={styles.notesLine}>Notes: {address.notes}</Text>
                   ) : null}
-                </View>
 
-                <Text style={styles.addressName}>{address.fullName}</Text>
-                <Text style={styles.addressLine}>{address.phone}</Text>
-                {renderAddressLines(address).map((line) => (
-                  <Text key={`${address.id}-${line}`} style={styles.addressLine}>
-                    {line}
-                  </Text>
-                ))}
-                {!!address.notes ? (
-                  <Text style={styles.notesLine}>Notes: {address.notes}</Text>
-                ) : null}
-
-                <View style={styles.actionsRow}>
-                  <TouchableOpacity style={styles.smallAction} onPress={() => openEditModal(address)}>
-                    <Text style={styles.smallActionText}>Edit</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={styles.smallAction} onPress={() => confirmDelete(address)}>
-                    <Text style={styles.smallActionText}>Delete</Text>
-                  </TouchableOpacity>
-                  {!address.isDefault ? (
-                    <TouchableOpacity
-                      style={[styles.smallAction, styles.defaultAction]}
-                      onPress={() => void setDefaultAddress(address.id)}
-                    >
-                      <Text style={styles.defaultActionText}>Set as default</Text>
+                  <View style={styles.actionsRow}>
+                    <TouchableOpacity style={styles.smallAction} onPress={() => openEditModal(address)}>
+                      <Text style={styles.smallActionText}>Edit</Text>
                     </TouchableOpacity>
-                  ) : null}
+                    <TouchableOpacity style={styles.smallAction} onPress={() => confirmDelete(address)}>
+                      <Text style={styles.smallActionText}>Delete</Text>
+                    </TouchableOpacity>
+                    {!address.isDefault ? (
+                      <TouchableOpacity
+                        style={[styles.smallAction, styles.defaultAction]}
+                        onPress={() => void setDefaultAddress(address.id)}
+                      >
+                        <Text style={styles.defaultActionText}>Set as default</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
                 </View>
-              </View>
-            ))
+              ))}
+            </>
           )}
 
           <TouchableOpacity
@@ -281,8 +292,9 @@ export default function AddressScreen() {
               <AddressInput label="Phone number" value={form.phone} onChangeText={(value) => updateField('phone', value)} keyboardType="phone-pad" />
               <AddressInput label="Address line 1" value={form.address1} onChangeText={(value) => updateField('address1', value)} />
               <AddressInput label="Address line 2 optional" value={form.address2} onChangeText={(value) => updateField('address2', value)} />
-              <AddressInput label="City/town" value={form.city} onChangeText={(value) => updateField('city', value)} />
-              <AddressInput label="Region/country" value={form.region} onChangeText={(value) => updateField('region', value)} />
+              <AddressInput label="City / town" value={form.city} onChangeText={(value) => updateField('city', value)} />
+              <AddressInput label="Region / state / parish" value={form.region} onChangeText={(value) => updateField('region', value)} />
+              <AddressInput label="Country" value={form.country} onChangeText={(value) => updateField('country', value)} />
               <AddressInput label="Postal code optional" value={form.postalCode} onChangeText={(value) => updateField('postalCode', value)} />
               <AddressInput
                 label="Delivery instructions optional"
@@ -293,7 +305,7 @@ export default function AddressScreen() {
 
               <View style={styles.defaultRow}>
                 <View style={styles.defaultRowText}>
-                  <Text style={styles.defaultRowTitle}>Default shipping</Text>
+                  <Text style={styles.defaultRowTitle}>Set as default address</Text>
                   <Text style={styles.defaultRowCopy}>Use this address first at checkout.</Text>
                 </View>
                 <Switch
@@ -388,6 +400,11 @@ const styles = StyleSheet.create({
     padding: 18,
     borderWidth: 1,
     borderColor: '#ffe4d6',
+    shadowColor: '#ff6a00',
+    shadowOpacity: 0.05,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2,
   },
   cardHeader: {
     flexDirection: 'row',
@@ -423,20 +440,23 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '900',
   },
-  guestNotice: {
+  deviceNotice: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#f1ecff',
-    borderRadius: 16,
+    backgroundColor: '#fff7f2',
+    borderRadius: 14,
     padding: 12,
     marginBottom: 14,
+    borderWidth: 1,
+    borderColor: '#ffe4d6',
   },
-  guestNoticeText: {
+  deviceNoticeText: {
     flex: 1,
     marginLeft: 8,
-    color: '#4d33b8',
-    fontSize: 13,
+    color: '#6f5a4e',
+    fontSize: 12,
     fontWeight: '700',
+    lineHeight: 17,
   },
   actionButton: {
     minHeight: 52,
@@ -473,6 +493,22 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: 'center',
     lineHeight: 20,
+  },
+  emptyButton: {
+    marginTop: 16,
+    minHeight: 48,
+    paddingHorizontal: 20,
+    borderRadius: 14,
+    backgroundColor: '#ff6a00',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 8,
+  },
+  emptyButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '900',
   },
   addressCard: {
     backgroundColor: '#fff7f2',
@@ -676,3 +712,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
 });
+
+export default function AddressScreen() {
+  return <AddressContent />;
+}

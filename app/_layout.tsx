@@ -1,7 +1,9 @@
+import 'react-native-gesture-handler';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Image,
   InteractionManager,
+  Modal,
   Platform,
   Pressable,
   SafeAreaView,
@@ -10,32 +12,52 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import * as SplashScreen from 'expo-splash-screen';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import * as Font from 'expo-font';
 import { Stack, usePathname, useRouter } from 'expo-router';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { EDGE_SWIPE_STACK_OPTIONS } from '../utils/navigation-gestures';
 import { UserProvider, useUser } from '../context/UserContext';
 import { useUpdates } from '../context/UpdatesContext';
-import { PAYMENT_TESTING_MODE } from '../utils/payment-testing';
+import { SIGN_IN_ENABLED } from '../utils/payment-testing';
 import { CartProvider } from '../context/CartContext';
 import { WishlistProvider } from '../context/WishlistContext';
 import { AddressProvider } from '../context/AddressContext';
 import { HistoryProvider } from '../context/HistoryContext';
 import { UpdatesProvider } from '../context/UpdatesContext';
 import { NoodAlertProvider } from '../context/NoodAlertContext';
+import { logAppRestartDebug } from '../utils/auth-flow-debug';
+import {
+  isAppBootstrapComplete,
+  markAppBootstrapComplete,
+} from '../utils/app-bootstrap';
+import { logAuthRestartCheck, logRootLayoutMounted } from '../utils/auth-restart-debug';
 import { logBackendStartup } from '../utils/backend';
+import { logDevRuntimeParity } from '../utils/dev-runtime';
+import { isKeepAwakeActivationError } from '../utils/keep-awake-errors';
 import {
   canUseRemotePushNotifications,
+  configureNotificationPresentation,
   ensurePushTokenRegistered,
   evaluateNotificationPromptState,
   markNotificationPromptShown,
 } from '../utils/push-notifications';
+import NoodBouncingLogo from '../components/NoodBouncingLogo';
+import RewardInviteDeepLinkListener from '../components/RewardInviteDeepLinkListener';
+import RewardPopupHost from '../components/RewardPopupHost';
 import ShopifyAuthDeepLinkListener from '../components/ShopifyAuthDeepLinkListener';
+import { logNativeSplashConfigChecked } from '../utils/splash';
 
 const webShadow = (value: string) => (Platform.OS === 'web' ? { boxShadow: value } : {});
 const platformShadow = (webValue: string, nativeValue: object) =>
   Platform.OS === 'web' ? webShadow(webValue) : nativeValue;
 const GOOGLE_LOGO_URL =
   'https://cdn.shopify.com/s/files/1/0663/2099/0292/files/2a5758d6-4edb-4047-87bb-e6b94dbbbab0-cover.png?v=1781936734';
+const SPLASH_MIN_VISIBLE_MS = 1200;
+const ICON_FONT_READY_TIMEOUT_MS = 4000;
+
+void SplashScreen.preventAutoHideAsync().catch(() => {});
 
 type WelcomeAuthProvider = 'google' | 'facebook' | 'shop';
 
@@ -76,24 +98,59 @@ export default function RootLayout() {
 }
 
 function RootLayoutInner() {
-  const [iconsReady, setIconsReady] = useState(Platform.OS === 'web');
+  const bootstrapAlreadyComplete = isAppBootstrapComplete();
+  const [iconsReady, setIconsReady] = useState(
+    () => Platform.OS === 'web' || bootstrapAlreadyComplete
+  );
+  const [splashMinElapsed, setSplashMinElapsed] = useState(() => bootstrapAlreadyComplete);
   const [welcomeDismissedForSession, setWelcomeDismissedForSession] = useState(false);
-  const [notificationFlowFinished, setNotificationFlowFinished] = useState(false);
+  const [notificationFlowFinished, setNotificationFlowFinished] = useState(
+    () => bootstrapAlreadyComplete
+  );
+  const showLaunchSplash = !bootstrapAlreadyComplete && (!iconsReady || !splashMinElapsed);
   const handleNotificationFlowFinished = useCallback(() => {
     setNotificationFlowFinished(true);
   }, []);
 
   useEffect(() => {
-    logBackendStartup();
+    logRootLayoutMounted();
+    logAppRestartDebug('root-layout-mounted', {
+      bootstrapAlreadyComplete,
+      showLaunchSplash,
+    });
+    logAuthRestartCheck({
+      step: 'root-layout-mounted',
+      isAppBootstrapping: showLaunchSplash,
+    });
+    logNativeSplashConfigChecked();
+    logDevRuntimeParity('root-layout-mounted');
+    void logBackendStartup();
+    void configureNotificationPresentation();
   }, []);
+
+  useEffect(() => {
+    if (bootstrapAlreadyComplete) {
+      setSplashMinElapsed(true);
+      return;
+    }
+
+    const timer = setTimeout(() => setSplashMinElapsed(true), SPLASH_MIN_VISIBLE_MS);
+    return () => clearTimeout(timer);
+  }, [bootstrapAlreadyComplete]);
+
+  useEffect(() => {
+    if (iconsReady && splashMinElapsed) {
+      markAppBootstrapComplete();
+      setNotificationFlowFinished(true);
+    }
+  }, [iconsReady, splashMinElapsed]);
 
   useEffect(() => {
     const previousUnhandledRejection = (globalThis as any).onunhandledrejection;
 
     (globalThis as any).onunhandledrejection = (event: any) => {
-      const message = String(event?.reason?.message || event?.reason || '');
-
-      if (message.includes('Unable to activate keep awake')) {
+      if (isKeepAwakeActivationError(event?.reason)) {
+        console.warn('[KEEP_AWAKE_DISABLED]', event?.reason);
         event?.preventDefault?.();
         return;
       }
@@ -111,9 +168,15 @@ function RootLayoutInner() {
   useEffect(() => {
     let isMounted = true;
 
+    const timeout = setTimeout(() => {
+      if (isMounted && Platform.OS !== 'web') {
+        setIconsReady(true);
+      }
+    }, ICON_FONT_READY_TIMEOUT_MS);
+
     Font.loadAsync(Ionicons.font)
       .catch(() => {
-        // Keep the app usable if the icon font is slow or unavailable on web.
+        // Keep the app usable if the icon font is slow or unavailable on native.
       })
       .finally(() => {
         if (isMounted && Platform.OS !== 'web') {
@@ -123,13 +186,20 @@ function RootLayoutInner() {
 
     return () => {
       isMounted = false;
+      clearTimeout(timeout);
     };
   }, []);
 
   return (
-    <View style={styles.rootShell}>
+    <GestureHandlerRootView style={styles.rootShell}>
       <ShopifyAuthDeepLinkListener />
-      <Stack screenOptions={{ headerShown: false }} />
+      <RewardInviteDeepLinkListener />
+      <Stack
+        screenOptions={{
+          headerShown: false,
+          ...EDGE_SWIPE_STACK_OPTIONS,
+        }}
+      />
       {iconsReady ? (
         <>
           <NotificationPermissionPromptHost onFlowFinished={handleNotificationFlowFinished} />
@@ -138,11 +208,14 @@ function RootLayoutInner() {
             onDismiss={() => setWelcomeDismissedForSession(true)}
             canShowAfterStartup={notificationFlowFinished}
           />
+          <RewardPopupHost
+            appInteractive={iconsReady && notificationFlowFinished}
+            welcomeDismissedForSession={welcomeDismissedForSession}
+          />
         </>
-      ) : (
-        <LaunchSplash overlay />
-      )}
-    </View>
+      ) : null}
+      {showLaunchSplash ? <LaunchSplash /> : null}
+    </GestureHandlerRootView>
   );
 }
 
@@ -158,7 +231,7 @@ function WelcomeModalHost({
   const router = useRouter();
   const pathname = usePathname();
   const { isReady, isSignedIn } = useUser();
-  const loginActionsEnabled = !PAYMENT_TESTING_MODE;
+  const loginActionsEnabled = SIGN_IN_ENABLED;
 
   const isAuthRoute =
     pathname === '/sign-in' ||
@@ -178,6 +251,11 @@ function WelcomeModalHost({
     closeModal();
 
     InteractionManager.runAfterInteractions(() => {
+      logAuthRestartCheck({
+        step: 'welcome-modal-open-provider',
+        isAppBootstrapping: !isAppBootstrapComplete(),
+        detail: { provider },
+      });
       router.push({
         pathname: '/account/auth',
         params: { provider },
@@ -385,11 +463,23 @@ function NotificationPermissionPromptHost({
       return;
     }
 
+    let cancelled = false;
+    const fallbackTimer = setTimeout(() => {
+      if (!cancelled) {
+        setVisible(true);
+      }
+    }, 900);
+
     const task = InteractionManager.runAfterInteractions(() => {
-      setVisible(true);
+      if (!cancelled) {
+        clearTimeout(fallbackTimer);
+        setVisible(true);
+      }
     });
 
     return () => {
+      cancelled = true;
+      clearTimeout(fallbackTimer);
       task.cancel?.();
     };
   }, [isReady, promptReady]);
@@ -434,54 +524,90 @@ function NotificationPermissionPromptHost({
     closePrompt();
   };
 
-  if (!visible) return null;
-
   return (
-    <View style={styles.notificationOverlay}>
-      <SafeAreaView style={styles.notificationModalShell}>
-        <Pressable style={styles.backdrop} onPress={handleNotNow} />
+    <Modal
+      transparent
+      visible={visible}
+      animationType="fade"
+      onRequestClose={() => void handleNotNow()}
+    >
+      <View style={styles.notificationOverlay}>
+        <SafeAreaView style={styles.notificationModalShell}>
+          <Pressable style={styles.backdrop} onPress={() => void handleNotNow()} />
 
-        <View style={styles.notificationCard}>
-          <View style={styles.notificationAccentBar} />
+          <View style={styles.notificationCard}>
+            <View style={styles.notificationAccentBar} />
 
-          <View style={styles.notificationIconWrap}>
-            <Ionicons name="notifications-outline" size={24} color="#ff6a00" />
+            <View style={styles.notificationIconWrap}>
+              <Ionicons name="notifications-outline" size={24} color="#ff6a00" />
+            </View>
+
+            <Text style={styles.notificationTitle}>Stay updated with NOOD</Text>
+            <Text style={styles.notificationMessage}>
+              Enable notifications for order updates, delivery alerts, deals, and rewards.
+            </Text>
+
+            <TouchableOpacity
+              style={styles.notificationPrimaryButton}
+              activeOpacity={0.92}
+              onPress={() => void handleEnable()}
+            >
+              <Text style={styles.notificationPrimaryButtonText}>Enable notifications</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.notificationSecondaryButton}
+              activeOpacity={0.85}
+              onPress={() => void handleNotNow()}
+            >
+              <Text style={styles.notificationSecondaryButtonText}>Not now</Text>
+            </TouchableOpacity>
           </View>
-
-          <Text style={styles.notificationTitle}>Stay updated with NOOD</Text>
-          <Text style={styles.notificationMessage}>
-            Enable notifications for order updates, delivery alerts, deals, and rewards.
-          </Text>
-
-          <TouchableOpacity
-            style={styles.notificationPrimaryButton}
-            activeOpacity={0.92}
-            onPress={() => void handleEnable()}
-          >
-            <Text style={styles.notificationPrimaryButtonText}>Enable notifications</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.notificationSecondaryButton}
-            activeOpacity={0.85}
-            onPress={() => void handleNotNow()}
-          >
-            <Text style={styles.notificationSecondaryButtonText}>Not now</Text>
-          </TouchableOpacity>
-        </View>
-      </SafeAreaView>
-    </View>
+        </SafeAreaView>
+      </View>
+    </Modal>
   );
 }
 
-function LaunchSplash({ overlay = false }: { overlay?: boolean }) {
+function LaunchSplash() {
+  useEffect(() => {
+    logAuthRestartCheck({
+      step: 'launch-splash-mounted',
+      isAppBootstrapping: true,
+    });
+
+    const frame = requestAnimationFrame(() => {
+      void SplashScreen.hideAsync().catch(() => {});
+    });
+
+    if (__DEV__) {
+      console.log('[NOOD splash] app loading component mounted', { component: 'LaunchSplash' });
+      console.log('[NOOD splash] native splash hidden — logo-only in-app splash active');
+    }
+
+    return () => {
+      cancelAnimationFrame(frame);
+
+      if (__DEV__) {
+        console.log('[NOOD splash] loading component unmounted', { component: 'LaunchSplash' });
+      }
+    };
+  }, []);
+
+  const handleAnimationStarted = useCallback(() => {
+    if (__DEV__) {
+      console.log('[NOOD splash] bouncing logo animation started', { component: 'LaunchSplash' });
+    }
+  }, []);
+
   return (
-    <View style={[styles.launchSplash, overlay && styles.launchSplashOverlay]}>
+    <View style={styles.launchSplash}>
       <View style={styles.launchSplashContent}>
-        <Image
-          source={require('../assets/images/nood-brand-splash.png')}
-          resizeMode="contain"
-          style={styles.launchSplashLogo}
+        <NoodBouncingLogo
+          width={320}
+          height={320}
+          bounceEnabled={false}
+          onAnimationStarted={handleAnimationStarted}
         />
       </View>
     </View>
@@ -494,21 +620,16 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
   },
   launchSplash: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: '#fff',
-  },
-  launchSplashOverlay: {
-    ...StyleSheet.absoluteFillObject,
     zIndex: 10000,
     ...(Platform.OS === 'web' ? {} : { elevation: 10000 }),
   },
-  launchSplashLogo: {
-    width: 260,
-    height: 180,
-  },
   launchSplashContent: {
+    width: 320,
+    height: 320,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -740,12 +861,10 @@ const styles = StyleSheet.create({
     color: '#8d7a6f',
   },
   notificationOverlay: {
-    ...StyleSheet.absoluteFillObject,
+    flex: 1,
     backgroundColor: 'rgba(17, 17, 17, 0.38)',
     justifyContent: 'center',
     paddingHorizontal: 20,
-    zIndex: 9990,
-    ...(Platform.OS === 'web' ? {} : { elevation: 9990 }),
   },
   notificationModalShell: {
     flex: 1,

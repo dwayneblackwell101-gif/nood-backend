@@ -1,3 +1,5 @@
+import { HOME_PERF_DEBUG } from './debug-flags';
+
 export type HomeFeedProduct = {
   id: string;
   collectionHandle: string;
@@ -37,7 +39,7 @@ const CATEGORY_MATCH_ORDER: MainCategory[] = [
 const perfNow = () => globalThis.performance?.now?.() ?? Date.now();
 
 function homeLog(message: string, data?: Record<string, unknown>) {
-  if (__DEV__) {
+  if (HOME_PERF_DEBUG) {
     console.log(message, data);
   }
 }

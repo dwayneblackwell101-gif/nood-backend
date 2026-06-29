@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
+  BackHandler,
   FlatList,
-  Image,
+  RefreshControl,
   SafeAreaView,
   StyleSheet,
   Text,
@@ -10,17 +11,40 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { Image as ExpoImage } from 'expo-image';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import { CATALOG_LIST_PROPS } from '../components/catalog/ListPerf';
 import { router, useFocusEffect } from 'expo-router';
 import NoodSpinner from '../components/NoodSpinner';
 import { useCart } from '../context/CartContext';
-import { BASE_CURRENCY } from '../utils/currency';
-import { catalogFetch } from '../utils/catalog';
+import { BASE_CURRENCY, normalizeCatalogCurrencyCode } from '../utils/currency';
+import { fetchCatalogPath, peekCatalogFreshness } from '../utils/catalog';
+import {
+  getConfiguredBackendUrl,
+  getLastSuccessfulBackendUrl,
+  PAYMENT_BACKEND_URL,
+} from '../utils/backend';
 import { buildProductRouteParams } from '../utils/product-navigation';
+import { NOOD_REFRESH_CONTROL_PROPS } from '../utils/navigation-gestures';
+import { useScreenPerfReporter } from '../utils/screen-perf';
+import {
+  getProductAvailabilityLabel,
+  resolveListProductAvailableForSale,
+  resolveListProductSoldOut,
+} from '../utils/product-availability';
 
 const SEARCH_PRODUCTS_CACHE_KEY = 'NOOD_SEARCH_PRODUCTS_CACHE_V1';
+const HOME_PRODUCTS_CACHE_KEY = 'NOOD_HOME_PRODUCTS_CACHE_V2';
+const SEARCH_POPULAR_PRODUCT_LIMIT = 60;
 
 const SEARCH_DEBOUNCE_MS = 300;
+const SEARCH_PERF_DEBUG = false;
+
+function searchPerfLog(...args: unknown[]) {
+  if (SEARCH_PERF_DEBUG) {
+    console.log(...args);
+  }
+}
 
 type SearchProduct = {
   id: string;
@@ -52,93 +76,124 @@ type SearchProductsCache = {
   savedAt?: string;
 };
 
-const ALL_PRODUCTS_QUERY = `
-  query GetSearchProducts($first: Int!, $after: String) {
-    products(first: $first, after: $after, sortKey: CREATED_AT, reverse: true) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      edges {
-        node {
-          id
-          title
-          handle
-          vendor
-          productType
-          description
-          tags
-          availableForSale
-          featuredImage {
-            url
-          }
-          priceRange {
-            minVariantPrice {
-              amount
-              currencyCode
-            }
-          }
-          compareAtPriceRange {
-            maxVariantPrice {
-              amount
-              currencyCode
-            }
-          }
-          collections(first: 10) {
-            edges {
-              node {
-                handle
-                title
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-`;
+type HomeProductsCache = {
+  version?: number;
+  products?: SearchProduct[];
+  nextCursor?: string | null;
+  hasMore?: boolean;
+  mixKey?: number | null;
+  savedAt?: string;
+};
 
-const SHOPIFY_PRODUCT_SEARCH_QUERY = `
-  query SearchProducts($first: Int!, $query: String!) {
-    products(first: $first, query: $query, sortKey: RELEVANCE) {
-      edges {
-        node {
-          id
-          title
-          handle
-          vendor
-          productType
-          description
-          tags
-          availableForSale
-          featuredImage {
-            url
-          }
-          priceRange {
-            minVariantPrice {
-              amount
-              currencyCode
-            }
-          }
-          compareAtPriceRange {
-            maxVariantPrice {
-              amount
-              currencyCode
-            }
-          }
-          collections(first: 10) {
-            edges {
-              node {
-                handle
-                title
-              }
-            }
-          }
-        }
-      }
+type SearchProductCardProps = {
+  item: SearchProduct;
+  displayPrice: string;
+  displayOldPrice: string | null;
+  onOpen: (product: SearchProduct) => void;
+};
+
+function searchProductCardPropsAreEqual(
+  prev: SearchProductCardProps,
+  next: SearchProductCardProps
+) {
+  return (
+    prev.item.id === next.item.id &&
+    prev.item.handle === next.item.handle &&
+    prev.item.image === next.item.image &&
+    prev.item.title === next.item.title &&
+    prev.displayPrice === next.displayPrice &&
+    prev.displayOldPrice === next.displayOldPrice &&
+    prev.onOpen === next.onOpen
+  );
+}
+
+const SearchProductCard = React.memo(function SearchProductCard({
+  item,
+  displayPrice,
+  displayOldPrice,
+  onOpen,
+}: SearchProductCardProps) {
+  const isSoldOut = resolveListProductSoldOut(item);
+
+  return (
+    <TouchableOpacity
+      style={styles.productCard}
+      activeOpacity={0.9}
+      onPress={() => onOpen(item)}
+    >
+      <ExpoImage
+        source={{ uri: item.image }}
+        style={styles.productImage}
+        contentFit="cover"
+        cachePolicy="memory-disk"
+        recyclingKey={item.image || item.id}
+        transition={0}
+      />
+      <Text style={styles.productTitle} numberOfLines={2}>
+        {item.title}
+      </Text>
+      <Text style={styles.productMeta} numberOfLines={1}>
+        {item.brand || item.category}
+      </Text>
+      <View style={styles.priceRow}>
+        <Text style={styles.productPrice}>{displayPrice}</Text>
+        {displayOldPrice ? <Text style={styles.oldPrice}>{displayOldPrice}</Text> : null}
+      </View>
+      {isSoldOut ? (
+        <Text style={styles.stockUnavailableText}>{getProductAvailabilityLabel(item)}</Text>
+      ) : null}
+    </TouchableOpacity>
+  );
+}, searchProductCardPropsAreEqual);
+
+function parseHomeProductsCacheRaw(raw: string | null): SearchProduct[] {
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw) as SearchProduct[] | HomeProductsCache;
+
+    if (Array.isArray(parsed)) {
+      return parsed
+        .filter((product) => product?.handle)
+        .slice(0, SEARCH_POPULAR_PRODUCT_LIMIT)
+        .map(normalizeCachedProduct);
     }
+
+    if (parsed && typeof parsed === 'object' && Array.isArray(parsed.products)) {
+      return parsed.products
+        .filter((product) => product?.handle)
+        .slice(0, SEARCH_POPULAR_PRODUCT_LIMIT)
+        .map(normalizeCachedProduct);
+    }
+  } catch (error) {
+    searchPerfLog('[NOOD search] cache read error', {
+      source: 'home-cache',
+      error: String((error as any)?.message || error),
+    });
   }
-`;
+
+  return [];
+}
+
+async function readHomePopularProductsFromCache(): Promise<SearchProduct[]> {
+  try {
+    const homeRaw = await AsyncStorage.getItem(HOME_PRODUCTS_CACHE_KEY);
+    const products = parseHomeProductsCacheRaw(homeRaw);
+
+    if (products.length) {
+      searchPerfLog('[NOOD search] home cache popular count', products.length);
+      searchPerfLog('[NOOD search] using home cache for popular');
+    }
+
+    return products;
+  } catch (error) {
+    searchPerfLog('[NOOD search] cache read error', {
+      source: 'home-cache',
+      error: String((error as any)?.message || error),
+    });
+    return [];
+  }
+}
 
 function formatMoney(amount?: string | null) {
   if (!amount) return '$0.00';
@@ -407,57 +462,81 @@ function mergeProducts(primary: SearchProduct[], secondary: SearchProduct[]) {
   return merged;
 }
 
-function buildShopifySearchQuery(query: string) {
-  const tokens = normalizeSearchValue(query)
-    .split(' ')
-    .filter((token) => token.length >= 2)
-    .slice(0, 4);
+const SEARCH_BACKEND_TIMEOUT_MS = 20000;
+const SEARCH_BOOTSTRAP_TIMEOUT_MS = 25000;
 
-  if (!tokens.length) return '';
-
-  return tokens
-    .flatMap((token) => [
-      `title:${token}*`,
-      `tag:${token}*`,
-      `vendor:${token}*`,
-      `product_type:${token}*`,
-    ])
-    .join(' OR ');
+async function readInstantDefaultProductsFromCache(): Promise<SearchProduct[]> {
+  return readHomePopularProductsFromCache();
 }
 
-const SEARCH_BACKEND_TIMEOUT_MS = 30000;
+async function fetchBackendSearchProducts(query: string) {
+  const trimmed = query.trim();
+  if (trimmed.length < 2) {
+    return [];
+  }
 
-async function fetchShopifySearchProducts(query: string) {
-  const shopifyQuery = buildShopifySearchQuery(query);
-  if (!shopifyQuery) return [];
+  const path = `/api/catalog/search?q=${encodeURIComponent(trimmed)}&limit=80&first=80`;
+  const backendUrl = getConfiguredBackendUrl();
+
+  searchPerfLog('[NOOD search] backend request', {
+    query: trimmed,
+    backendUrl: backendUrl || '(not set)',
+    path,
+  });
 
   try {
-    const json = await catalogGraphqlFetch(
-      SHOPIFY_PRODUCT_SEARCH_QUERY,
-      {
-        first: 80,
-        query: shopifyQuery,
-      },
-      { timeoutMs: SEARCH_BACKEND_TIMEOUT_MS }
-    );
-
-    return mapProducts(json?.data?.products?.edges || []);
+    const json = await fetchCatalogPath(path, {
+      skipLocalCache: true,
+      timeoutMs: SEARCH_BACKEND_TIMEOUT_MS,
+    });
+    const products = mapProducts(json?.data?.products?.edges || []);
+    searchPerfLog('[NOOD catalog] search count', products.length);
+    searchPerfLog('[NOOD search] backend response count', {
+      query: trimmed,
+      count: products.length,
+      source: json?.source || 'unknown',
+    });
+    return products;
   } catch (error) {
-    console.log('[NOOD app] search backend timed out or failed; using local results', String(error));
+    searchPerfLog('[NOOD search] backend error', {
+      query: trimmed,
+      backendUrl: backendUrl || '(not set)',
+      path,
+      error: String((error as any)?.message || error),
+    });
     return [];
   }
 }
 
-async function fetchSearchCatalogBootstrap() {
-  const json = await catalogGraphqlFetch(ALL_PRODUCTS_QUERY, {
-    first: 48,
-    after: null,
+async function fetchSearchCatalogBootstrap(): Promise<{
+  products: SearchProduct[];
+  usedFallback: boolean;
+}> {
+  const path = '/api/catalog/products?limit=48&first=48&sort=updated';
+  const primaryUrl = getConfiguredBackendUrl();
+
+  searchPerfLog('[NOOD search] fetching backend bootstrap', {
+    path,
+    primaryUrl: primaryUrl || '(not set)',
+  });
+
+  const json = await fetchCatalogPath(path, {
+    skipLocalCache: true,
+    timeoutMs: SEARCH_BOOTSTRAP_TIMEOUT_MS,
   });
   const edges = json?.data?.products?.edges || [];
   const products = mapProducts(edges);
+  const resolvedUrl = getLastSuccessfulBackendUrl();
+  const usedFallback = Boolean(primaryUrl && resolvedUrl && primaryUrl !== resolvedUrl);
 
-  console.log(`[NOOD app] search bootstrap loaded count=${products.length}`);
-  return products;
+  if (usedFallback) {
+    searchPerfLog('[NOOD search] backend fallback used', {
+      primaryUrl,
+      resolvedUrl: resolvedUrl || PAYMENT_BACKEND_URL,
+    });
+  }
+
+  return { products, usedFallback };
 }
 
 function mapProducts(edges: any[]): SearchProduct[] {
@@ -467,10 +546,10 @@ function mapProducts(edges: any[]): SearchProduct[] {
     const oldPriceAmount = node.compareAtPriceRange?.maxVariantPrice?.amount
       ? Number(node.compareAtPriceRange.maxVariantPrice.amount)
       : null;
-    const currencyCode =
+    const currencyCode = normalizeCatalogCurrencyCode(
       node.priceRange?.minVariantPrice?.currencyCode ||
-      node.compareAtPriceRange?.maxVariantPrice?.currencyCode ||
-      BASE_CURRENCY;
+        node.compareAtPriceRange?.maxVariantPrice?.currencyCode
+    );
     const collectionHandles =
       node.collections?.edges?.map((collection: any) => collection.node?.handle).filter(Boolean) ||
       [];
@@ -483,7 +562,7 @@ function mapProducts(edges: any[]): SearchProduct[] {
       collectionTitles[0] ||
       matchedCollection;
 
-    return {
+    const mapped: SearchProduct = {
       id: String(node.id),
       title: String(node.title || 'Product'),
       handle: String(node.handle || ''),
@@ -505,17 +584,20 @@ function mapProducts(edges: any[]): SearchProduct[] {
       collectionTitle: collectionTitles[0] || matchedCollection,
       collectionHandles,
       collectionTitles,
-      availableForSale: Boolean(node.availableForSale ?? true),
+      variants: node.variants?.edges?.length ? node.variants : undefined,
+      availableForSale: true,
     };
+    mapped.availableForSale = resolveListProductAvailableForSale(mapped);
+    return mapped;
   });
 }
 
-async function catalogGraphqlFetch(
-  query: string,
-  variables?: Record<string, any>,
-  options?: { timeoutMs?: number }
-) {
-  return catalogFetch(query, variables, options);
+function hasTypedSearchQuery(value: string) {
+  return value.trim().length > 0;
+}
+
+function hasBackendSearchQuery(value: string) {
+  return value.trim().length >= 2;
 }
 
 export default function SearchScreen() {
@@ -527,12 +609,60 @@ export default function SearchScreen() {
   } = useCart();
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
-  const [products, setProducts] = useState<SearchProduct[]>([]);
+  const [defaultProducts, setDefaultProducts] = useState<SearchProduct[]>([]);
+  const defaultProductsRef = useRef<SearchProduct[]>([]);
   const [remoteSearchProducts, setRemoteSearchProducts] = useState<SearchProduct[]>([]);
   const [searchingFreshResults, setSearchingFreshResults] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const isFetchingRef = useRef(false);
-  const searchRequestIdRef = useRef(0);
+  const [loadingDefaults, setLoadingDefaults] = useState(false);
+  const [pullRefreshing, setPullRefreshing] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const bootstrapRequestIdRef = useRef(0);
+  const searchRequestSeqRef = useRef(0);
+  const activeSearchQueryRef = useRef('');
+  const lastSuccessfulSearchRef = useRef<{ query: string; products: SearchProduct[] }>({
+    query: '',
+    products: [],
+  });
+
+  useEffect(() => {
+    defaultProductsRef.current = defaultProducts;
+  }, [defaultProducts]);
+
+  const applyDefaultProducts = useCallback((nextProducts: SearchProduct[], source: string) => {
+    defaultProductsRef.current = nextProducts;
+    setDefaultProducts(nextProducts);
+
+    if (!hasTypedSearchQuery(activeSearchQueryRef.current)) {
+      setLoadError('');
+      if (source === 'home-cache') {
+        searchPerfLog('[NOOD search] popular products loaded count', nextProducts.length, { source });
+      } else {
+        searchPerfLog('[NOOD search] bootstrap products loaded count', nextProducts.length, { source });
+      }
+      return;
+    }
+
+    searchPerfLog('[NOOD search] popular ignored because active query exists', {
+      query: activeSearchQueryRef.current,
+      count: nextProducts.length,
+      source,
+    });
+  }, []);
+
+  const handleBackPress = useCallback(() => {
+    if (router.canGoBack()) {
+      router.back();
+      return true;
+    }
+
+    router.replace('/(tabs)');
+    return true;
+  }, []);
+
+  useEffect(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', handleBackPress);
+    return () => subscription.remove();
+  }, [handleBackPress]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -542,67 +672,98 @@ export default function SearchScreen() {
     return () => clearTimeout(timer);
   }, []);
 
-  const loadSearchCache = useCallback(async () => {
+  const refreshDefaultProductsInBackground = useCallback(async () => {
+    const requestId = bootstrapRequestIdRef.current + 1;
+    bootstrapRequestIdRef.current = requestId;
+    const startedWithActiveQuery = hasTypedSearchQuery(activeSearchQueryRef.current);
+
+    if (!defaultProductsRef.current.length && !startedWithActiveQuery) {
+      setLoadingDefaults(true);
+    }
+
+    void peekCatalogFreshness('search').catch((error) => {
+      searchPerfLog('[NOOD search] version check skipped', {
+        error: String((error as any)?.message || error),
+      });
+    });
+
     try {
-      const cached = await AsyncStorage.getItem(SEARCH_PRODUCTS_CACHE_KEY);
-      if (!cached) return false;
-
-      const parsed = JSON.parse(cached) as SearchProduct[] | SearchProductsCache;
-      const cachedProducts = Array.isArray(parsed) ? parsed : parsed.products;
-
-      if (!Array.isArray(cachedProducts) || !cachedProducts.length) {
-        return false;
+      const homePopular = await readHomePopularProductsFromCache();
+      if (requestId !== bootstrapRequestIdRef.current) {
+        searchPerfLog('[NOOD search] ignored stale popular refresh', { requestId });
+        return;
       }
 
-      setProducts(cachedProducts.map(normalizeCachedProduct));
-      setLoading(false);
-      return true;
+      if (homePopular.length) {
+        applyDefaultProducts(homePopular, 'home-cache');
+        return;
+      }
+
+      searchPerfLog('[NOOD search] fallback to search bootstrap popular');
+      const { products: fetchedProducts } = await fetchSearchCatalogBootstrap();
+      if (requestId !== bootstrapRequestIdRef.current) {
+        searchPerfLog('[NOOD search] ignored stale bootstrap response', { requestId });
+        return;
+      }
+
+      if (fetchedProducts.length) {
+        applyDefaultProducts(fetchedProducts, 'bootstrap');
+        await AsyncStorage.setItem(
+          SEARCH_PRODUCTS_CACHE_KEY,
+          JSON.stringify({
+            products: fetchedProducts,
+            savedAt: new Date().toISOString(),
+          } satisfies SearchProductsCache)
+        );
+      } else if (!defaultProductsRef.current.length && !hasTypedSearchQuery(activeSearchQueryRef.current)) {
+        setLoadError('No products returned from backend. Tap retry.');
+      }
     } catch (error) {
-      console.log('Search cache read error:', error);
-      return false;
-    }
-  }, []);
-
-  const refreshSearchBootstrap = useCallback(async () => {
-    if (isFetchingRef.current) return;
-    isFetchingRef.current = true;
-
-    try {
-      const fetchedProducts = await fetchSearchCatalogBootstrap();
-      if (!fetchedProducts.length) return;
-
-      setProducts(fetchedProducts);
-      await AsyncStorage.setItem(
-        SEARCH_PRODUCTS_CACHE_KEY,
-        JSON.stringify({
-          products: fetchedProducts,
-          savedAt: new Date().toISOString(),
-        } satisfies SearchProductsCache)
-      );
-      console.log('[NOOD home] search did not overwrite home feed cache');
-    } catch (error) {
-      console.log('Search bootstrap refresh error:', error);
+      if (requestId !== bootstrapRequestIdRef.current) {
+        searchPerfLog('[NOOD search] ignored stale bootstrap response', { requestId });
+        return;
+      }
+      const message = String((error as any)?.message || error);
+      if (!defaultProductsRef.current.length && !hasTypedSearchQuery(activeSearchQueryRef.current)) {
+        setLoadError('Could not load search products. Tap retry.');
+      }
+      searchPerfLog('[NOOD search] backend error', { stage: 'bootstrap', error: message });
     } finally {
-      setLoading(false);
-      isFetchingRef.current = false;
+      if (requestId === bootstrapRequestIdRef.current) {
+        setLoadingDefaults(false);
+      }
     }
-  }, []);
+  }, [applyDefaultProducts]);
 
-  const loadProducts = useCallback(async () => {
-    const showedCache = await loadSearchCache();
-    void refreshSearchBootstrap();
-    if (!showedCache) {
-      setLoading(true);
+  const handlePullRefresh = useCallback(async () => {
+    setPullRefreshing(true);
+    try {
+      await refreshDefaultProductsInBackground();
+      const activeQuery = activeSearchQueryRef.current.trim();
+      if (hasBackendSearchQuery(activeQuery)) {
+        const freshProducts = await fetchBackendSearchProducts(activeQuery);
+        if (activeSearchQueryRef.current.trim() === activeQuery) {
+          setRemoteSearchProducts(freshProducts);
+          if (freshProducts.length) {
+            lastSuccessfulSearchRef.current = { query: activeQuery, products: freshProducts };
+          }
+        }
+      }
+    } finally {
+      setPullRefreshing(false);
     }
-  }, [loadSearchCache, refreshSearchBootstrap]);
+  }, [refreshDefaultProductsInBackground]);
 
   useEffect(() => {
-    void loadProducts();
-  }, [loadProducts]);
+    activeSearchQueryRef.current = query.trim();
+    searchPerfLog('[NOOD search] query changed', { query: query.trim() });
+  }, [query]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
-      setDebouncedQuery(query.trim());
+      const nextDebouncedQuery = query.trim();
+      setDebouncedQuery(nextDebouncedQuery);
+      searchPerfLog('[NOOD search] debounced query', { query: nextDebouncedQuery });
     }, SEARCH_DEBOUNCE_MS);
 
     return () => clearTimeout(timer);
@@ -610,26 +771,80 @@ export default function SearchScreen() {
 
   useEffect(() => {
     const trimmedQuery = debouncedQuery.trim();
-    const requestId = searchRequestIdRef.current + 1;
-    searchRequestIdRef.current = requestId;
+    const requestId = searchRequestSeqRef.current + 1;
+    searchRequestSeqRef.current = requestId;
 
-    if (trimmedQuery.length < 2) {
-      setRemoteSearchProducts([]);
+    if (!hasBackendSearchQuery(trimmedQuery)) {
+      if (!hasTypedSearchQuery(activeSearchQueryRef.current)) {
+        setRemoteSearchProducts([]);
+        lastSuccessfulSearchRef.current = { query: '', products: [] };
+      }
       setSearchingFreshResults(false);
       return;
     }
 
-    setSearchingFreshResults(true);
+    const localMatches = filterProducts(defaultProductsRef.current, trimmedQuery);
+    const hasVisibleLocalResults =
+      localMatches.length > 0 ||
+      (lastSuccessfulSearchRef.current.query === trimmedQuery &&
+        lastSuccessfulSearchRef.current.products.length > 0);
+    setSearchingFreshResults(!hasVisibleLocalResults);
 
-    void fetchShopifySearchProducts(trimmedQuery)
+    searchPerfLog('[NOOD search] search request start', {
+      query: trimmedQuery,
+      requestId,
+    });
+    searchPerfLog('[NOOD search] local prefetch', {
+      query: trimmedQuery,
+      localMatches: localMatches.length,
+      localPool: defaultProductsRef.current.length,
+    });
+
+    void fetchBackendSearchProducts(trimmedQuery)
       .then((freshProducts) => {
-        if (searchRequestIdRef.current !== requestId) return;
-        if (freshProducts.length) {
-          setRemoteSearchProducts(freshProducts);
+        if (searchRequestSeqRef.current !== requestId) {
+          searchPerfLog('[NOOD search] ignored stale response', {
+            requestId,
+            query: trimmedQuery,
+            reason: 'superseded-request',
+          });
+          return;
         }
+
+        if (activeSearchQueryRef.current.trim() !== trimmedQuery) {
+          searchPerfLog('[NOOD search] ignored stale response', {
+            requestId,
+            query: trimmedQuery,
+            activeQuery: activeSearchQueryRef.current,
+            reason: 'query-changed',
+          });
+          return;
+        }
+
+        const nextProducts =
+          freshProducts.length > 0
+            ? freshProducts
+            : lastSuccessfulSearchRef.current.query === trimmedQuery
+              ? lastSuccessfulSearchRef.current.products
+              : [];
+
+        if (freshProducts.length > 0) {
+          lastSuccessfulSearchRef.current = { query: trimmedQuery, products: freshProducts };
+        }
+
+        setRemoteSearchProducts(nextProducts);
+        searchPerfLog('[NOOD search] search response', {
+          query: trimmedQuery,
+          requestId,
+          count: nextProducts.length,
+          usedCachedFallback: !freshProducts.length && nextProducts.length > 0,
+        });
       })
       .finally(() => {
-        if (searchRequestIdRef.current === requestId) {
+        if (
+          searchRequestSeqRef.current === requestId &&
+          activeSearchQueryRef.current.trim() === trimmedQuery
+        ) {
           setSearchingFreshResults(false);
         }
       });
@@ -637,63 +852,122 @@ export default function SearchScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      void loadProducts();
-    }, [loadProducts])
+      let cancelled = false;
+
+      void (async () => {
+        searchPerfLog('[NOOD search] screen opened');
+
+        if (!hasTypedSearchQuery(activeSearchQueryRef.current)) {
+          const cachedProducts = await readInstantDefaultProductsFromCache();
+          if (cancelled) return;
+
+          if (cachedProducts.length) {
+            applyDefaultProducts(cachedProducts, 'home-cache');
+          } else if (!defaultProductsRef.current.length) {
+            setLoadingDefaults(true);
+          }
+        } else {
+          searchPerfLog('[NOOD search] popular ignored because active query exists', {
+            query: activeSearchQueryRef.current,
+            source: 'focus-cache',
+          });
+        }
+
+        if (!cancelled) {
+          await refreshDefaultProductsInBackground();
+        }
+      })();
+
+      return () => {
+        cancelled = true;
+      };
+    }, [applyDefaultProducts, refreshDefaultProductsInBackground])
   );
 
-  const results = useMemo(() => {
-    const trimmedQuery = debouncedQuery.trim() || query.trim();
-    const searchPool = mergeProducts(remoteSearchProducts, products);
-    if (!trimmedQuery) return products;
+  const activeSearchQuery = useMemo(() => query.trim(), [query]);
 
-    return filterProducts(searchPool, trimmedQuery)
+  const results = useMemo(() => {
+    if (!activeSearchQuery) return [];
+
+    const localMatches = filterProducts(defaultProducts, activeSearchQuery);
+
+    if (!hasBackendSearchQuery(activeSearchQuery)) {
+      return localMatches
+        .map((product) => ({
+          product,
+          score: getSearchScore(product, activeSearchQuery),
+        }))
+        .sort((a, b) => b.score - a.score)
+        .map((entry) => entry.product);
+    }
+
+    const merged = remoteSearchProducts.length
+      ? mergeProducts(remoteSearchProducts, localMatches)
+      : localMatches;
+
+    const ranked = merged
       .map((product) => ({
         product,
-        score: getSearchScore(product, trimmedQuery),
+        score: getSearchScore(product, activeSearchQuery),
       }))
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.product);
-  }, [debouncedQuery, products, query, remoteSearchProducts]);
+
+    return ranked;
+  }, [activeSearchQuery, defaultProducts, remoteSearchProducts]);
 
   const suggestedProducts = useMemo(() => {
-    const trimmedQuery = debouncedQuery.trim() || query.trim();
-    if (!trimmedQuery || results.length) return [];
+    if (!activeSearchQuery || results.length) return [];
 
     const strictIds = new Set(results.map((product) => product.id || product.handle));
-    const searchPool = mergeProducts(remoteSearchProducts, products);
+    const searchPool = mergeProducts(remoteSearchProducts, defaultProducts);
     return searchPool
       .map((product) => ({
         product,
-        score: getSimilarSearchScore(product, trimmedQuery),
+        score: getSimilarSearchScore(product, activeSearchQuery),
       }))
       .filter((entry) => entry.score > 0 && !strictIds.has(entry.product.id || entry.product.handle))
       .sort((a, b) => b.score - a.score)
       .slice(0, 24)
       .map((entry) => entry.product);
-  }, [debouncedQuery, products, query, remoteSearchProducts, results]);
+  }, [activeSearchQuery, defaultProducts, remoteSearchProducts, results]);
 
   const displayedProducts = useMemo(() => {
-    const trimmedQuery = query.trim();
-    if (!trimmedQuery) return products;
+    if (!activeSearchQuery) return defaultProducts;
     return results.length ? results : suggestedProducts;
-  }, [products, query, results, suggestedProducts]);
+  }, [activeSearchQuery, defaultProducts, results, suggestedProducts]);
+
+  useEffect(() => {
+    if (activeSearchQuery.length === 0) {
+      void (async () => {
+        const homePopular = await readHomePopularProductsFromCache();
+        if (homePopular.length) {
+          applyDefaultProducts(homePopular, 'home-cache');
+        }
+      })();
+    }
+  }, [activeSearchQuery, applyDefaultProducts]);
+
+  useEffect(() => {
+    if (searchingFreshResults && displayedProducts.length > 0) {
+      setSearchingFreshResults(false);
+    }
+  }, [displayedProducts.length, searchingFreshResults]);
 
   const suggestionLabels = useMemo(() => {
-    const trimmedQuery = debouncedQuery.trim() || query.trim();
-    if (trimmedQuery.length < 1) return [];
+    if (!activeSearchQuery) return [];
 
     return (results.length ? results : suggestedProducts)
       .slice(0, 5)
       .map((product) => product.title)
       .filter((title, index, titles) => title && titles.indexOf(title) === index);
-  }, [debouncedQuery, query, results, suggestedProducts]);
+  }, [activeSearchQuery, results, suggestedProducts]);
 
   const hasExactOrPartialResults = useMemo(() => {
-    const trimmedQuery = debouncedQuery.trim() || query.trim();
-    if (!trimmedQuery) return true;
+    if (!activeSearchQuery) return true;
 
     return results.length > 0;
-  }, [debouncedQuery, query, results.length]);
+  }, [activeSearchQuery, results.length]);
 
   const openProduct = useCallback((product: SearchProduct) => {
     if (!product.handle) return;
@@ -727,34 +1001,37 @@ export default function SearchScreen() {
     [convertPrice, formatCurrencyMoney, selectedCurrency]
   );
 
+  const searchPriceById = useMemo(() => {
+    const map = new Map<string, { displayPrice: string; displayOldPrice: string | null }>();
+    displayedProducts.forEach((item) => {
+      map.set(item.id, {
+        displayPrice: getDisplayPrice(item),
+        displayOldPrice: getDisplayOldPrice(item),
+      });
+    });
+    return map;
+  }, [displayedProducts, getDisplayOldPrice, getDisplayPrice]);
+
+  const searchKeyExtractor = useCallback((item: SearchProduct) => item.id, []);
+
   const renderProduct = useCallback(
-    ({ item }: { item: SearchProduct }) => (
-      <TouchableOpacity
-        style={styles.productCard}
-        activeOpacity={0.9}
-        onPress={() => openProduct(item)}
-      >
-        <Image source={{ uri: item.image }} style={styles.productImage} resizeMode="cover" />
-        <Text style={styles.productTitle} numberOfLines={2}>
-          {item.title}
-        </Text>
-        <Text style={styles.productMeta} numberOfLines={1}>
-          {item.brand || item.category}
-        </Text>
-        <View style={styles.priceRow}>
-          <Text style={styles.productPrice}>{getDisplayPrice(item)}</Text>
-          {getDisplayOldPrice(item) ? <Text style={styles.oldPrice}>{getDisplayOldPrice(item)}</Text> : null}
-        </View>
-      </TouchableOpacity>
-    ),
-    [getDisplayOldPrice, getDisplayPrice, openProduct]
+    ({ item }: { item: SearchProduct }) => {
+      const prices = searchPriceById.get(item.id);
+      return (
+        <SearchProductCard
+          item={item}
+          displayPrice={prices?.displayPrice || getDisplayPrice(item)}
+          displayOldPrice={prices?.displayOldPrice ?? getDisplayOldPrice(item)}
+          onOpen={openProduct}
+        />
+      );
+    },
+    [getDisplayOldPrice, getDisplayPrice, openProduct, searchPriceById]
   );
 
   const listHeaderComponent = useMemo(() => {
-    const trimmedQuery = query.trim();
-
-    if (!trimmedQuery) {
-      return products.length ? (
+    if (!activeSearchQuery) {
+      return defaultProducts.length ? (
         <Text style={styles.resultsHint}>Popular products</Text>
       ) : null;
     }
@@ -766,10 +1043,10 @@ export default function SearchScreen() {
             <Text style={styles.noExactTitle}>No exact results found</Text>
             {suggestedProducts.length ? (
               <Text style={styles.resultsHint}>Suggested products</Text>
+            ) : searchingFreshResults && !displayedProducts.length ? (
+              <Text style={styles.resultsHint}>Updating results...</Text>
             ) : null}
           </>
-        ) : searchingFreshResults ? (
-          <Text style={styles.resultsHint}>Updating results...</Text>
         ) : null}
 
         {suggestionLabels.length ? (
@@ -791,13 +1068,24 @@ export default function SearchScreen() {
       </View>
     );
   }, [
+    activeSearchQuery,
+    defaultProducts.length,
+    displayedProducts.length,
     hasExactOrPartialResults,
-    products.length,
-    query,
     searchingFreshResults,
     suggestedProducts.length,
     suggestionLabels,
   ]);
+
+  useScreenPerfReporter(
+    'search',
+    {
+      itemCount: displayedProducts.length,
+      isFetching: searchingFreshResults || loadingDefaults,
+      isRefreshing: pullRefreshing,
+    },
+    [displayedProducts.length, loadingDefaults, pullRefreshing, searchingFreshResults]
+  );
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -819,7 +1107,17 @@ export default function SearchScreen() {
             autoCapitalize="none"
           />
           {query.length ? (
-            <TouchableOpacity activeOpacity={0.85} onPress={() => setQuery('')}>
+            <TouchableOpacity
+              activeOpacity={0.85}
+              onPress={() => {
+                activeSearchQueryRef.current = '';
+                searchRequestSeqRef.current += 1;
+                lastSuccessfulSearchRef.current = { query: '', products: [] };
+                setRemoteSearchProducts([]);
+                setSearchingFreshResults(false);
+                setQuery('');
+              }}
+            >
               <Ionicons name="close-circle" size={22} color="#777" />
             </TouchableOpacity>
           ) : (
@@ -830,25 +1128,66 @@ export default function SearchScreen() {
 
       <FlatList
         data={displayedProducts}
-        keyExtractor={(item) => item.id}
+        keyExtractor={searchKeyExtractor}
         numColumns={2}
         renderItem={renderProduct}
         columnWrapperStyle={styles.row}
         contentContainerStyle={styles.listContent}
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
+        {...CATALOG_LIST_PROPS}
+        refreshControl={
+          <RefreshControl
+            refreshing={pullRefreshing}
+            onRefresh={() => void handlePullRefresh()}
+            {...NOOD_REFRESH_CONTROL_PROPS}
+          />
+        }
         ListHeaderComponent={listHeaderComponent}
         ListEmptyComponent={
-          loading ? (
+          displayedProducts.length === 0 && loadingDefaults ? (
             <View style={styles.emptyWrap}>
               <NoodSpinner size={48} />
             </View>
-          ) : query.trim() ? null : (
+          ) : displayedProducts.length === 0 && loadError ? (
+            <View style={styles.emptyWrap}>
+              <Text style={styles.emptyTitle}>{loadError}</Text>
+              <TouchableOpacity
+                style={styles.retryButton}
+                activeOpacity={0.85}
+                onPress={() => {
+                  setLoadingDefaults(true);
+                  setLoadError('');
+                  void refreshDefaultProductsInBackground();
+                }}
+              >
+                <Text style={styles.retryButtonText}>Retry</Text>
+              </TouchableOpacity>
+            </View>
+          ) : displayedProducts.length === 0 && activeSearchQuery.length > 0 ? (
+            <View style={styles.emptyWrap}>
+              <Text style={styles.emptyTitle}>
+                {hasBackendSearchQuery(activeSearchQuery)
+                  ? 'No products found'
+                  : 'No matches yet. Keep typing to search.'}
+              </Text>
+            </View>
+          ) : displayedProducts.length === 0 && !activeSearchQuery ? (
             <View style={styles.emptyWrap}>
               <Text style={styles.emptyTitle}>No products found</Text>
-              <Text style={styles.emptySubTitle}>Pull to refresh and try again.</Text>
+              <TouchableOpacity
+                style={styles.retryButton}
+                activeOpacity={0.85}
+                onPress={() => {
+                  setLoadingDefaults(true);
+                  setLoadError('');
+                  void refreshDefaultProductsInBackground();
+                }}
+              >
+                <Text style={styles.retryButtonText}>Retry</Text>
+              </TouchableOpacity>
             </View>
-          )
+          ) : null
         }
       />
     </SafeAreaView>
@@ -972,6 +1311,12 @@ const styles = StyleSheet.create({
     color: '#ff4d00',
     fontWeight: '800',
   },
+  stockUnavailableText: {
+    marginTop: 4,
+    fontSize: 12,
+    color: '#b42318',
+    fontWeight: '700',
+  },
   oldPrice: {
     marginLeft: 6,
     fontSize: 12,
@@ -995,5 +1340,17 @@ const styles = StyleSheet.create({
     color: '#777',
     textAlign: 'center',
     lineHeight: 19,
+  },
+  retryButton: {
+    marginTop: 16,
+    backgroundColor: '#ff6a00',
+    borderRadius: 999,
+    paddingHorizontal: 22,
+    paddingVertical: 10,
+  },
+  retryButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '800',
   },
 });

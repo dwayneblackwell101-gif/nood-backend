@@ -2,9 +2,14 @@ import React, { useCallback, useMemo } from 'react';
 import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import AccountGuestState from '../../components/AccountGuestState';
+import { ACCOUNT_SIGN_IN_GATE_DISABLED } from '../../components/RequireSignIn';
+import NoodSpinner from '../../components/NoodSpinner';
 import { useCart } from '../../context/CartContext';
+import { useUser } from '../../context/UserContext';
 import { HistoryEvent, HistoryEventType, useHistoryEvents } from '../../context/HistoryContext';
 import { BASE_CURRENCY } from '../../utils/currency';
+import { noodAlert } from '../../utils/nood-alert';
 
 type TimelineItem = {
   id: string;
@@ -27,17 +32,27 @@ const TYPE_ICON: Record<HistoryEventType, React.ComponentProps<typeof Ionicons>[
   wishlist: 'heart-outline',
   checkout: 'card-outline',
   account: 'person-circle-outline',
+  review: 'star-outline',
 };
 
-const TYPE_COLOR: Record<HistoryEventType, string> = {
-  order: '#ff6a00',
-  wallet: '#5c31ff',
-  reward: '#ff8a00',
-  address: '#5c31ff',
-  wishlist: '#ff5a8a',
-  checkout: '#0070ba',
-  account: '#111',
-};
+const ACTIVITY_COLOR = '#ff6a00';
+const ORDER_COLOR = '#0070ba';
+const WALLET_CREDIT_COLOR = '#1f9d55';
+const WALLET_DEBIT_COLOR = '#e53935';
+
+function getItemColor(item: TimelineItem): string {
+  if (item.type === 'order' || item.type === 'checkout') {
+    return ORDER_COLOR;
+  }
+
+  if (item.type === 'wallet') {
+    return typeof item.amount === 'number' && item.amount < 0
+      ? WALLET_DEBIT_COLOR
+      : WALLET_CREDIT_COLOR;
+  }
+
+  return ACTIVITY_COLOR;
+}
 
 function toDate(value: string) {
   const date = new Date(value || 0);
@@ -55,8 +70,20 @@ function dayLabel(value: string) {
   return 'Earlier';
 }
 
+function formatTime(value: string) {
+  const date = toDate(value);
+  return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function formatStatus(status: string) {
+  return status
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
 export default function HistoryScreen() {
   const router = useRouter();
+  const { isReady, isSignedIn } = useUser();
   const { historyEvents = [] } = useHistoryEvents();
   const {
     orders = [],
@@ -77,8 +104,9 @@ export default function HistoryScreen() {
   );
 
   const timelineItems = useMemo(() => {
-    const eventItems: TimelineItem[] = (Array.isArray(historyEvents) ? historyEvents : []).map(
-      (event: HistoryEvent) => ({
+    const eventItems: TimelineItem[] = (Array.isArray(historyEvents) ? historyEvents : [])
+      .filter((event: HistoryEvent) => !!event?.date && !!event?.title)
+      .map((event: HistoryEvent) => ({
         id: `event-${event.id}`,
         type: event.type,
         title: event.title,
@@ -89,10 +117,28 @@ export default function HistoryScreen() {
         status: event.status,
         relatedId: event.relatedId,
         metadata: event.metadata,
-      })
+      }));
+
+    const loggedOrderIds = new Set(
+      eventItems.filter((event) => event.type === 'order' && event.relatedId).map((event) => event.relatedId)
+    );
+    const loggedWalletIds = new Set(
+      eventItems.filter((event) => event.type === 'wallet' && event.relatedId).map((event) => event.relatedId)
+    );
+    const loggedRewardKeys = new Set(
+      eventItems
+        .filter((event) => event.type === 'reward' && event.relatedId)
+        .map((event) => `${event.relatedId}:${event.status || ''}`)
     );
 
-    const orderItems: TimelineItem[] = (Array.isArray(orders) ? orders : []).map((order: any) => {
+    const orderItems: TimelineItem[] = (Array.isArray(orders) ? orders : [])
+      .filter(
+        (order: any) =>
+          order?.id &&
+          order?.date &&
+          !loggedOrderIds.has(String(order.id))
+      )
+      .map((order: any) => {
       const products = Array.isArray(order?.items)
         ? order.items
             .slice(0, 3)
@@ -111,8 +157,8 @@ export default function HistoryScreen() {
           products ? `Products: ${products}` : '',
         ]
           .filter(Boolean)
-          .join(' - '),
-        date: order.date || new Date().toISOString(),
+          .join(' · '),
+        date: order.date,
         amount: Number(order.total || 0),
         currency: order.currency || selectedCurrency,
         status: order.status || 'Processing',
@@ -121,70 +167,80 @@ export default function HistoryScreen() {
       } as TimelineItem;
     });
 
-    const walletItems: TimelineItem[] = (Array.isArray(walletHistory) ? walletHistory : []).map(
-      (entry: any, index: number) => ({
-        id: `wallet-${entry?.id || index}`,
-        type: 'wallet',
-        title: entry?.note || 'Wallet activity',
-        description:
-          entry?.type === 'spend' || entry?.type === 'debit'
-            ? 'Wallet balance decreased'
-            : 'Wallet balance increased',
-        date: entry?.createdAt || new Date().toISOString(),
-        amount:
-          entry?.type === 'spend' || entry?.type === 'debit'
+    const walletItems: TimelineItem[] = (Array.isArray(walletHistory) ? walletHistory : [])
+      .filter(
+        (entry: any) =>
+          entry?.createdAt &&
+          !loggedWalletIds.has(String(entry?.id || ''))
+      )
+      .map((entry: any, index: number) => {
+        const isDebit = entry?.type === 'spend' || entry?.type === 'debit';
+        return {
+          id: `wallet-${entry?.id || index}`,
+          type: 'wallet',
+          title: entry?.note || 'Wallet activity',
+          description: isDebit ? 'Wallet balance decreased' : 'Wallet balance increased',
+          date: entry.createdAt,
+          amount: isDebit
             ? -Math.abs(Number(entry?.amount || 0))
             : Math.abs(Number(entry?.amount || 0)),
-        currency: entry?.currency || BASE_CURRENCY,
-        status: entry?.type || 'completed',
-        relatedId: String(entry?.id || index),
-      })
-    );
+          currency: entry?.currency || BASE_CURRENCY,
+          status: entry?.type || 'completed',
+          relatedId: String(entry?.id || index),
+        };
+      });
 
     const rewardItems: TimelineItem[] = (Array.isArray(lockedRewards) ? lockedRewards : []).flatMap(
       (reward: any) => {
-        const items: TimelineItem[] = [
-          {
-            id: `reward-created-${reward?.id}`,
+        if (!reward?.id || !reward?.createdAt) {
+          return [];
+        }
+
+        const rewardId = String(reward.id);
+        const items: TimelineItem[] = [];
+
+        if (!loggedRewardKeys.has(`${rewardId}:${reward?.status || 'locked'}`)) {
+          items.push({
+            id: `reward-created-${rewardId}`,
             type: 'reward',
             title: 'Locked reward won',
-            description: `${reward?.note || 'Reward'} - spend ${displayMoney(
+            description: `${reward?.note || 'Reward'} — spend ${displayMoney(
               Number(reward?.unlockRequirement || 0),
               reward?.currency || BASE_CURRENCY
             )} to unlock.`,
-            date: reward?.createdAt || new Date().toISOString(),
+            date: reward.createdAt,
             amount: Number(reward?.amount || 0),
             currency: reward?.currency || BASE_CURRENCY,
             status: reward?.status || 'locked',
-            relatedId: String(reward?.id || ''),
-          },
-        ];
-
-        if (reward?.status === 'unlocked') {
-          items.push({
-            id: `reward-unlocked-${reward?.id}`,
-            type: 'reward',
-            title: 'Reward unlocked',
-            description: `${reward?.note || 'Reward'} moved to wallet.`,
-            date: reward?.unlockedAt || reward?.updatedAt || reward?.createdAt || new Date().toISOString(),
-            amount: Number(reward?.amount || 0),
-            currency: reward?.currency || BASE_CURRENCY,
-            status: 'unlocked',
-            relatedId: String(reward?.id || ''),
+            relatedId: rewardId,
           });
         }
 
-        if (reward?.status === 'expired') {
+        if (reward?.status === 'unlocked' && reward?.unlockedAt && !loggedRewardKeys.has(`${rewardId}:unlocked`)) {
           items.push({
-            id: `reward-expired-${reward?.id}`,
+            id: `reward-unlocked-${rewardId}`,
+            type: 'reward',
+            title: 'Reward unlocked',
+            description: `${reward?.note || 'Reward'} moved to wallet.`,
+            date: reward.unlockedAt,
+            amount: Number(reward?.amount || 0),
+            currency: reward?.currency || BASE_CURRENCY,
+            status: 'unlocked',
+            relatedId: rewardId,
+          });
+        }
+
+        if (reward?.status === 'expired' && reward?.expiresAt && !loggedRewardKeys.has(`${rewardId}:expired`)) {
+          items.push({
+            id: `reward-expired-${rewardId}`,
             type: 'reward',
             title: 'Reward expired',
             description: `${reward?.note || 'Reward'} expired before it unlocked.`,
-            date: reward?.expiresAt || reward?.createdAt || new Date().toISOString(),
+            date: reward.expiresAt,
             amount: Number(reward?.amount || 0),
             currency: reward?.currency || BASE_CURRENCY,
             status: 'expired',
-            relatedId: String(reward?.id || ''),
+            relatedId: rewardId,
           });
         }
 
@@ -234,15 +290,70 @@ export default function HistoryScreen() {
     }
 
     if (item.type === 'wishlist') {
-      router.push('/(tabs)/wishlist' as any);
+      router.replace('/wishlist' as any);
+      return;
     }
+
+    if (item.type === 'review') {
+      router.push('/account/reviews' as any);
+      return;
+    }
+
+    if (item.type === 'checkout') {
+      router.push('/account/orders' as any);
+      return;
+    }
+
+    if (item.type === 'account') {
+      router.push('/account/security' as any);
+      return;
+    }
+
+    noodAlert(
+      'This feature is being set up',
+      'This activity link will open in a future NOOD update.'
+    );
   };
 
-  const renderAmount = (item: TimelineItem) => {
-    if (typeof item.amount !== 'number') return '';
+  if (!isReady) {
+    return (
+      <SafeAreaView style={styles.loadingWrap}>
+        <NoodSpinner size={48} />
+      </SafeAreaView>
+    );
+  }
 
-    const sign = item.type === 'wallet' && item.amount < 0 ? '-' : item.amount > 0 && item.type === 'wallet' ? '+' : '';
-    return `${sign}${displayMoney(Math.abs(Number(item.amount || 0)), item.currency || BASE_CURRENCY)}`;
+  if (!isSignedIn && !ACCOUNT_SIGN_IN_GATE_DISABLED) {
+    return (
+      <AccountGuestState
+        showHeader
+        headerTitle="History"
+        icon="time-outline"
+        title="Sign in to view your activity"
+        subtitle="Orders, wallet updates, rewards, saved items, and checkout activity will appear here after you sign in."
+      />
+    );
+  }
+
+  const renderAmount = (item: TimelineItem) => {
+    if (typeof item.amount !== 'number' || item.amount === 0) return null;
+
+    const color = getItemColor(item);
+    const sign =
+      item.type === 'wallet'
+        ? item.amount < 0
+          ? '−'
+          : '+'
+        : item.type === 'order' || item.type === 'checkout'
+          ? ''
+          : '';
+
+    return (
+      <Text style={[styles.amount, { color }]}>
+        {sign}
+        {displayMoney(Math.abs(Number(item.amount || 0)), item.currency || BASE_CURRENCY)}
+      </Text>
+    );
   };
 
   return (
@@ -257,53 +368,83 @@ export default function HistoryScreen() {
 
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content}>
         <View style={styles.card}>
-          <Text style={styles.heading}>Recent activity</Text>
+          <Text style={styles.heading}>Activity timeline</Text>
           <Text style={styles.description}>
-            Orders, wallet updates, rewards, address changes, and checkout activity are grouped here.
+            Orders, wallet updates, saved items, addresses, and rewards appear here as you shop.
           </Text>
 
           {timelineItems.length === 0 ? (
             <View style={styles.emptyBox}>
-              <Text style={styles.emptyTitle}>No history yet</Text>
-              <Text style={styles.emptyText}>Place an order or use your wallet to build your timeline.</Text>
+              <View style={styles.emptyIconWrap}>
+                <Ionicons name="time-outline" size={36} color="#ff6a00" />
+              </View>
+              <Text style={styles.emptyTitle}>No activity yet</Text>
+              <Text style={styles.emptyText}>
+                Orders, wallet updates, saved items, addresses, and rewards will appear here.
+              </Text>
+              <TouchableOpacity
+                style={styles.emptyButton}
+                activeOpacity={0.9}
+                onPress={() => router.replace('/categories' as any)}
+              >
+                <Text style={styles.emptyButtonText}>Start shopping</Text>
+              </TouchableOpacity>
             </View>
           ) : (
             ['Today', 'Yesterday', 'Earlier'].map((group) =>
               groupedItems[group]?.length ? (
                 <View key={group} style={styles.group}>
                   <Text style={styles.groupTitle}>{group}</Text>
-                  {groupedItems[group].map((item) => {
-                    const color = TYPE_COLOR[item.type] || '#ff6a00';
-                    const amount = renderAmount(item);
 
-                    return (
-                      <TouchableOpacity
-                        key={item.id}
-                        style={styles.row}
-                        activeOpacity={0.86}
-                        onPress={() => openTimelineItem(item)}
-                      >
-                        <View style={styles.rowLeft}>
-                          <View style={[styles.iconWrap, { borderColor: `${color}22`, backgroundColor: `${color}12` }]}>
-                            <Ionicons name={TYPE_ICON[item.type]} size={18} color={color} />
-                          </View>
-                          <View style={styles.textWrap}>
-                            <View style={styles.titleLine}>
-                              <Text style={styles.rowTitle} numberOfLines={1}>{item.title}</Text>
-                              {!!item.status ? (
-                                <View style={styles.statusBadge}>
-                                  <Text style={styles.statusBadgeText}>{item.status}</Text>
-                                </View>
-                              ) : null}
+                  <View style={styles.timeline}>
+                    {groupedItems[group].map((item, index) => {
+                      const color = getItemColor(item);
+                      const isLast = index === groupedItems[group].length - 1;
+                      const amount = renderAmount(item);
+
+                      return (
+                        <TouchableOpacity
+                          key={item.id}
+                          style={styles.timelineRow}
+                          activeOpacity={0.86}
+                          onPress={() => openTimelineItem(item)}
+                        >
+                          <View style={styles.timelineRail}>
+                            <View style={[styles.timelineDot, { borderColor: color, backgroundColor: `${color}18` }]}>
+                              <Ionicons name={TYPE_ICON[item.type]} size={16} color={color} />
                             </View>
-                            <Text style={styles.rowSubtitle} numberOfLines={3}>{item.description}</Text>
-                            <Text style={styles.rowDate}>{toDate(item.date).toLocaleString()}</Text>
+                            {!isLast ? <View style={styles.timelineLine} /> : null}
                           </View>
-                        </View>
-                        {!!amount ? <Text style={[styles.amount, { color }]}>{amount}</Text> : null}
-                      </TouchableOpacity>
-                    );
-                  })}
+
+                          <View style={styles.timelineCard}>
+                            <View style={styles.timelineCardTop}>
+                              <Text style={styles.rowTitle} numberOfLines={1}>
+                                {item.title}
+                              </Text>
+                              <Text style={styles.rowTime}>{formatTime(item.date)}</Text>
+                            </View>
+
+                            <Text style={styles.rowSubtitle} numberOfLines={3}>
+                              {item.description}
+                            </Text>
+
+                            <View style={styles.timelineCardBottom}>
+                              {!!item.status ? (
+                                <View style={[styles.statusBadge, { backgroundColor: `${color}14` }]}>
+                                  <Text style={[styles.statusBadgeText, { color }]}>
+                                    {formatStatus(item.status)}
+                                  </Text>
+                                </View>
+                              ) : (
+                                <View />
+                              )}
+                              {amount}
+                            </View>
+                          </View>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
                 </View>
               ) : null
             )
@@ -315,6 +456,12 @@ export default function HistoryScreen() {
 }
 
 const styles = StyleSheet.create({
+  loadingWrap: {
+    flex: 1,
+    backgroundColor: '#fff7f2',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   container: {
     flex: 1,
     backgroundColor: '#fff7f2',
@@ -354,6 +501,11 @@ const styles = StyleSheet.create({
     padding: 18,
     borderWidth: 1,
     borderColor: '#ffe4d6',
+    shadowColor: '#ff6a00',
+    shadowOpacity: 0.05,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2,
   },
   heading: {
     fontSize: 20,
@@ -369,96 +521,143 @@ const styles = StyleSheet.create({
   },
   emptyBox: {
     backgroundColor: '#fff7f2',
-    borderRadius: 16,
-    padding: 16,
+    borderRadius: 18,
+    padding: 28,
     borderWidth: 1,
     borderColor: '#ffe4d6',
+    alignItems: 'center',
+  },
+  emptyIconWrap: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#ffe4d6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 14,
   },
   emptyTitle: {
-    fontSize: 16,
-    fontWeight: '800',
-    color: '#ff6a00',
-    marginBottom: 6,
+    fontSize: 18,
+    fontWeight: '900',
+    color: '#111',
+    marginBottom: 8,
   },
   emptyText: {
     fontSize: 14,
-    color: '#555',
+    color: '#666',
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: 18,
+  },
+  emptyButton: {
+    minHeight: 48,
+    paddingHorizontal: 24,
+    borderRadius: 14,
+    backgroundColor: '#ff6a00',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptyButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '900',
   },
   group: {
-    marginBottom: 16,
+    marginBottom: 20,
   },
   groupTitle: {
     color: '#6f5a4e',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '900',
-    marginBottom: 8,
+    marginBottom: 12,
+    letterSpacing: 0.6,
     textTransform: 'uppercase',
   },
-  row: {
+  timeline: {
+    gap: 0,
+  },
+  timelineRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  timelineRail: {
+    width: 36,
+    alignItems: 'center',
+    marginRight: 10,
+  },
+  timelineDot: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    borderWidth: 1.5,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fff',
+  },
+  timelineLine: {
+    flex: 1,
+    width: 2,
+    minHeight: 24,
+    backgroundColor: '#f0e0d4',
+    marginTop: 4,
+    marginBottom: 4,
+    borderRadius: 1,
+  },
+  timelineCard: {
+    flex: 1,
+    backgroundColor: '#fff7f2',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#ffe4d6',
+    padding: 14,
+    marginBottom: 12,
+  },
+  timelineCardTop: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f4e1d6',
-  },
-  rowLeft: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingRight: 12,
-  },
-  iconWrap: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    borderWidth: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 10,
-  },
-  textWrap: {
-    flex: 1,
-  },
-  titleLine: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
+    gap: 8,
+    marginBottom: 4,
   },
   rowTitle: {
-    flexShrink: 1,
+    flex: 1,
     fontSize: 15,
-    fontWeight: '800',
+    fontWeight: '900',
     color: '#111',
   },
-  statusBadge: {
-    borderRadius: 999,
-    backgroundColor: '#fff1df',
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-  },
-  statusBadgeText: {
-    color: '#ff6a00',
-    fontSize: 10,
-    fontWeight: '900',
+  rowTime: {
+    fontSize: 11,
+    color: '#9a8b80',
+    fontWeight: '700',
   },
   rowSubtitle: {
-    marginTop: 3,
     fontSize: 13,
     lineHeight: 18,
     color: '#666',
     fontWeight: '600',
   },
-  rowDate: {
-    marginTop: 3,
-    fontSize: 11,
-    color: '#9a8b80',
-    fontWeight: '700',
+  timelineCardBottom: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 10,
+    gap: 8,
+  },
+  statusBadge: {
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  statusBadgeText: {
+    fontSize: 10,
+    fontWeight: '900',
   },
   amount: {
     fontSize: 13,
     fontWeight: '900',
-    maxWidth: 92,
     textAlign: 'right',
+    flexShrink: 0,
   },
 });

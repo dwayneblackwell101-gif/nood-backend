@@ -1,10 +1,10 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
-  Alert,
   Image,
   Linking,
   Modal,
   Platform,
+  RefreshControl,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -13,11 +13,14 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import RequireSignIn from '../../components/RequireSignIn';
 import { useCart } from '../../context/CartContext';
 import { useHistoryEvents } from '../../context/HistoryContext';
 import { BASE_CURRENCY } from '../../utils/currency';
+import { noodAlert } from '../../utils/nood-alert';
+import { NOOD_REFRESH_CONTROL_PROPS } from '../../utils/navigation-gestures';
 
 const PLACEHOLDER_IMAGE = 'https://via.placeholder.com/140x140.png?text=NOOD';
 
@@ -60,8 +63,11 @@ function getCarrier(order: any) {
 }
 
 function getFulfillmentStatus(order: any) {
+  if (order?.fulfillmentStatus) {
+    return order.fulfillmentStatus;
+  }
+
   return (
-    order?.fulfillmentStatus ||
     order?.fulfillment_status ||
     order?.fulfillment?.status ||
     order?.fulfillments?.[0]?.status ||
@@ -73,19 +79,93 @@ function build17TrackUrl(trackingNumber: string) {
   return `https://t.17track.net/en#nums=${encodeURIComponent(trackingNumber.trim())}`;
 }
 
-export default function OrdersScreen() {
+function getOrderRefundState(order: any) {
+  const financialStatus = String(order?.displayFinancialStatus || order?.financialStatus || '')
+    .trim()
+    .toUpperCase();
+  const status = String(order?.status || '').trim().toLowerCase();
+  const refundedAmount = Number(order?.refundedAmount || 0);
+  const total = Number(order?.total || 0);
+  const refundRecords = Array.isArray(order?.refundRecords) ? order.refundRecords : [];
+
+  const isPartiallyRefunded =
+    financialStatus === 'PARTIALLY_REFUNDED' ||
+    status === 'partially refunded' ||
+    (refundedAmount > 0 && total > 0 && refundedAmount < total);
+
+  const isFullyRefunded =
+    financialStatus === 'REFUNDED' ||
+    status === 'refunded' ||
+    Boolean(order?.refunded) ||
+    (total > 0 && refundedAmount >= total);
+
+  const latestRefundDate = refundRecords
+    .map((entry: any) => String(entry?.createdAt || ''))
+    .filter(Boolean)
+    .sort()
+    .pop();
+
+  return {
+    isPartiallyRefunded,
+    isFullyRefunded,
+    refundedAmount,
+    latestRefundDate: latestRefundDate || order?.refundProcessedAt,
+    refundMethodLabel: order?.refundMethodLabel || order?.paymentMethod || 'Original payment method',
+  };
+}
+
+function getOrderDisplayStatus(order: any): string {
+  const refundState = getOrderRefundState(order);
+
+  if (refundState.isFullyRefunded) {
+    return 'Refunded';
+  }
+
+  if (refundState.isPartiallyRefunded) {
+    return 'Partially refunded';
+  }
+
+  if (refundState.refundedAmount > 0) {
+    return 'Refund processed';
+  }
+
+  return order?.status || 'Processing';
+}
+
+function OrdersContent() {
   const router = useRouter();
   const { addHistoryEvent } = useHistoryEvents();
   const {
     orders = [],
-    refundToBalance,
-    markOrderRefunded,
+    refreshOrdersFromShopify,
     selectedCurrency = BASE_CURRENCY,
     convertPrice,
     formatMoney,
   } = useCart();
+  useFocusEffect(
+    useCallback(() => {
+      console.log('[ORDERS PAGE REFRESH]', {
+        orderCount: Array.isArray(orders) ? orders.length : 0,
+      });
+      console.log('[NOOD account] order product data used', {
+        orderCount: Array.isArray(orders) ? orders.length : 0,
+      });
+      void refreshOrdersFromShopify?.();
+    }, [orders, refreshOrdersFromShopify])
+  );
   const [trackingNumber, setTrackingNumber] = useState('');
   const [selectedOrder, setSelectedOrder] = useState<any | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const handleRefresh = useCallback(async () => {
+    if (!refreshOrdersFromShopify) return;
+    setRefreshing(true);
+    try {
+      await refreshOrdersFromShopify();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refreshOrdersFromShopify]);
 
   const sortedOrders = useMemo(
     () =>
@@ -98,12 +178,7 @@ export default function OrdersScreen() {
   );
 
   const showMessage = (title: string, message: string) => {
-    if (Platform.OS === 'web' && typeof window !== 'undefined') {
-      window.alert(`${title}\n\n${message}`);
-      return;
-    }
-
-    Alert.alert(title, message);
+    noodAlert(title, message);
   };
 
   const openTracking = async (number: string, order?: any) => {
@@ -141,28 +216,16 @@ export default function OrdersScreen() {
   };
 
   const handleRefund = (order: any) => {
-    if (order.refunded || order.status === 'Refunded') {
-      Alert.alert('Already refunded', `Order #${order.id} has already been refunded.`);
+    const refundState = getOrderRefundState(order);
+    if (refundState.isFullyRefunded) {
+      noodAlert('Already refunded', `Order #${order.id} has already been refunded.`);
       return;
     }
 
-    Alert.alert('Refund Order', `Choose how to refund order #${order.id}`, [
-      {
-        text: 'Refund to NOOD Balance',
-        onPress: () => {
-          refundToBalance(Number(order.total || 0), String(order.id), `Refund for order #${order.id}`);
-          Alert.alert('Refund complete', 'Refund added to NOOD Balance.');
-        },
-      },
-      {
-        text: 'Refund to Original Payment',
-        onPress: () => {
-          markOrderRefunded(String(order.id), 'Original Payment');
-          Alert.alert('Refund recorded', 'Refund marked as sent to original payment method.');
-        },
-      },
-      { text: 'Cancel', style: 'cancel' },
-    ]);
+    router.push({
+      pathname: '/account/returns',
+      params: { orderId: String(order.id) },
+    } as any);
   };
 
   const getStatusColor = (status: string) => {
@@ -230,7 +293,17 @@ export default function OrdersScreen() {
         <View style={styles.headerSpacer} />
       </View>
 
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.scrollContent}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={() => void handleRefresh()}
+            {...NOOD_REFRESH_CONTROL_PROPS}
+          />
+        }
+      >
         <View style={styles.trackingCard}>
           <View style={styles.trackingIcon}>
             <Ionicons name="navigate-outline" size={22} color="#fff" />
@@ -255,7 +328,7 @@ export default function OrdersScreen() {
         <View style={styles.card}>
           <Text style={styles.big}>Order center</Text>
           <Text style={styles.text}>
-            Local checkout orders appear here now. Shopify customer orders and fulfillment tracking can plug into this same layout when the API is ready.
+            Orders placed through NOOD checkout appear here. Track status, payment method, and shipping details for each purchase.
           </Text>
 
           {sortedOrders.length === 0 ? (
@@ -266,8 +339,9 @@ export default function OrdersScreen() {
             </View>
           ) : (
             sortedOrders.map((order: any) => {
-              const isRefunded = order.refunded || order.status === 'Refunded';
-              const status = isRefunded ? 'Refunded' : order.status || 'Processing';
+              const refundState = getOrderRefundState(order);
+              const isFullyRefunded = refundState.isFullyRefunded;
+              const status = getOrderDisplayStatus(order);
               const statusColor = getStatusColor(status);
               const tracking = getTrackingNumber(order);
               const carrier = getCarrier(order);
@@ -311,6 +385,22 @@ export default function OrdersScreen() {
                     <Text style={styles.orderValue}>{displayTotal(order)}</Text>
                   </View>
 
+                  {refundState.refundedAmount > 0 ? (
+                    <View style={styles.orderInfoRow}>
+                      <Text style={styles.orderLabel}>Refunded</Text>
+                      <Text style={styles.orderValue}>
+                        {formatMoney(
+                          convertPrice(
+                            refundState.refundedAmount,
+                            order?.currency || selectedCurrency,
+                            selectedCurrency
+                          ),
+                          selectedCurrency
+                        )}
+                      </Text>
+                    </View>
+                  ) : null}
+
                   {tracking ? (
                     <View style={styles.trackingLine}>
                       <Ionicons name="trail-sign-outline" size={16} color="#5c31ff" />
@@ -340,12 +430,18 @@ export default function OrdersScreen() {
                     ) : null}
 
                     <TouchableOpacity
-                      style={[styles.refundButton, isRefunded && styles.refundButtonDisabled]}
+                      style={[styles.refundButton, isFullyRefunded && styles.refundButtonDisabled]}
                       activeOpacity={0.9}
                       onPress={() => handleRefund(order)}
-                      disabled={isRefunded}
+                      disabled={isFullyRefunded}
                     >
-                      <Text style={styles.refundButtonText}>{isRefunded ? 'Refunded' : 'Request Refund'}</Text>
+                      <Text style={styles.refundButtonText}>
+                        {isFullyRefunded
+                          ? 'Refunded'
+                          : refundState.isPartiallyRefunded
+                            ? 'Request Refund'
+                            : 'Request Refund'}
+                      </Text>
                     </TouchableOpacity>
                   </View>
                 </View>
@@ -369,9 +465,41 @@ export default function OrdersScreen() {
               <ScrollView showsVerticalScrollIndicator={false}>
                 <Text style={styles.detailOrderId}>Order #{selectedOrder.id}</Text>
                 <Text style={styles.detailMeta}>{formatDate(selectedOrder.date)}</Text>
-                <Text style={styles.detailMeta}>Status: {selectedOrder.status || 'Processing'}</Text>
+                <Text style={styles.detailMeta}>Status: {getOrderDisplayStatus(selectedOrder)}</Text>
                 <Text style={styles.detailMeta}>Payment: {selectedOrder.paymentMethod || 'Wallet'}</Text>
                 <Text style={styles.detailTotal}>{displayTotal(selectedOrder)}</Text>
+
+                {(() => {
+                  const refundState = getOrderRefundState(selectedOrder);
+                  if (!refundState.refundedAmount && !refundState.isPartiallyRefunded) {
+                    return null;
+                  }
+
+                  return (
+                    <>
+                      <Text style={styles.detailSectionTitle}>Refund details</Text>
+                      <Text style={styles.detailMeta}>
+                        Refund amount:{' '}
+                        {formatMoney(
+                          convertPrice(
+                            refundState.refundedAmount,
+                            selectedOrder?.currency || selectedCurrency,
+                            selectedCurrency
+                          ),
+                          selectedCurrency
+                        )}
+                      </Text>
+                      {refundState.latestRefundDate ? (
+                        <Text style={styles.detailMeta}>
+                          Refund date: {formatDate(refundState.latestRefundDate)}
+                        </Text>
+                      ) : null}
+                      <Text style={styles.detailMeta}>
+                        Refund method: {refundState.refundMethodLabel}
+                      </Text>
+                    </>
+                  );
+                })()}
 
                 <Text style={styles.detailSectionTitle}>Products ordered</Text>
                 {orderProducts(selectedOrder).length ? (
@@ -387,12 +515,42 @@ export default function OrdersScreen() {
                 ) : (
                   <Text style={styles.detailMeta}>Product details are not available for this order yet.</Text>
                 )}
+
+                <Text style={styles.detailSectionTitle}>Shipping address</Text>
+                {selectedOrder?.shippingAddress ? (
+                  <>
+                    <Text style={styles.detailMeta}>{selectedOrder.shippingAddress.fullName}</Text>
+                    <Text style={styles.detailMeta}>{selectedOrder.shippingAddress.phone}</Text>
+                    <Text style={styles.detailMeta}>{selectedOrder.shippingAddress.address1}</Text>
+                    {selectedOrder.shippingAddress.address2 ? (
+                      <Text style={styles.detailMeta}>{selectedOrder.shippingAddress.address2}</Text>
+                    ) : null}
+                    <Text style={styles.detailMeta}>
+                      {[selectedOrder.shippingAddress.city, selectedOrder.shippingAddress.region]
+                        .filter(Boolean)
+                        .join(', ')}
+                    </Text>
+                    {selectedOrder.shippingAddress.postalCode ? (
+                      <Text style={styles.detailMeta}>{selectedOrder.shippingAddress.postalCode}</Text>
+                    ) : null}
+                  </>
+                ) : (
+                  <Text style={styles.detailMeta}>Shipping address not saved for this order.</Text>
+                )}
               </ScrollView>
             ) : null}
           </View>
         </View>
       </Modal>
     </SafeAreaView>
+  );
+}
+
+export default function OrdersScreen() {
+  return (
+    <RequireSignIn feature="your orders">
+      <OrdersContent />
+    </RequireSignIn>
   );
 }
 

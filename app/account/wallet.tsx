@@ -7,7 +7,6 @@ import {
   TouchableOpacity,
   ScrollView,
   TextInput,
-  Alert,
   Modal,
   Platform,
   Image,
@@ -18,9 +17,13 @@ import * as WebBrowser from 'expo-web-browser';
 import { useCart } from '../../context/CartContext';
 import { useAddressBook } from '../../context/AddressContext';
 import { useUser } from '../../context/UserContext';
-import { postBackendJson } from '../../utils/backend';
+import RequireSignIn from '../../components/RequireSignIn';
+import { postPaymentBackendJson } from '../../utils/backend';
 import { BASE_CURRENCY } from '../../utils/currency';
-import { getCheckoutCustomer, getPaymentTestingEmail } from '../../utils/customer';
+import { getCheckoutCustomer, getPaymentCustomerEmail } from '../../utils/customer';
+import { getWalletTransactionDisplay } from '../../utils/wallet-display';
+import NoodDialogShell from '../../components/NoodDialogShell';
+import { noodAlert } from '../../utils/nood-alert';
 
 const WIPAY_LOGO =
   'https://cdn.shopify.com/s/files/1/0663/2099/0292/files/IMG_2415.jpg?v=1772139039';
@@ -29,7 +32,7 @@ const PAYPAL_LOGO =
 
 type WalletItem = {
   id: string;
-  type: 'credit' | 'debit' | 'refund' | 'spend';
+  type: 'credit' | 'debit' | 'refund' | 'spend' | 'topup' | 'purchase';
   amount: number;
   note: string;
   createdAt: string;
@@ -60,7 +63,7 @@ export default function WalletScreen() {
     const parsedAmount = Number(amount);
 
     if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-      Alert.alert('Error', 'Enter a valid amount');
+      noodAlert('Error', 'Enter a valid amount');
       return;
     }
 
@@ -72,7 +75,7 @@ export default function WalletScreen() {
 
     if (!paymentUrl || !paymentUrl.startsWith('https://')) {
       console.log('[NOOD payment] invalid paymentUrl:', paymentUrl);
-      Alert.alert('Payment Error', 'Payment link could not be created. Please try again.');
+      noodAlert('Payment Error', 'Payment link could not be created. Please try again.');
       return;
     }
 
@@ -99,7 +102,7 @@ export default function WalletScreen() {
       customerId: profileId,
       amount: provider === 'paypal' ? paypalAmount.toFixed(2) : parsedAmount.toFixed(2),
       name: customer.name,
-      email: getPaymentTestingEmail(customer.email),
+      email: getPaymentCustomerEmail(customer.email),
       phone: customer.phone,
       provider,
       paymentMethod: provider,
@@ -118,7 +121,7 @@ export default function WalletScreen() {
   const createTopUpSession = async (provider: 'wipay' | 'paypal') => {
     const payload = getTopUpPayload(provider);
     try {
-      const data = await postBackendJson('/wallet/topup', payload, { timeoutMs: 45000 });
+      const data = await postPaymentBackendJson('/wallet/topup', payload, { timeoutMs: 45000 });
       console.log('Wallet top-up response:', data);
 
       const paymentUrl =
@@ -138,7 +141,7 @@ export default function WalletScreen() {
   };
 
   const capturePayPalTopUp = async (orderId: string) => {
-    const data = await postBackendJson(
+    const data = await postPaymentBackendJson(
       `/api/wallet/paypal/orders/${encodeURIComponent(orderId)}/capture`,
       {},
       { timeoutMs: 45000 }
@@ -177,8 +180,9 @@ export default function WalletScreen() {
       throw new Error('PayPal wallet top-up did not return a valid confirmed amount.');
     }
 
-    addWalletFunds?.(creditedBaseAmount, `PayPal wallet top-up (${transactionId})`, {
+    addWalletFunds?.(creditedBaseAmount, 'Wallet top-up', {
       id: walletHistoryId,
+      type: 'topup',
       provider: 'paypal',
       transactionId,
       orderId,
@@ -199,7 +203,7 @@ export default function WalletScreen() {
       await openPaymentUrl(paymentUrl);
     } catch (err) {
       console.log('Wallet WiPay error:', err);
-      Alert.alert('Error', err instanceof Error ? err.message : 'Connection failed');
+      noodAlert('Error', err instanceof Error ? err.message : 'Connection failed');
     } finally {
       setLoading(false);
     }
@@ -211,7 +215,7 @@ export default function WalletScreen() {
       setShowPaymentModal(false);
 
       const payload = getTopUpPayload('paypal');
-      const data = await postBackendJson('/api/wallet/paypal/orders', payload, { timeoutMs: 45000 });
+      const data = await postPaymentBackendJson('/api/wallet/paypal/orders', payload, { timeoutMs: 45000 });
       console.log('[NOOD wallet] PayPal wallet order response:', data);
 
       const orderId = String(data?.id || data?.order_id || data?.orderID || '').trim();
@@ -223,16 +227,22 @@ export default function WalletScreen() {
 
       await openPaymentUrl(paymentUrl);
       await capturePayPalTopUp(orderId);
-      Alert.alert('Wallet Updated', 'Your PayPal top-up was added to your wallet.');
+      noodAlert('Wallet Updated', 'Your PayPal top-up was added to your wallet.');
     } catch (err) {
       console.log('Wallet PayPal error:', err);
-      Alert.alert('Error', err instanceof Error ? err.message : 'PayPal top-up is not available yet');
+      noodAlert('Error', err instanceof Error ? err.message : 'PayPal top-up is not available yet');
     } finally {
       setLoading(false);
     }
   };
 
   return (
+    <RequireSignIn
+      feature="your wallet"
+      title="Sign in to use your wallet"
+      subtitle="Balance, credits, and transaction history are available after sign-in."
+      icon="wallet-outline"
+    >
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
         <TouchableOpacity onPress={handleBackPress} style={styles.iconBtn}>
@@ -248,82 +258,82 @@ export default function WalletScreen() {
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
       >
-        <View style={styles.balanceCard}>
-          <Text style={styles.balanceLabel}>Available Balance</Text>
-          <Text style={styles.balanceAmount}>{displayMoney(balance)}</Text>
+            <View style={styles.balanceCard}>
+              <Text style={styles.balanceLabel}>Available Balance</Text>
+              <Text style={styles.balanceAmount}>{displayMoney(balance)}</Text>
 
-          <TextInput
-            style={styles.input}
-            placeholder="Enter amount"
-            placeholderTextColor="#999"
-            keyboardType="numeric"
-            value={amount}
-            onChangeText={setAmount}
-          />
+              <TextInput
+                style={styles.input}
+                placeholder="Enter amount"
+                placeholderTextColor="#999"
+                keyboardType="numeric"
+                value={amount}
+                onChangeText={setAmount}
+              />
 
-          <TouchableOpacity
-            style={[styles.topUpBtn, loading && styles.disabledBtn]}
-            onPress={openPaymentChoices}
-            disabled={loading}
-          >
-            <Text style={styles.topUpBtnText}>
-              {loading ? 'Opening Payment...' : 'Top Up Wallet'}
-            </Text>
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Wallet Activity</Text>
-
-          {!Array.isArray(walletHistory) || walletHistory.length === 0 ? (
-            <View style={styles.emptyCard}>
-              <Ionicons name="wallet-outline" size={42} color="#ff6a00" />
-              <Text style={styles.emptyTitle}>No wallet activity yet</Text>
-              <Text style={styles.emptyText}>
-                Top up your wallet to see activity here.
-              </Text>
+              <TouchableOpacity
+                style={[styles.topUpBtn, loading && styles.disabledBtn]}
+                onPress={openPaymentChoices}
+                disabled={loading}
+              >
+                <Text style={styles.topUpBtnText}>
+                  {loading ? 'Opening Payment...' : 'Top Up Wallet'}
+                </Text>
+              </TouchableOpacity>
             </View>
-          ) : (
-            (walletHistory as WalletItem[]).map((item) => {
-              const isPositive =
-                item.type === 'credit' || item.type === 'refund';
 
-              return (
-                <View key={item.id} style={styles.historyCard}>
-                  <View style={styles.historyLeft}>
-                    <View style={styles.historyIconWrap}>
-                      <Ionicons
-                        name={isPositive ? 'arrow-down-circle' : 'arrow-up-circle'}
-                        size={22}
-                        color="#ff6a00"
-                      />
-                    </View>
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>Wallet Activity</Text>
 
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.historyTitle}>
-                        {item.note || 'Wallet transaction'}
-                      </Text>
-                      <Text style={styles.historyDate}>
-                        {item.createdAt
-                          ? new Date(item.createdAt).toLocaleString()
-                          : ''}
-                      </Text>
-                    </View>
-                  </View>
-
-                  <Text
-                    style={[
-                      styles.historyAmount,
-                      isPositive ? styles.positiveAmount : styles.negativeAmount,
-                    ]}
-                  >
-                    {isPositive ? '+' : '-'}{displayMoney(Number(item.amount || 0))}
+              {!Array.isArray(walletHistory) || walletHistory.length === 0 ? (
+                <View style={styles.emptyCard}>
+                  <Ionicons name="wallet-outline" size={42} color="#ff6a00" />
+                  <Text style={styles.emptyTitle}>No wallet activity yet</Text>
+                  <Text style={styles.emptyText}>
+                    Top up your wallet to see activity here.
                   </Text>
                 </View>
-              );
-            })
-          )}
-        </View>
+              ) : (
+                (walletHistory as WalletItem[]).map((item) => {
+                  const walletDisplay = getWalletTransactionDisplay(item.type);
+
+                  return (
+                    <View key={item.id} style={styles.historyCard}>
+                      <View style={styles.historyLeft}>
+                        <View style={styles.historyIconWrap}>
+                          <Ionicons
+                            name={walletDisplay.icon as any}
+                            size={22}
+                            color={walletDisplay.color}
+                          />
+                        </View>
+
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.historyTitle}>
+                            {item.note || 'Wallet transaction'}
+                          </Text>
+                          <Text style={styles.historyDate}>
+                            {item.createdAt
+                              ? new Date(item.createdAt).toLocaleString()
+                              : ''}
+                          </Text>
+                        </View>
+                      </View>
+
+                      <Text
+                        style={[
+                          styles.historyAmount,
+                          { color: walletDisplay.color },
+                        ]}
+                      >
+                        {walletDisplay.sign}
+                        {displayMoney(Number(item.amount || 0))}
+                      </Text>
+                    </View>
+                  );
+                })
+              )}
+            </View>
       </ScrollView>
 
       <Modal
@@ -332,14 +342,16 @@ export default function WalletScreen() {
         animationType="fade"
         onRequestClose={() => setShowPaymentModal(false)}
       >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>Top Up Wallet</Text>
-            <Text style={styles.modalAmount}>
-              Top up {displayMoney(Number(amount || 0))}
-            </Text>
+        <NoodDialogShell
+          onBackdropPress={() => setShowPaymentModal(false)}
+          cardStyle={styles.modalCard}
+        >
+          <Text style={styles.modalTitle}>Top Up Wallet</Text>
+          <Text style={styles.modalAmount}>
+            Top up {displayMoney(Number(amount || 0))}
+          </Text>
 
-            <TouchableOpacity
+          <TouchableOpacity
               style={[styles.wipayButton, loading && styles.disabledBtn]}
               activeOpacity={0.92}
               onPress={handleWiPayTopUp}
@@ -386,16 +398,16 @@ export default function WalletScreen() {
               <Ionicons name="arrow-forward" size={18} color="#0070ba" />
             </TouchableOpacity>
 
-            <TouchableOpacity
-              style={styles.cancelBtn}
-              onPress={() => setShowPaymentModal(false)}
-            >
-              <Text style={styles.cancelBtnText}>Cancel</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
+          <TouchableOpacity
+            style={styles.cancelBtn}
+            onPress={() => setShowPaymentModal(false)}
+          >
+            <Text style={styles.cancelBtnText}>Cancel</Text>
+          </TouchableOpacity>
+        </NoodDialogShell>
       </Modal>
     </SafeAreaView>
+    </RequireSignIn>
   );
 }
 
@@ -429,6 +441,48 @@ const styles = StyleSheet.create({
   content: {
     padding: 16,
     paddingBottom: 40,
+  },
+
+  guestCard: {
+    backgroundColor: '#fff',
+    borderRadius: 24,
+    padding: 28,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#ffd9c2',
+    minHeight: 320,
+    justifyContent: 'center',
+  },
+
+  guestTitle: {
+    marginTop: 16,
+    fontSize: 24,
+    fontWeight: '900',
+    color: '#111',
+    textAlign: 'center',
+  },
+
+  guestText: {
+    marginTop: 10,
+    fontSize: 14,
+    lineHeight: 21,
+    color: '#666',
+    textAlign: 'center',
+    maxWidth: 300,
+  },
+
+  guestSignInBtn: {
+    marginTop: 20,
+    backgroundColor: '#ff6a00',
+    borderRadius: 999,
+    paddingHorizontal: 22,
+    paddingVertical: 14,
+  },
+
+  guestSignInBtnText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '800',
   },
 
   balanceCard: {
@@ -567,27 +621,8 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
 
-  positiveAmount: {
-    color: '#5c31ff',
-  },
-
-  negativeAmount: {
-    color: '#d64545',
-  },
-
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.35)',
-    justifyContent: 'center',
-    padding: 24,
-  },
-
   modalCard: {
-    backgroundColor: '#fff',
-    borderRadius: 24,
-    padding: 20,
-    borderWidth: 1,
-    borderColor: '#efdfcc',
+    maxWidth: 400,
   },
 
   modalTitle: {

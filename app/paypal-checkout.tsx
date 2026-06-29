@@ -1,6 +1,5 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Alert,
   SafeAreaView,
   StatusBar,
   StyleSheet,
@@ -15,20 +14,34 @@ import { useCart } from '../context/CartContext';
 import { useAddressBook } from '../context/AddressContext';
 import { useHistoryEvents } from '../context/HistoryContext';
 import { useUser } from '../context/UserContext';
-import { postBackendJson } from '../utils/backend';
+import { getConfiguredBackendUrl, getPaymentBackendUrl } from '../utils/backend';
 import { BASE_CURRENCY } from '../utils/currency';
-import { getCheckoutCustomer, getPaymentTestingEmail } from '../utils/customer';
+import { SHOPIFY_CHECKOUT_CURRENCY } from '../utils/checkout-totals';
+import { getCheckoutSessionId, resetCheckoutSessionId } from '../utils/checkout-session';
+import {
+  PAYMENT_REVIEW_MESSAGE,
+  validateCheckoutPrerequisites,
+} from '../utils/checkout-validation';
+import { getCheckoutCustomer, getPaymentCustomerEmail } from '../utils/customer';
+import { PAYMENT_TESTING_MODE } from '../utils/payment-testing';
+import { getCustomerProfile } from '../utils/customer-profile';
 import NoodSpinner from '../components/NoodSpinner';
+import { noodAlert } from '../utils/nood-alert';
 
 const PAYPAL_CLIENT_ID = String(process.env.EXPO_PUBLIC_PAYPAL_CLIENT_ID || '').trim();
 const PAYPAL_ENV = String(process.env.EXPO_PUBLIC_PAYPAL_ENV || 'sandbox').trim().toLowerCase();
+const PAYPAL_SDK_CURRENCY = 'USD';
 
 type PayPalMessage =
   | { type: 'paypal-ready' }
-  | { type: 'create-order'; requestId: string }
-  | { type: 'capture-order'; requestId: string; orderID: string }
-  | { type: 'cancel' }
-  | { type: 'error'; message?: string };
+  | { type: 'paypal-sdk-loaded' }
+  | { type: 'paypal-rendering-buttons' }
+  | { type: 'paypal-buttons-rendered' }
+  | { type: 'PAYPAL_BUTTONS_RENDERED' }
+  | { type: 'paypal-loading-hidden' }
+  | { type: 'PAYPAL_SUCCESS'; payload?: any }
+  | { type: 'PAYPAL_CANCEL'; payload?: any }
+  | { type: 'PAYPAL_ERROR'; message?: string };
 
 type ShopifyOrderResult = {
   shopifyOrderId: string;
@@ -38,6 +51,10 @@ type ShopifyOrderResult = {
 
 function escapeForScript(value: string) {
   return value.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
+}
+
+function getPayPalBackendUrl() {
+  return getConfiguredBackendUrl() || getPaymentBackendUrl();
 }
 
 function getShopifyOrderResult(data: any): ShopifyOrderResult {
@@ -72,253 +89,436 @@ function getShopifyOrderResult(data: any): ShopifyOrderResult {
   };
 }
 
-function makePayPalHtml(clientId: string, currency: string, amount: string, paypalEnv: string) {
-  const sdkUrl =
-    paypalEnv === 'live'
-      ? 'https://www.paypal.com/web-sdk/v6/core'
-      : 'https://www.sandbox.paypal.com/web-sdk/v6/core';
+function buildPayPalSdkScriptUrl(clientId: string, paypalEnv: string) {
+  const host = paypalEnv === 'live' ? 'www.paypal.com' : 'www.sandbox.paypal.com';
+  const enableFunding =
+    paypalEnv === 'sandbox' ? 'venmo,paylater,card' : 'venmo,paylater,card';
+  const buyerCountry = paypalEnv === 'sandbox' ? '&buyer-country=US' : '';
+
+  return `https://${host}/sdk/js?client-id=${encodeURIComponent(clientId)}&currency=${PAYPAL_SDK_CURRENCY}&intent=capture&components=buttons&enable-funding=${enableFunding}${buyerCountry}`;
+}
+
+function makePayPalHtml(
+  clientId: string,
+  paypalEnv: string,
+  backendUrl: string,
+  orderPayloadJson: string,
+  capturePayloadJson: string
+) {
+  const sdkUrl = buildPayPalSdkScriptUrl(clientId, paypalEnv);
 
   return `<!doctype html>
-<html>
+<html lang="en">
   <head>
+    <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
     <style>
+      * { box-sizing: border-box; }
       html, body {
         margin: 0;
         padding: 0;
-        background: #f6f3ef;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        min-height: 100%;
+        background: #0b0b0b;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        color: #111827;
       }
-      .wrap {
+      .page {
         min-height: 100vh;
+        padding: 24px 16px 32px;
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+      }
+      .paypal-card {
+        width: 100%;
+        max-width: 520px;
+        background: #ffffff;
+        border-radius: 18px;
         padding: 18px;
-        box-sizing: border-box;
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
+      }
+      .message {
+        margin: 0 0 16px;
+        font-size: 14px;
+        line-height: 20px;
+        font-weight: 600;
+        color: #2c2e2f;
+        text-align: left;
+      }
+      .paypal-p {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        margin-right: 6px;
+        border-radius: 4px;
+        background: #003087;
+        color: #ffffff;
+        font-size: 12px;
+        font-weight: 900;
+        vertical-align: middle;
+      }
+      .message a {
+        color: #0070ba;
+        text-decoration: none;
+        font-weight: 700;
+      }
+      .loading-state {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        min-height: 220px;
+        color: #4b5563;
+        font-size: 14px;
+        font-weight: 700;
+      }
+      .loading-state[hidden],
+      .loading-state.paypal-hidden {
+        display: none !important;
+      }
+      .loading-spinner {
+        width: 30px;
+        height: 30px;
+        border: 3px solid #e5e7eb;
+        border-top-color: #0070ba;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      .button-panel[hidden] {
+        display: none !important;
+      }
+      #paypal-button-container {
+        width: 100%;
+        min-height: 200px;
+      }
+      #paypal-button-container > div,
+      #paypal-button-container iframe {
+        width: 100% !important;
+        max-width: 100% !important;
+      }
+      .powered-row {
+        margin-top: 16px;
         display: flex;
         align-items: center;
         justify-content: center;
-      }
-      .card {
-        width: 100%;
-        max-width: 430px;
-        background: #fff;
-        border-radius: 20px;
-        padding: 18px;
-        border: 1px solid #e7e0d8;
-        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
-        box-sizing: border-box;
-      }
-      .title {
-        font-size: 22px;
-        line-height: 28px;
-        font-weight: 800;
-        color: #111;
-        text-align: center;
-        margin: 4px 0 6px;
-      }
-      .subtitle {
-        color: #677083;
-        font-size: 14px;
+        gap: 4px;
+        font-size: 12px;
+        color: #6c7378;
         font-weight: 600;
-        text-align: center;
-        margin: 0 0 16px;
       }
-      .button-stack {
-        display: grid;
-        gap: 10px;
+      .powered-brand {
+        color: #003087;
+        font-weight: 900;
+        font-style: italic;
+        letter-spacing: -0.2px;
       }
-      paypal-button,
-      paypal-pay-later-button,
-      paypal-credit-button {
-        width: 100%;
-        min-height: 50px;
-        display: block;
-      }
-      .status {
-        min-height: 18px;
-        color: #a33a00;
+      #result-message {
+        min-height: 20px;
+        margin-top: 14px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: #fff4ed;
+        color: #b42318;
         font-size: 13px;
         line-height: 18px;
         font-weight: 700;
         text-align: center;
-        margin-top: 8px;
+      }
+      #result-message.info {
+        background: #eff6ff;
+        color: #1d4ed8;
+      }
+      #result-message:empty {
+        display: none;
       }
     </style>
   </head>
   <body>
-    <div class="wrap">
-      <div class="card">
-        <p class="title">Pay securely with PayPal</p>
-        <p class="subtitle">Total ${escapeForScript(currency)} ${escapeForScript(amount)}</p>
-        <div class="button-stack">
-          <paypal-button hidden></paypal-button>
-          <paypal-pay-later-button hidden></paypal-pay-later-button>
-          <paypal-credit-button hidden></paypal-credit-button>
+    <div class="page">
+      <div class="paypal-card">
+        <div class="message">
+          <span class="paypal-p">P</span>
+          Pay in full or eligible installments
+          <br />
+          <a href="https://www.paypal.com/us/webapps/mpp/pay-in-4" target="_blank" rel="noopener noreferrer">Learn more</a>
         </div>
-        <div id="result-message" class="status"></div>
+
+        <div id="paypal-loading" class="loading-state">
+          <div class="loading-spinner"></div>
+          <span>Loading PayPal buttons...</span>
+        </div>
+
+        <div id="button-panel" class="button-panel" hidden>
+          <div id="paypal-button-container"></div>
+          <div class="powered-row">
+            <span>Powered by</span>
+            <span class="powered-brand">PayPal</span>
+          </div>
+        </div>
+
+        <div id="result-message"></div>
       </div>
     </div>
-    <script src="${sdkUrl}"></script>
     <script>
-      const pending = {};
+      const BACKEND_URL = "${escapeForScript(backendUrl)}";
+      const ORDER_PAYLOAD = ${orderPayloadJson};
+      const CAPTURE_PAYLOAD = ${capturePayloadJson};
 
-      function send(message) {
+      function postAppMessage(message) {
         window.ReactNativeWebView.postMessage(JSON.stringify(message));
       }
 
-      function resultMessage(message) {
-        document.querySelector("#result-message").textContent = message || "";
-      }
-
-      window.NoodPayPal = {
-        resolve(requestId, value) {
-          if (pending[requestId]) {
-            pending[requestId].resolve(value);
-            delete pending[requestId];
-          }
-        },
-        reject(requestId, message) {
-          if (pending[requestId]) {
-            pending[requestId].reject(new Error(message || "PayPal request failed."));
-            delete pending[requestId];
-          }
+      function resultMessage(message, tone) {
+        const node = document.querySelector("#result-message");
+        if (!node) return;
+        node.textContent = message || "";
+        node.classList.remove("info");
+        if (tone === "info") {
+          node.classList.add("info");
         }
-      };
-
-      function requestNative(type, payload) {
-        const requestId = String(Date.now()) + "-" + Math.random().toString(16).slice(2);
-        send({ type, requestId, ...(payload || {}) });
-        return new Promise((resolve, reject) => {
-          pending[requestId] = { resolve, reject };
-        });
       }
 
-      async function createOrder() {
-        const orderId = await requestNative("create-order");
-        return { orderId };
-      }
+      var paypalLoadingHidden = false;
 
-      const paymentSessionOptions = {
-        async onApprove(data) {
-          const orderID = data && (data.orderId || data.orderID || data.id);
-          if (!orderID) {
-            throw new Error("PayPal did not return an order ID.");
-          }
-          resultMessage("Finalizing payment...");
-          await requestNative("capture-order", { orderID });
-        },
-        onCancel() {
-          send({ type: "cancel" });
-        },
-        onError(error) {
-          resultMessage("Sorry, PayPal could not process this payment.");
-          send({
-            type: "error",
-            message: error && error.message ? error.message : String(error || "PayPal error")
-          });
-        }
-      };
-
-      async function configurePayPalButton(sdkInstance) {
-        const paypalPaymentSession = sdkInstance.createPayPalOneTimePaymentSession(paymentSessionOptions);
-        const paypalButton = document.querySelector("paypal-button");
-        paypalButton.removeAttribute("hidden");
-        paypalButton.addEventListener("click", async () => {
-          try {
-            resultMessage("");
-            await paypalPaymentSession.start({ presentationMode: "auto" }, createOrder());
-          } catch (error) {
-            paymentSessionOptions.onError(error);
-          }
-        });
-      }
-
-      async function setupPayLaterButton(sdkInstance, paymentMethodDetails) {
-        if (!sdkInstance.createPayLaterOneTimePaymentSession) return;
-        const payLaterPaymentSession = sdkInstance.createPayLaterOneTimePaymentSession(paymentSessionOptions);
-        const payLaterButton = document.querySelector("paypal-pay-later-button");
-        if (paymentMethodDetails) {
-          payLaterButton.productCode = paymentMethodDetails.productCode;
-          payLaterButton.countryCode = paymentMethodDetails.countryCode;
-        }
-        payLaterButton.removeAttribute("hidden");
-        payLaterButton.addEventListener("click", async () => {
-          try {
-            resultMessage("");
-            await payLaterPaymentSession.start({ presentationMode: "auto" }, createOrder());
-          } catch (error) {
-            paymentSessionOptions.onError(error);
-          }
-        });
-      }
-
-      async function setupPayPalCreditButton(sdkInstance, paymentMethodDetails) {
-        if (!sdkInstance.createPayPalCreditOneTimePaymentSession) return;
-        const paypalCreditPaymentSession = sdkInstance.createPayPalCreditOneTimePaymentSession(paymentSessionOptions);
-        const paypalCreditButton = document.querySelector("paypal-credit-button");
-        if (paymentMethodDetails) {
-          paypalCreditButton.countryCode = paymentMethodDetails.countryCode;
-        }
-        paypalCreditButton.removeAttribute("hidden");
-        paypalCreditButton.addEventListener("click", async () => {
-          try {
-            resultMessage("");
-            await paypalCreditPaymentSession.start({ presentationMode: "auto" }, createOrder());
-          } catch (error) {
-            paymentSessionOptions.onError(error);
-          }
-        });
-      }
-
-      async function mountButtons() {
-        if (!window.paypal || !window.paypal.createInstance) {
-          resultMessage("PayPal could not load. Check your internet connection.");
-          send({ type: "error", message: "PayPal SDK did not load." });
+      function hidePayPalLoadingUi() {
+        if (paypalLoadingHidden) {
           return;
         }
+        paypalLoadingHidden = true;
 
-        try {
-          const sdkInstance = await window.paypal.createInstance({
-            clientId: "${escapeForScript(clientId)}",
-            components: ["paypal-payments"],
-            pageType: "checkout"
-          });
-
-          const paymentMethods = await sdkInstance.findEligibleMethods({
-            currencyCode: "${escapeForScript(currency)}"
-          });
-
-          if (paymentMethods.isEligible("paypal")) {
-            await configurePayPalButton(sdkInstance);
-          }
-
-          if (paymentMethods.isEligible("paylater")) {
-            await setupPayLaterButton(sdkInstance, paymentMethods.getDetails("paylater"));
-          }
-
-          if (paymentMethods.isEligible("credit")) {
-            await setupPayPalCreditButton(sdkInstance, paymentMethods.getDetails("credit"));
-          }
-
-          if (
-            !paymentMethods.isEligible("paypal") &&
-            !paymentMethods.isEligible("paylater") &&
-            !paymentMethods.isEligible("credit")
-          ) {
-            throw new Error("No eligible PayPal payment methods are available for this device or currency.");
-          }
-
-          send({ type: "paypal-ready" });
-        } catch (error) {
-          resultMessage(error && error.message ? error.message : "PayPal setup failed.");
-          send({
-            type: "error",
-            message: error && error.message ? error.message : String(error || "PayPal setup failed.")
-          });
+        var loading = document.getElementById("paypal-loading");
+        var panel = document.getElementById("button-panel");
+        if (loading) {
+          loading.setAttribute("hidden", "hidden");
+          loading.classList.add("paypal-hidden");
+          loading.style.display = "none";
         }
+        if (panel) {
+          panel.removeAttribute("hidden");
+          panel.style.display = "block";
+        }
+        document.body.classList.add("paypal-ready");
+
+        postAppMessage({ type: "PAYPAL_BUTTONS_RENDERED" });
+        postAppMessage({ type: "paypal-buttons-rendered" });
+        postAppMessage({ type: "paypal-loading-hidden" });
+        postAppMessage({ type: "paypal-ready" });
       }
 
-      mountButtons();
+      function getErrorDetail(orderData) {
+        return orderData && orderData.details && orderData.details[0]
+          ? orderData.details[0]
+          : null;
+      }
+
+      function formatOrderError(orderData) {
+        const errorDetail = getErrorDetail(orderData);
+        if (errorDetail) {
+          return errorDetail.issue + " " + errorDetail.description + (orderData.debug_id ? " (" + orderData.debug_id + ")" : "");
+        }
+        if (orderData && orderData.message) {
+          return String(orderData.message);
+        }
+        return JSON.stringify(orderData || {});
+      }
+
+      function isInstrumentDeclined(orderData, message) {
+        const errorDetail = getErrorDetail(orderData);
+        if (errorDetail && errorDetail.issue === "INSTRUMENT_DECLINED") {
+          return true;
+        }
+        return /INSTRUMENT_DECLINED/i.test(String(message || ""));
+      }
+
+      function buildButtonHandlers() {
+        return {
+          createOrder: async function() {
+            resultMessage("");
+            const response = await fetch(BACKEND_URL + "/api/orders", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(ORDER_PAYLOAD)
+            });
+
+            const orderData = await response.json().catch(function() {
+              return {};
+            });
+
+            if (orderData && orderData.id) {
+              return orderData.id;
+            }
+
+            const message = formatOrderError(orderData);
+            resultMessage(message);
+            postAppMessage({ type: "PAYPAL_ERROR", message });
+            throw new Error(message);
+          },
+          onApprove: async function(data, actions) {
+            resultMessage("Finalizing payment...", "info");
+
+            const response = await fetch(
+              BACKEND_URL + "/api/orders/" + encodeURIComponent(data.orderID) + "/capture",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(CAPTURE_PAYLOAD)
+              }
+            );
+
+            const orderData = await response.json().catch(function() {
+              return {};
+            });
+            const errorDetail = getErrorDetail(orderData);
+
+            if (errorDetail && errorDetail.issue === "INSTRUMENT_DECLINED") {
+              resultMessage("Payment method declined. Choose another option and try again.");
+              return actions.restart();
+            }
+
+            if (!response.ok || orderData.error || orderData.success === false) {
+              const message = formatOrderError(orderData);
+              if (isInstrumentDeclined(orderData, message) && actions && typeof actions.restart === "function") {
+                resultMessage("Payment method declined. Choose another option and try again.");
+                return actions.restart();
+              }
+              resultMessage(message);
+              postAppMessage({ type: "PAYPAL_ERROR", message });
+              throw new Error(message);
+            }
+
+            resultMessage("");
+            postAppMessage({ type: "PAYPAL_SUCCESS", payload: orderData });
+          },
+          onCancel: function(data) {
+            resultMessage("PayPal checkout was cancelled. Your cart is unchanged.", "info");
+            postAppMessage({ type: "PAYPAL_CANCEL", payload: data || {} });
+          },
+          onError: function(error) {
+            const message = error && error.message ? error.message : String(error || "PayPal checkout failed.");
+            if (isInstrumentDeclined(null, message)) {
+              resultMessage("Payment method declined. Choose another option and try again.");
+              return;
+            }
+            resultMessage("Sorry, PayPal could not process this payment.");
+            postAppMessage({ type: "PAYPAL_ERROR", message });
+          }
+        };
+      }
+
+      function mountPayPalButtons() {
+        if (!window.paypal || !window.paypal.Buttons) {
+          resultMessage("PayPal could not load. Check your internet connection.");
+          postAppMessage({ type: "PAYPAL_ERROR", message: "PayPal SDK did not load." });
+          return Promise.reject(new Error("PayPal SDK did not load."));
+        }
+
+        postAppMessage({ type: "paypal-rendering-buttons" });
+
+        const container = document.querySelector("#paypal-button-container");
+        container.innerHTML = "";
+        const panel = document.getElementById("button-panel");
+        if (panel) {
+          panel.removeAttribute("hidden");
+          panel.style.display = "block";
+        }
+        const handlers = buildButtonHandlers();
+        const fundingButtons = [
+          {
+            fundingSource: window.paypal.FUNDING.PAYPAL,
+            style: { shape: "rect", layout: "vertical", color: "gold", label: "paypal", height: 50, tagline: false }
+          },
+          {
+            fundingSource: window.paypal.FUNDING.VENMO,
+            style: { shape: "rect", layout: "vertical", color: "blue", height: 50, tagline: false }
+          },
+          {
+            fundingSource: window.paypal.FUNDING.PAYLATER,
+            style: { shape: "rect", layout: "vertical", color: "gold", height: 50, tagline: false }
+          },
+          {
+            fundingSource: window.paypal.FUNDING.CARD,
+            style: { shape: "rect", layout: "vertical", color: "black", height: 50, tagline: false }
+          }
+        ];
+
+        const renderJobs = [];
+
+        fundingButtons.forEach(function(entry) {
+          const button = window.paypal.Buttons(Object.assign({}, handlers, {
+            fundingSource: entry.fundingSource,
+            style: entry.style
+          }));
+
+          if (!button.isEligible || !button.isEligible()) {
+            return;
+          }
+
+          renderJobs.push(button.render(container));
+        });
+
+        if (!renderJobs.length) {
+          renderJobs.push(
+            window.paypal.Buttons(Object.assign({}, handlers, {
+              style: {
+                shape: "rect",
+                layout: "vertical",
+                color: "gold",
+                label: "paypal",
+                height: 50,
+                tagline: false
+              }
+            })).render(container)
+          );
+        }
+
+        var loadingFallbackTimer = setTimeout(function() {
+          if (container && container.children.length) {
+            hidePayPalLoadingUi();
+          }
+        }, 4000);
+
+        return Promise.all(renderJobs)
+          .then(function() {
+            clearTimeout(loadingFallbackTimer);
+            hidePayPalLoadingUi();
+          })
+          .catch(function(error) {
+            clearTimeout(loadingFallbackTimer);
+            if (container && container.children.length) {
+              hidePayPalLoadingUi();
+              return;
+            }
+            throw error;
+          });
+      }
+
+      function onPayPalSdkLoaded() {
+        postAppMessage({ type: "paypal-sdk-loaded" });
+        mountPayPalButtons().catch(function(error) {
+          const message = error && error.message ? error.message : "PayPal buttons could not be rendered.";
+          resultMessage(message);
+          postAppMessage({ type: "PAYPAL_ERROR", message });
+        });
+      }
+
+      function onPayPalSdkError() {
+        var loading = document.getElementById("paypal-loading");
+        if (loading) {
+          loading.setAttribute("hidden", "hidden");
+          loading.classList.add("paypal-hidden");
+          loading.style.display = "none";
+        }
+        resultMessage("PayPal SDK failed to load. Check your connection and try again.");
+        postAppMessage({ type: "PAYPAL_ERROR", message: "PayPal SDK failed to load." });
+      }
     </script>
+    <script src="${sdkUrl}" onload="onPayPalSdkLoaded()" onerror="onPayPalSdkError()"></script>
   </body>
 </html>`;
 }
@@ -327,81 +527,140 @@ export default function PayPalCheckoutScreen() {
   const router = useRouter();
   const webViewRef = useRef<WebView>(null);
   const handledRef = useRef(false);
-  const { total, currency } = useLocalSearchParams<{ total?: string; currency?: string }>();
+  const payPalLoadingHiddenRef = useRef(false);
+  const { checkoutSessionId: checkoutSessionIdParam } = useLocalSearchParams<{
+    checkoutSessionId?: string;
+  }>();
   const {
     addOrder,
     cartItems = [],
+    checkoutTotals,
     clearCart,
     convertPrice,
     formatMoney,
     selectedCurrency = BASE_CURRENCY,
   } = useCart();
-  const { defaultAddress } = useAddressBook();
+  const { defaultAddress, loadingAddresses } = useAddressBook();
   const { addHistoryEvent } = useHistoryEvents();
   const { displayName, isSignedIn } = useUser();
   const [isLoading, setIsLoading] = useState(true);
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [setupWarning, setSetupWarning] = useState('');
+  const [profileEmail, setProfileEmail] = useState('');
 
-  const paymentCurrency = String(currency || selectedCurrency || BASE_CURRENCY).toUpperCase();
-  const paypalCurrency = 'USD';
-  const shopifyCurrency = 'TTD';
-  const paymentTotal = Number(total || 0);
-  const paypalAmount = useMemo(
-    () => convertPrice(paymentTotal, paymentCurrency, paypalCurrency),
-    [convertPrice, paymentCurrency, paymentTotal]
+  const checkoutSessionId = String(checkoutSessionIdParam || '').trim() || getCheckoutSessionId();
+  const total = checkoutTotals.total;
+  const cartPayload = checkoutTotals.cartLines;
+  const displayTotal = useMemo(
+    () => convertPrice(total, SHOPIFY_CHECKOUT_CURRENCY, selectedCurrency),
+    [convertPrice, selectedCurrency, total]
   );
-  const shopifyAmount = useMemo(
-    () => convertPrice(paymentTotal, paymentCurrency, shopifyCurrency),
-    [convertPrice, paymentCurrency, paymentTotal]
-  );
-  const amount = useMemo(() => paypalAmount.toFixed(2), [paypalAmount]);
 
-  const cartPayload = useMemo(
-    () =>
-      cartItems.map((item: any) => {
-        const itemBaseCurrency = item?.baseCurrency || BASE_CURRENCY;
-        const convertedUnitPrice = convertPrice(
-          Number(item?.price || 0),
-          itemBaseCurrency,
-          shopifyCurrency
-        );
+  useEffect(() => {
+    console.log('[NOOD paypal] screen mounted');
+  }, []);
 
-        return {
-          title: item?.title || 'Product',
-          productId: item?.productId ? String(item.productId) : '',
-          quantity: Number(item?.quantity || 1),
-          price: Number(convertedUnitPrice.toFixed(2)),
-          currency: shopifyCurrency,
-          variantId: item?.variantId ? String(item.variantId) : '',
-          image: item?.image || '',
-          handle: item?.handle || '',
-          variantTitle: item?.variantTitle || '',
-        };
-      }),
-    [cartItems, convertPrice]
-  );
+  useEffect(() => {
+    if (!isSignedIn) {
+      setProfileEmail('');
+      return;
+    }
+
+    void getCustomerProfile().then((profile) => {
+      setProfileEmail(String(profile?.email || '').trim());
+    });
+  }, [isSignedIn]);
+
   const checkoutCustomer = useMemo(
-    () => getCheckoutCustomer({ defaultAddress, displayName, isSignedIn }),
-    [defaultAddress, displayName, isSignedIn]
+    () => getCheckoutCustomer({ defaultAddress, displayName, isSignedIn, profileEmail }),
+    [defaultAddress, displayName, isSignedIn, profileEmail]
   );
-  const paymentCustomerEmail = useMemo(
-    () => getPaymentTestingEmail(checkoutCustomer.email),
-    [checkoutCustomer.email]
+  const paymentCustomerEmail = getPaymentCustomerEmail(checkoutCustomer.email);
+
+  const backendUrl = useMemo(() => getPayPalBackendUrl(), []);
+
+  const orderPayload = useMemo(
+    () => ({
+      checkoutSessionId,
+      clientOrderId: checkoutSessionId,
+      total: Number(total.toFixed(2)),
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
+      shopifyTotalTtd: Number(total.toFixed(2)),
+      name: checkoutCustomer.name,
+      email: paymentCustomerEmail,
+      phone: checkoutCustomer.phone,
+      cart: cartPayload,
+      cartItems: cartPayload,
+      shippingAddress: defaultAddress,
+    }),
+    [
+      cartPayload,
+      checkoutCustomer.name,
+      checkoutCustomer.phone,
+      checkoutSessionId,
+      defaultAddress,
+      paymentCustomerEmail,
+      total,
+    ]
+  );
+
+  const capturePayload = useMemo(
+    () => ({
+      checkoutSessionId,
+      clientOrderId: checkoutSessionId,
+      total: Number(total.toFixed(2)),
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
+      shopifyTotalTtd: Number(total.toFixed(2)),
+      cart: cartPayload,
+      cartItems: cartPayload,
+      shippingAddress: defaultAddress,
+    }),
+    [cartPayload, checkoutSessionId, defaultAddress, total]
   );
 
   const html = useMemo(
-    () => makePayPalHtml(PAYPAL_CLIENT_ID, paypalCurrency, amount, PAYPAL_ENV),
-    [amount]
+    () =>
+      makePayPalHtml(
+        PAYPAL_CLIENT_ID,
+        PAYPAL_ENV,
+        backendUrl,
+        JSON.stringify(orderPayload),
+        JSON.stringify(capturePayload)
+      ),
+    [backendUrl, capturePayload, orderPayload]
   );
 
-  const respondToWebView = (requestId: string, ok: boolean, value: string) => {
-    const fn = ok ? 'resolve' : 'reject';
-    webViewRef.current?.injectJavaScript(
-      `window.NoodPayPal && window.NoodPayPal.${fn}(${JSON.stringify(requestId)}, ${JSON.stringify(value)}); true;`
-    );
-  };
+  useEffect(() => {
+    const validation = validateCheckoutPrerequisites({
+      cartItems,
+      defaultAddress,
+      profileEmail,
+      loadingAddresses,
+      requireEmail: !PAYMENT_TESTING_MODE,
+    });
 
-  const finishSuccess = (orderId: string, captureData: any, shopifyResult: ShopifyOrderResult) => {
+    if (!validation.ok) {
+      const reason = validation.message || validation.title || 'Checkout unavailable';
+      console.log('[NOOD paypal] setup issue:', reason);
+      setSetupWarning(reason);
+      return;
+    }
+
+    if (!PAYPAL_CLIENT_ID) {
+      console.log('[NOOD paypal] setup issue: PayPal client ID missing');
+      setSetupWarning('Missing EXPO_PUBLIC_PAYPAL_CLIENT_ID in app .env');
+      return;
+    }
+
+    if (!backendUrl) {
+      console.log('[NOOD paypal] setup issue: backend URL missing');
+      setSetupWarning('Payment backend URL is not configured.');
+      return;
+    }
+
+    setSetupWarning('');
+  }, [backendUrl, cartItems, defaultAddress, loadingAddresses, profileEmail]);
+
+  const finishSuccess = (captureData: any, shopifyResult: ShopifyOrderResult) => {
     if (handledRef.current) return;
     handledRef.current = true;
 
@@ -411,13 +670,13 @@ export default function PayPalCheckoutScreen() {
       captureData?.paypal?.purchase_units?.[0]?.payments?.captures?.[0]?.id ||
       captureData?.capture?.purchase_units?.[0]?.payments?.captures?.[0]?.id ||
       captureData?.id ||
-      orderId;
+      '';
 
     addOrder({
       id: shopifyResult.shopifyOrderName || shopifyResult.shopifyOrderId || Date.now().toString(),
       date: new Date().toISOString(),
-      total: paymentTotal,
-      currency: paymentCurrency,
+      total,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
       status: 'paid',
       paymentMethod: shopifyResult.shopifyOrderName
         ? `PayPal (${shopifyResult.shopifyOrderName})`
@@ -429,54 +688,39 @@ export default function PayPalCheckoutScreen() {
       shippingAddress: defaultAddress,
       items: cartItems,
     });
-    console.log('[NOOD order] app order saved');
-    console.log('[NOOD PayPal] saved app order after Shopify confirmation', {
-      shopifyOrderId: shopifyResult.shopifyOrderId,
-      shopifyOrderName: shopifyResult.shopifyOrderName,
-      paymentTransactionId: captureId,
-      items: cartItems,
-      customer: checkoutCustomer,
-      shippingAddress: defaultAddress,
-    });
     void addHistoryEvent({
       type: 'checkout',
       title: 'Payment completed',
       description: `PayPal payment completed for Shopify order ${shopifyResult.shopifyOrderName || shopifyResult.shopifyOrderId}.`,
-      amount: paymentTotal,
-      currency: paymentCurrency,
+      amount: total,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
       status: 'success',
     });
     clearCart();
-    console.log('[NOOD order] cart cleared');
+    resetCheckoutSessionId();
 
-    Alert.alert(
+    noodAlert(
       'Payment Successful',
       shopifyResult.shopifyOrderName
         ? `Order ${shopifyResult.shopifyOrderName} was created successfully.`
         : 'Your PayPal payment was completed and the Shopify order was created.',
-      [
-      { text: 'View Orders', onPress: () => router.replace('/account/orders') },
-      ]
+      [{ text: 'View Orders', onPress: () => router.replace('/account/orders') }]
     );
   };
 
   const finishFailure = (message: string) => {
-    if (handledRef.current) return;
-    handledRef.current = true;
     void addHistoryEvent({
       type: 'checkout',
       title: 'PayPal checkout failed',
       description: message,
-      amount: paymentTotal,
-      currency: paymentCurrency,
+      amount: total,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
       status: 'failed',
     });
-    Alert.alert('Payment Not Completed', message, [
-      { text: 'Back', onPress: () => router.back() },
-    ]);
+    noodAlert('Payment Not Completed', message, [{ text: 'Back', onPress: () => router.back() }]);
   };
 
-  const finishPaymentReceivedOrderIssue = (data: any, message?: string) => {
+  const finishPaymentReceivedOrderIssue = (data: any) => {
     if (handledRef.current) return;
     handledRef.current = true;
 
@@ -486,131 +730,40 @@ export default function PayPalCheckoutScreen() {
       data?.capture?.purchase_units?.[0]?.payments?.captures?.[0]?.id ||
       data?.paypal?.id ||
       '';
-    const recoveryId = data?.recovery_id || '';
-
-    addOrder({
-      id: recoveryId || transactionId || Date.now().toString(),
-      date: new Date().toISOString(),
-      total: paymentTotal,
-      currency: paymentCurrency,
-      status: 'failed-paid',
-      paymentMethod: transactionId ? `PayPal (${transactionId})` : 'PayPal',
-      paymentTransactionId: transactionId,
-      customer: checkoutCustomer,
-      shippingAddress: defaultAddress,
-      items: cartItems,
-    });
 
     void addHistoryEvent({
       type: 'checkout',
       title: 'Payment received - order needs review',
-      description: `Payment was successful, but Shopify order creation needs review. Transaction ID: ${transactionId || 'not provided'}.`,
-      amount: paymentTotal,
-      currency: paymentCurrency,
+      description: `${PAYMENT_REVIEW_MESSAGE} Transaction ID: ${transactionId || 'not provided'}.`,
+      amount: total,
+      currency: SHOPIFY_CHECKOUT_CURRENCY,
       status: 'needs_review',
-      relatedId: recoveryId || transactionId,
+      relatedId: data?.recovery_id || transactionId,
     });
 
-    Alert.alert(
+    noodAlert(
       'Payment Received - Order Processing Issue',
-      message ||
-        `Your payment was successful, but your order needs review. Please contact support with transaction ID: ${transactionId || 'not provided'}.`,
-      [{ text: 'View Orders', onPress: () => router.replace('/account/orders') }]
+      transactionId
+        ? `${PAYMENT_REVIEW_MESSAGE} ${transactionId}`
+        : PAYMENT_REVIEW_MESSAGE,
+      [{ text: 'Back to Checkout', onPress: () => router.back() }]
     );
   };
 
-  const handleCreateOrder = async (requestId: string) => {
-    try {
-      setIsProcessing(true);
-      const itemsMissingVariantIds = cartPayload.filter((item: any) => !String(item?.variantId || '').trim());
-      if (itemsMissingVariantIds.length) {
-        console.log('[NOOD PayPal] blocked create order missing Shopify variantId', itemsMissingVariantIds);
-        throw new Error('One or more cart items is missing its Shopify variant ID. Please remove it and add it again before checkout.');
-      }
-      console.log('[NOOD PayPal] create order cart line items', cartPayload);
-      const data = await postBackendJson(
-        '/api/orders',
-        {
-          total: Number(amount),
-          currency: paypalCurrency,
-          paypalTotalUsd: Number(amount),
-          shopifyTotalTtd: Number(shopifyAmount.toFixed(2)),
-          name: checkoutCustomer.name,
-          email: paymentCustomerEmail,
-          phone: checkoutCustomer.phone,
-          cart: cartPayload,
-          cartItems: cartPayload,
-          shippingAddress: defaultAddress,
-        },
-        { timeoutMs: 45000 }
-      );
-      console.log('[NOOD PayPal] create order response', data);
-
-      const orderId = data?.id || data?.orderID || data?.orderId || '';
-      if (!orderId) {
-        throw new Error('No PayPal order ID received from backend.');
-      }
-
-      respondToWebView(requestId, true, orderId);
-    } catch (error: any) {
-      const message = error?.message || 'Could not create PayPal order.';
-      respondToWebView(requestId, false, message);
-      Alert.alert('PayPal Error', message);
-    } finally {
-      setIsProcessing(false);
+  const handlePayPalSuccess = (payload: any) => {
+    if (payload?.payment_received || payload?.status === 'payment_received_order_review') {
+      finishPaymentReceivedOrderIssue(payload);
+      return;
     }
-  };
 
-  const handleCaptureOrder = async (requestId: string, orderID: string) => {
-    try {
-      setIsProcessing(true);
-      console.log('[NOOD PayPal] capture order request', {
-        orderID,
-        cartItems: cartPayload,
-        total: Number(amount),
-        currency: paypalCurrency,
-      });
-      const data = await postBackendJson(
-        `/api/orders/${encodeURIComponent(orderID)}/capture`,
-        {
-          total: Number(amount),
-          currency: paypalCurrency,
-          paypalTotalUsd: Number(amount),
-          shopifyTotalTtd: Number(shopifyAmount.toFixed(2)),
-          cart: cartPayload,
-          cartItems: cartPayload,
-          shippingAddress: defaultAddress,
-        },
-        { timeoutMs: 45000 }
-      );
-      console.log('[NOOD PayPal] capture/order success response', data);
+    const shopifyResult = getShopifyOrderResult(payload);
 
-      if (data?.payment_received || data?.status === 'payment_received_order_review') {
-        respondToWebView(requestId, true, 'captured');
-        finishPaymentReceivedOrderIssue(data);
-        return;
-      }
-
-      const shopifyResult = getShopifyOrderResult(data);
-
-      if (!shopifyResult.shopifyOrderId && !shopifyResult.shopifyOrderName) {
-        respondToWebView(requestId, true, 'captured');
-        finishPaymentReceivedOrderIssue(
-          data,
-          'Your payment was successful, but your order needs review. Please contact support with transaction ID: not provided.'
-        );
-        return;
-      }
-
-      respondToWebView(requestId, true, 'captured');
-      finishSuccess(orderID, data, shopifyResult);
-    } catch (error: any) {
-      const message = error?.message || 'Could not capture PayPal payment.';
-      respondToWebView(requestId, false, message);
-      finishFailure(message);
-    } finally {
-      setIsProcessing(false);
+    if (!shopifyResult.shopifyOrderId && !shopifyResult.shopifyOrderName) {
+      finishPaymentReceivedOrderIssue(payload);
+      return;
     }
+
+    finishSuccess(payload, shopifyResult);
   };
 
   const handleMessage = (event: WebViewMessageEvent) => {
@@ -624,28 +777,60 @@ export default function PayPalCheckoutScreen() {
 
     if (!message) return;
 
-    if (message.type === 'paypal-ready') {
+    if (message.type === 'paypal-sdk-loaded') {
+      console.log('[NOOD paypal] sdk loaded');
+      return;
+    }
+
+    if (message.type === 'paypal-rendering-buttons') {
+      console.log('[NOOD paypal] rendering buttons');
+      return;
+    }
+
+    if (message.type === 'paypal-buttons-rendered' || message.type === 'PAYPAL_BUTTONS_RENDERED') {
+      console.log('[NOOD paypal] buttons rendered');
+      return;
+    }
+
+    if (message.type === 'paypal-loading-hidden' || message.type === 'paypal-ready') {
+      if (!payPalLoadingHiddenRef.current) {
+        payPalLoadingHiddenRef.current = true;
+        console.log('[NOOD paypal] loading hidden');
+        setIsLoading(false);
+      }
+      return;
+    }
+
+    if (message.type === 'PAYPAL_SUCCESS') {
       setIsLoading(false);
+      handlePayPalSuccess(message.payload);
       return;
     }
 
-    if (message.type === 'create-order') {
-      void handleCreateOrder(message.requestId);
+    if (message.type === 'PAYPAL_CANCEL') {
+      setIsLoading(false);
+      void addHistoryEvent({
+        type: 'checkout',
+        title: 'PayPal checkout cancelled',
+        description: 'Buyer cancelled PayPal before payment completed.',
+        amount: total,
+        currency: SHOPIFY_CHECKOUT_CURRENCY,
+        status: 'cancelled',
+      });
       return;
     }
 
-    if (message.type === 'capture-order') {
-      void handleCaptureOrder(message.requestId, message.orderID);
-      return;
-    }
-
-    if (message.type === 'cancel') {
-      finishFailure('PayPal checkout was cancelled.');
-      return;
-    }
-
-    if (message.type === 'error') {
-      finishFailure(message.message || 'PayPal checkout failed.');
+    if (message.type === 'PAYPAL_ERROR') {
+      payPalLoadingHiddenRef.current = true;
+      setIsLoading(false);
+      void addHistoryEvent({
+        type: 'checkout',
+        title: 'PayPal checkout error',
+        description: message.message || 'PayPal checkout failed.',
+        amount: total,
+        currency: SHOPIFY_CHECKOUT_CURRENCY,
+        status: 'failed',
+      });
     }
   };
 
@@ -679,21 +864,32 @@ export default function PayPalCheckoutScreen() {
           <Ionicons name="arrow-back" size={22} color="#111111" />
         </TouchableOpacity>
         <View style={styles.headerCenter}>
-          <Text style={styles.headerTitle}>PayPal Checkout</Text>
-          <Text style={styles.headerSubtitle}>{formatMoney(paymentTotal, paymentCurrency)}</Text>
+          <Text style={styles.headerTitle}>Pay with PayPal / Card</Text>
+          <Text style={styles.headerSubtitle}>{formatMoney(displayTotal, selectedCurrency)}</Text>
         </View>
-        <TouchableOpacity style={styles.roundButton} onPress={() => webViewRef.current?.reload()}>
+        <TouchableOpacity
+          style={styles.roundButton}
+          onPress={() => {
+            payPalLoadingHiddenRef.current = false;
+            setIsLoading(true);
+            webViewRef.current?.reload();
+          }}
+        >
           <Ionicons name="refresh" size={20} color="#111111" />
         </TouchableOpacity>
       </View>
 
+      {!!setupWarning ? (
+        <View style={styles.setupWarningBanner}>
+          <Text style={styles.setupWarningText}>{setupWarning}</Text>
+        </View>
+      ) : null}
+
       <View style={styles.webviewWrap}>
-        {(isLoading || isProcessing) && (
+        {isLoading && (
           <View style={styles.loadingOverlay}>
             <NoodSpinner size={42} />
-            <Text style={styles.loadingText}>
-              {isProcessing ? 'Talking to PayPal...' : 'Loading PayPal...'}
-            </Text>
+            <Text style={styles.loadingText}>Loading PayPal...</Text>
           </View>
         )}
         <WebView
@@ -708,7 +904,19 @@ export default function PayPalCheckoutScreen() {
           originWhitelist={['*']}
           mixedContentMode="compatibility"
           onMessage={handleMessage}
-          onLoadEnd={() => setIsLoading(false)}
+          onLoadStart={() => {
+            payPalLoadingHiddenRef.current = false;
+            setIsLoading(true);
+          }}
+          onLoadEnd={() => {
+            console.log('[NOOD paypal] webview html loaded');
+          }}
+          onError={(event) => {
+            console.log(
+              '[NOOD paypal] webview load error',
+              event.nativeEvent.description || event.nativeEvent
+            );
+          }}
           renderLoading={() => (
             <View style={styles.loadingOverlay}>
               <NoodSpinner size={42} />
@@ -763,21 +971,39 @@ const styles = StyleSheet.create({
   roundButtonPlaceholder: {
     width: 42,
   },
+  setupWarningBanner: {
+    marginHorizontal: 12,
+    marginTop: 8,
+    marginBottom: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: '#fff4ed',
+    borderWidth: 1,
+    borderColor: '#ffd6bf',
+  },
+  setupWarningText: {
+    color: '#9a3412',
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
   webviewWrap: {
     flex: 1,
-    backgroundColor: '#f6f3ef',
+    backgroundColor: '#0b0b0b',
   },
   loadingOverlay: {
     ...StyleSheet.absoluteFillObject,
     zIndex: 2,
-    backgroundColor: 'rgba(246, 243, 239, 0.92)',
+    backgroundColor: 'rgba(11, 11, 11, 0.88)',
     alignItems: 'center',
     justifyContent: 'center',
   },
   loadingText: {
     marginTop: 10,
     fontSize: 14,
-    color: '#111111',
+    color: '#ffffff',
     fontWeight: '800',
   },
   emptyState: {

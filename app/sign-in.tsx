@@ -1,6 +1,8 @@
-import React from 'react';
+import React, { useCallback, useState } from 'react';
 import {
+  ActivityIndicator,
   Image,
+  Platform,
   SafeAreaView,
   StyleSheet,
   Text,
@@ -9,19 +11,55 @@ import {
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import * as WebBrowser from 'expo-web-browser';
+import { useHistoryEvents } from '../context/HistoryContext';
+import { useUser } from '../context/UserContext';
+import { logAuthRestartCheck } from '../utils/auth-restart-debug';
+import { isAppBootstrapComplete } from '../utils/app-bootstrap';
+import { handleShopifyAuthRedirectUrl } from '../utils/shopify-auth-handlers';
+import { launchShopifyAuthSession } from '../utils/shopify-auth-launcher';
+import { noodAlert } from '../utils/nood-alert';
+
+WebBrowser.maybeCompleteAuthSession();
 
 const GOOGLE_LOGO_URL =
   'https://cdn.shopify.com/s/files/1/0663/2099/0292/files/2a5758d6-4edb-4047-87bb-e6b94dbbbab0-cover.png?v=1781936734';
 
 export default function SignInScreen() {
   const router = useRouter();
+  const { markSignedIn } = useUser();
+  const { addHistoryEvent } = useHistoryEvents();
+  const [openingProvider, setOpeningProvider] = useState<string | null>(null);
 
-  const openAuth = async (provider: 'google' | 'email' | 'phone') => {
-    router.push({
-      pathname: '/account/auth',
-      params: { provider },
-    });
-  };
+  const openAuth = useCallback(
+    async (provider: 'google' | 'facebook' | 'shop' | 'email' | 'phone') => {
+      if (openingProvider) return;
+
+      setOpeningProvider(provider);
+      logAuthRestartCheck({
+        step: 'sign-in-open-auth',
+        isAppBootstrapping: !isAppBootstrapComplete(),
+        isAuthLoading: true,
+        detail: { provider },
+      });
+
+      await launchShopifyAuthSession({
+        provider,
+        onRedirectUrl: async (url) => {
+          await handleShopifyAuthRedirectUrl(url, {
+            markSignedIn,
+            addHistoryEvent,
+          });
+        },
+        onError: (message) => {
+          noodAlert('Sign-in unavailable', message);
+        },
+      });
+
+      setOpeningProvider(null);
+    },
+    [addHistoryEvent, markSignedIn, openingProvider]
+  );
 
   const handleBackPress = () => {
     if (router.canGoBack()) {
@@ -55,12 +93,42 @@ export default function SignInScreen() {
       <TouchableOpacity
         style={styles.primaryButton}
         activeOpacity={0.9}
+        disabled={Boolean(openingProvider)}
         onPress={() => {
           void openAuth('google');
         }}
       >
         <Image source={{ uri: GOOGLE_LOGO_URL }} style={styles.googleLogo} resizeMode="contain" />
         <Text style={styles.primaryButtonText}>Continue with Google</Text>
+        {openingProvider === 'google' ? (
+          <ActivityIndicator size="small" color="#ff6a00" style={styles.buttonSpinner} />
+        ) : null}
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        style={styles.facebookButton}
+        activeOpacity={0.9}
+        onPress={() => {
+          void openAuth('facebook');
+        }}
+      >
+        <View style={styles.facebookIconWrap}>
+          <Text style={styles.facebookIconText}>f</Text>
+        </View>
+        <Text style={styles.facebookButtonText}>Continue with Facebook</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        style={styles.shopButton}
+        activeOpacity={0.9}
+        onPress={() => {
+          void openAuth('shop');
+        }}
+      >
+        <View style={styles.shopIconWrap}>
+          <Ionicons name="bag-handle" size={18} color="#5433EB" />
+        </View>
+        <Text style={styles.shopButtonText}>Continue with Shop</Text>
       </TouchableOpacity>
 
       <TouchableOpacity
@@ -167,6 +235,62 @@ const styles = StyleSheet.create({
     width: 22,
     height: 22,
   },
+  facebookButton: {
+    minHeight: 58,
+    borderRadius: 18,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#e8ddd4',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 12,
+  },
+  facebookIconWrap: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#1877F2',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  facebookIconText: {
+    color: '#fff',
+    fontSize: 20,
+    fontWeight: '900',
+    fontFamily: Platform.OS === 'ios' ? 'Helvetica Neue' : 'sans-serif',
+  },
+  facebookButtonText: {
+    marginLeft: 10,
+    color: '#111',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  shopButton: {
+    minHeight: 58,
+    borderRadius: 18,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#e8ddd4',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 12,
+  },
+  shopIconWrap: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    backgroundColor: '#F3EEFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  shopButtonText: {
+    marginLeft: 10,
+    color: '#111',
+    fontSize: 16,
+    fontWeight: '800',
+  },
   secondaryButton: {
     minHeight: 58,
     borderRadius: 18,
@@ -200,5 +324,8 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     fontWeight: '600',
+  },
+  buttonSpinner: {
+    marginLeft: 10,
   },
 });

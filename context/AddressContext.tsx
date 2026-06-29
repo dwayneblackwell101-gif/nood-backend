@@ -2,8 +2,10 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useUser } from './UserContext';
 import { useHistoryEvents } from './HistoryContext';
+import { getCustomerProfile } from '../utils/customer-profile';
+import { getAddressesStorageKey } from '../utils/customer-storage';
 
-const ADDRESS_BOOK_KEY = 'NOOD_ADDRESS_BOOK_V1';
+const LEGACY_ADDRESS_PREFIX = 'NOOD_ADDRESS_BOOK_V1';
 
 export type ShippingAddress = {
   id: string;
@@ -13,6 +15,7 @@ export type ShippingAddress = {
   address2?: string;
   city: string;
   region: string;
+  country: string;
   postalCode?: string;
   notes?: string;
   isDefault: boolean;
@@ -28,6 +31,7 @@ type AddressContextValue = {
   addresses: ShippingAddress[];
   defaultAddress: ShippingAddress | null;
   loadingAddresses: boolean;
+  isDeviceLocal: boolean;
   addAddress: (address: AddressInput) => Promise<void>;
   updateAddress: (id: string, address: AddressInput) => Promise<void>;
   deleteAddress: (id: string) => Promise<void>;
@@ -35,8 +39,6 @@ type AddressContextValue = {
 };
 
 const AddressContext = createContext<AddressContextValue | null>(null);
-
-const makeStorageKey = (profileId: string) => `${ADDRESS_BOOK_KEY}:${profileId || 'guest'}`;
 
 const normalizeAddress = (address: ShippingAddress): ShippingAddress => ({
   ...address,
@@ -46,36 +48,99 @@ const normalizeAddress = (address: ShippingAddress): ShippingAddress => ({
   address2: String(address.address2 || '').trim(),
   city: String(address.city || '').trim(),
   region: String(address.region || '').trim(),
+  country: String(address.country || address.region || '').trim(),
   postalCode: String(address.postalCode || '').trim(),
   notes: String(address.notes || '').trim(),
 });
 
+async function loadLegacyAddresses(profileId: string): Promise<ShippingAddress[]> {
+  try {
+    const saved = await AsyncStorage.getItem(`${LEGACY_ADDRESS_PREFIX}:${profileId || 'guest'}`);
+    if (!saved) {
+      return [];
+    }
+
+    const parsed = JSON.parse(saved);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.map((entry) =>
+      normalizeAddress({
+        ...entry,
+        country: entry?.country || entry?.region || '',
+      })
+    );
+  } catch {
+    return [];
+  }
+}
+
 export function AddressProvider({ children }: { children: React.ReactNode }) {
-  const { profileId, isReady } = useUser();
+  const { profileId, isReady, isSignedIn, settings } = useUser();
   const { addHistoryEvent } = useHistoryEvents();
   const [addresses, setAddresses] = useState<ShippingAddress[]>([]);
   const [loadingAddresses, setLoadingAddresses] = useState(true);
+  const [customerEmail, setCustomerEmail] = useState('');
 
-  const storageKey = useMemo(() => makeStorageKey(profileId), [profileId]);
+  const storageKey = useMemo(
+    () => (profileId ? getAddressesStorageKey(profileId, customerEmail, isSignedIn) : ''),
+    [customerEmail, isSignedIn, profileId]
+  );
+
+  useEffect(() => {
+    if (!isSignedIn) {
+      setCustomerEmail('');
+      return;
+    }
+
+    void getCustomerProfile().then((profile) => {
+      setCustomerEmail(profile?.email || '');
+    });
+  }, [isSignedIn]);
 
   useEffect(() => {
     let isMounted = true;
 
     const loadAddresses = async () => {
-      if (!isReady) return;
+      if (!isReady || !profileId || !storageKey) {
+        return;
+      }
 
       try {
         setLoadingAddresses(true);
         const saved = await AsyncStorage.getItem(storageKey);
-        const parsed = saved ? JSON.parse(saved) : [];
+        let parsed: ShippingAddress[] = saved ? JSON.parse(saved) : [];
+
+        if (!Array.isArray(parsed) || !parsed.length) {
+          const legacy = await loadLegacyAddresses(profileId);
+          if (legacy.length) {
+            parsed = legacy;
+            await AsyncStorage.setItem(storageKey, JSON.stringify(legacy));
+          }
+        }
+
         if (isMounted) {
-          setAddresses(Array.isArray(parsed) ? parsed.map(normalizeAddress) : []);
+          setAddresses(
+            Array.isArray(parsed)
+              ? parsed.map((entry) =>
+                  normalizeAddress({
+                    ...entry,
+                    country: entry.country || settings.country || entry.region || '',
+                  })
+                )
+              : []
+          );
         }
       } catch (error) {
         console.log('Address load error:', error);
-        if (isMounted) setAddresses([]);
+        if (isMounted) {
+          setAddresses([]);
+        }
       } finally {
-        if (isMounted) setLoadingAddresses(false);
+        if (isMounted) {
+          setLoadingAddresses(false);
+        }
       }
     };
 
@@ -84,10 +149,15 @@ export function AddressProvider({ children }: { children: React.ReactNode }) {
     return () => {
       isMounted = false;
     };
-  }, [isReady, storageKey]);
+  }, [isReady, isSignedIn, profileId, settings.country, storageKey]);
 
   const persistAddresses = useCallback(
     async (nextAddresses: ShippingAddress[]) => {
+      if (!storageKey) {
+        setAddresses([]);
+        return;
+      }
+
       setAddresses(nextAddresses);
       await AsyncStorage.setItem(storageKey, JSON.stringify(nextAddresses));
     },
@@ -101,6 +171,7 @@ export function AddressProvider({ children }: { children: React.ReactNode }) {
       const nextAddress = normalizeAddress({
         ...address,
         id: `${Date.now()}`,
+        country: address.country || settings.country || address.region || '',
         isDefault: shouldBeDefault,
         createdAt: now,
         updatedAt: now,
@@ -118,13 +189,13 @@ export function AddressProvider({ children }: { children: React.ReactNode }) {
       void addHistoryEvent({
         type: 'address',
         title: 'Address added',
-        description: `${nextAddress.fullName} - ${nextAddress.city}, ${nextAddress.region}`,
+        description: `${nextAddress.fullName} - ${nextAddress.city}, ${nextAddress.country}`,
         status: nextAddress.isDefault ? 'default' : 'saved',
         relatedId: nextAddress.id,
         date: nextAddress.createdAt,
       });
     },
-    [addHistoryEvent, addresses, persistAddresses]
+    [addHistoryEvent, addresses, persistAddresses, settings.country]
   );
 
   const updateAddress = useCallback(
@@ -135,6 +206,7 @@ export function AddressProvider({ children }: { children: React.ReactNode }) {
           ? normalizeAddress({
               ...item,
               ...address,
+              country: address.country || item.country || settings.country || '',
               isDefault: shouldBeDefault || item.isDefault,
               updatedAt: new Date().toISOString(),
             })
@@ -157,7 +229,7 @@ export function AddressProvider({ children }: { children: React.ReactNode }) {
         relatedId: id,
       });
     },
-    [addHistoryEvent, addresses, persistAddresses]
+    [addHistoryEvent, addresses, persistAddresses, settings.country]
   );
 
   const deleteAddress = useCallback(
@@ -189,7 +261,7 @@ export function AddressProvider({ children }: { children: React.ReactNode }) {
         type: 'address',
         title: 'Default address changed',
         description: address
-          ? `${address.fullName} - ${address.city}, ${address.region}`
+          ? `${address.fullName} - ${address.city}, ${address.country}`
           : 'Default shipping address was changed.',
         status: 'default',
         relatedId: id,
@@ -208,12 +280,22 @@ export function AddressProvider({ children }: { children: React.ReactNode }) {
       addresses,
       defaultAddress,
       loadingAddresses,
+      isDeviceLocal: !isSignedIn,
       addAddress,
       updateAddress,
       deleteAddress,
       setDefaultAddress,
     }),
-    [addAddress, addresses, defaultAddress, deleteAddress, loadingAddresses, setDefaultAddress, updateAddress]
+    [
+      addAddress,
+      addresses,
+      defaultAddress,
+      deleteAddress,
+      isSignedIn,
+      loadingAddresses,
+      setDefaultAddress,
+      updateAddress,
+    ]
   );
 
   return <AddressContext.Provider value={value}>{children}</AddressContext.Provider>;

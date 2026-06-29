@@ -1,10 +1,12 @@
 import { useEffect, useRef } from 'react';
-import { BackHandler } from 'react-native';
+import { BackHandler, StyleSheet, Text, View } from 'react-native';
 import { PlatformPressable } from '@react-navigation/elements';
 import { useNavigationState } from '@react-navigation/native';
 import { Tabs, usePathname, useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useCart } from '../../context/CartContext';
+import { useWishlist } from '../../context/WishlistContext';
 
 type TabPath = '/' | '/categories' | '/cart' | '/wishlist' | '/account';
 
@@ -14,6 +16,27 @@ function isHomeTabPath(pathname: string): boolean {
     pathname === '/(tabs)' ||
     pathname === '/index' ||
     pathname === '/(tabs)/index'
+  );
+}
+
+function CartTabIcon({
+  color,
+  size,
+  badge,
+}: {
+  color: string;
+  size: number;
+  badge?: string | number;
+}) {
+  return (
+    <View style={styles.cartIconWrap}>
+      <Ionicons name="cart" size={size} color={color} />
+      {badge != null ? (
+        <View style={styles.cartBadge}>
+          <Text style={styles.cartBadgeText}>{badge}</Text>
+        </View>
+      ) : null}
+    </View>
   );
 }
 
@@ -30,6 +53,12 @@ export default function TabLayout() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const pathname = usePathname();
+  const { cartCount } = useCart();
+  const { wishlistCount } = useWishlist();
+  const cartBadge =
+    cartCount > 0 ? (cartCount > 99 ? '99+' : cartCount) : undefined;
+  const wishlistBadge =
+    wishlistCount > 0 ? (wishlistCount > 99 ? '99+' : wishlistCount) : undefined;
   const tabHistoryRef = useRef<TabPath[]>([]);
   const isHomeTabActive = useNavigationState(
     (state) => state.routes[state.index]?.name === 'index'
@@ -102,13 +131,7 @@ export default function TabLayout() {
             <Ionicons name="home" size={size} color={color} />
           ),
           tabBarButton: (props) => (
-            <PlatformPressable
-              {...props}
-              onPress={(event) => {
-                if (shouldIgnoreHomeTabPress) return;
-                props.onPress?.(event);
-              }}
-            />
+            <PlatformPressable {...props} />
           ),
         }}
       />
@@ -128,7 +151,7 @@ export default function TabLayout() {
         options={{
           title: 'Cart',
           tabBarIcon: ({ color, size }) => (
-            <Ionicons name="cart" size={size} color={color} />
+            <CartTabIcon color={color} size={size} badge={cartBadge} />
           ),
         }}
       />
@@ -137,6 +160,7 @@ export default function TabLayout() {
         name="wishlist"
         options={{
           title: 'Wishlist',
+          tabBarBadge: wishlistBadge,
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="heart" size={size} color={color} />
           ),
@@ -155,3 +179,32 @@ export default function TabLayout() {
     </Tabs>
   );
 }
+
+const styles = StyleSheet.create({
+  cartIconWrap: {
+    width: 30,
+    height: 26,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cartBadge: {
+    position: 'absolute',
+    top: -3,
+    right: -4,
+    minWidth: 16,
+    height: 16,
+    borderRadius: 8,
+    paddingHorizontal: 4,
+    backgroundColor: '#ff6a00',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1.5,
+    borderColor: '#fff',
+  },
+  cartBadgeText: {
+    color: '#fff',
+    fontSize: 9,
+    fontWeight: '800',
+    lineHeight: 11,
+  },
+});

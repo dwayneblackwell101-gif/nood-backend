@@ -2,11 +2,16 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
 import { router } from 'expo-router';
+import {
+  makePushTokenStorageKey,
+  registerPushTokenWithBackend,
+  requestNotificationPermissionAndToken,
+  savePushTokenLocally,
+} from '../utils/push-notifications';
 import { useUser } from './UserContext';
 
 const READ_UPDATES_KEY = 'NOOD_READ_UPDATES_V1';
 const NOTIFICATION_SETTINGS_KEY = 'NOOD_NOTIFICATION_SETTINGS_V1';
-const PUSH_TOKEN_KEY = 'NOOD_EXPO_PUSH_TOKEN_V1';
 
 export type UpdateType = 'deal' | 'app' | 'arrival' | 'reward' | 'shipping' | 'sale' | 'coupon';
 
@@ -131,7 +136,7 @@ export function UpdatesProvider({ children }: { children: React.ReactNode }) {
 
   const readKey = useMemo(() => makeProfileKey(READ_UPDATES_KEY, profileId), [profileId]);
   const settingsKey = useMemo(() => makeProfileKey(NOTIFICATION_SETTINGS_KEY, profileId), [profileId]);
-  const tokenKey = useMemo(() => makeProfileKey(PUSH_TOKEN_KEY, profileId), [profileId]);
+  const tokenKey = useMemo(() => makePushTokenStorageKey(profileId), [profileId]);
   const enabledUpdates = useMemo(
     () =>
       updates
@@ -186,14 +191,24 @@ export function UpdatesProvider({ children }: { children: React.ReactNode }) {
     if (Platform.OS === 'web') return '';
 
     try {
-      setExpoPushToken('');
-      await AsyncStorage.removeItem(tokenKey);
-      return '';
+      const { granted, token } = await requestNotificationPermissionAndToken();
+      if (!granted || !token) {
+        return '';
+      }
+
+      setExpoPushToken(token);
+      await savePushTokenLocally(profileId, token);
+      await registerPushTokenWithBackend({
+        token,
+        userId: profileId || undefined,
+        deviceId: profileId || undefined,
+      });
+      return token;
     } catch (error) {
       console.log('Push notification permission error:', error);
       return '';
     }
-  }, [tokenKey]);
+  }, [profileId]);
 
   const updateNotificationSetting = useCallback(
     async (key: keyof NotificationSettings, value: boolean) => {

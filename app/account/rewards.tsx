@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   AccessibilityInfo,
   Image,
@@ -25,8 +24,20 @@ import Animated, {
 import * as Haptics from 'expo-haptics';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import RequireSignIn from '../../components/RequireSignIn';
 import { useCart } from '../../context/CartContext';
+import { useUser } from '../../context/UserContext';
 import { BASE_CURRENCY } from '../../utils/currency';
+import { resolveCustomerStorageKey } from '../../utils/customer-storage';
+import { getLuckySpinStatus, recordLuckySpinUsage, type LuckySpinStatus } from '../../utils/lucky-spin';
+import { formatGameRewardUsd } from '../../utils/reward-currency';
+import { getScratchCountdownParts } from '../../utils/scratch-countdown';
+import {
+  getScratchEligibility,
+  markScratchPrizeManualOpen,
+  setScratchPopupExternalModalOpen,
+  type ScratchEligibility,
+} from '../../utils/scratch-prize-popup';
 
 type Prize = {
   id: string;
@@ -34,30 +45,17 @@ type Prize = {
   amount: number;
   unlockRequirement: number;
   weight: number;
-  kind: 'reward' | 'try-again';
 };
 
 const PURPLE = '#5c31ff';
 const PURPLE_SOFT = '#9f79ff';
 const ORANGE = '#ff6a00';
-const DAILY_SPIN_KEY = 'NOOD_LUCKY_SPIN_DAILY_LIMIT_V1';
-
 const WHEEL_PRIZES: Prize[] = [
-  { id: 'ttd-1', label: 'TTD $1', amount: 1, unlockRequirement: 25, weight: 38, kind: 'reward' },
-  { id: 'ttd-2', label: 'TTD $2', amount: 2, unlockRequirement: 40, weight: 30, kind: 'reward' },
-  { id: 'ttd-3', label: 'TTD $3', amount: 3, unlockRequirement: 50, weight: 16, kind: 'reward' },
-  { id: 'ttd-5', label: 'TTD $5', amount: 5, unlockRequirement: 75, weight: 8, kind: 'reward' },
-  { id: 'ttd-10', label: 'TTD $10', amount: 10, unlockRequirement: 150, weight: 2, kind: 'reward' },
-  { id: 'try-again', label: '1 more chance', amount: 0, unlockRequirement: 0, weight: 6, kind: 'try-again' },
+  { id: 'usd-5', label: '$5 USD', amount: 5, unlockRequirement: 25, weight: 38 },
+  { id: 'usd-10', label: '$10 USD', amount: 10, unlockRequirement: 40, weight: 30 },
+  { id: 'usd-15', label: '$15 USD', amount: 15, unlockRequirement: 50, weight: 16 },
+  { id: 'usd-20', label: '$20 USD', amount: 20, unlockRequirement: 150, weight: 2 },
 ];
-
-function todayKey() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function formatTtd(amount: number) {
-  return `TTD $${Number(amount || 0).toFixed(0)}`;
-}
 
 function pickPrize() {
   const totalWeight = WHEEL_PRIZES.reduce((sum, prize) => sum + prize.weight, 0);
@@ -110,9 +108,21 @@ function CoinBurst({ active, reducedMotion }: { active: boolean; reducedMotion: 
   );
 }
 
-export default function RewardsScreen() {
+function RewardsContent() {
   const router = useRouter();
+  const { isSignedIn, profileId } = useUser();
   const params = useLocalSearchParams<{ autoSpin?: string }>();
+  const customerKey = useMemo(
+    () => resolveCustomerStorageKey(profileId || '', '', isSignedIn),
+    [isSignedIn, profileId]
+  );
+  const [luckySpinStatus, setLuckySpinStatus] = useState<LuckySpinStatus>({
+    canSpin: true,
+    used: false,
+    luckySpinUsedAt: null,
+    luckySpinRewardAmountUsd: null,
+    source: 'local',
+  });
   const spinRotation = useSharedValue(0);
   const loadingProgress = useSharedValue(0);
   const couponBob = useSharedValue(0);
@@ -136,15 +146,22 @@ export default function RewardsScreen() {
   } = (useCart() as any) || {};
 
   const [modalVisible, setModalVisible] = useState(false);
-  const [modalStep, setModalStep] = useState<'loading' | 'wheel' | 'reveal'>('loading');
+  const [modalStep, setModalStep] = useState<'loading' | 'wheel' | 'reveal' | 'used'>('loading');
+
+  useEffect(() => {
+    setScratchPopupExternalModalOpen(modalVisible);
+    return () => {
+      setScratchPopupExternalModalOpen(false);
+    };
+  }, [modalVisible]);
   const [spinning, setSpinning] = useState(false);
   const [selectedPrize, setSelectedPrize] = useState<Prize | null>(null);
-  const [lastSpinDate, setLastSpinDate] = useState('');
   const [reducedMotion, setReducedMotion] = useState(false);
   const [burstActive, setBurstActive] = useState(false);
+  const [scratchEligibility, setScratchEligibility] = useState<ScratchEligibility | null>(null);
 
-  const today = useMemo(() => todayKey(), []);
-  const canSpinToday = lastSpinDate !== today;
+  const canSpin = isSignedIn && luckySpinStatus.canSpin && !luckySpinStatus.used;
+  const luckySpinUsed = luckySpinStatus.used || !luckySpinStatus.canSpin;
 
   const activeLockedRewards = useMemo(
     () => (Array.isArray(lockedRewards) ? lockedRewards : []).filter((reward: any) => reward?.status === 'locked'),
@@ -198,18 +215,62 @@ export default function RewardsScreen() {
   }, [refreshLockedRewards]);
 
   useEffect(() => {
+    let mounted = true;
+
+    void getScratchEligibility(isSignedIn ? profileId : undefined).then((status) => {
+      if (mounted) {
+        setScratchEligibility(status);
+      }
+    });
+
+    return () => {
+      mounted = false;
+    };
+  }, [isSignedIn, profileId]);
+
+  const scratchTokenReady = Boolean(
+    scratchEligibility?.canPlay && (scratchEligibility?.scratchTokens || 0) > 0
+  );
+  const scratchCountdown = useMemo(
+    () => getScratchCountdownParts(scratchEligibility?.completedAt),
+    [scratchEligibility?.completedAt]
+  );
+  const scratchBadgeLabel = scratchTokenReady
+    ? '1 token ready'
+    : scratchCountdown
+      ? `Next in ${Math.max(scratchCountdown.days, 1)} day${scratchCountdown.days === 1 ? '' : 's'}`
+      : 'Next in 14 days';
+
+  useEffect(() => {
     AccessibilityInfo.isReduceMotionEnabled().then(setReducedMotion).catch(() => setReducedMotion(false));
     const subscription = AccessibilityInfo.addEventListener?.('reduceMotionChanged', setReducedMotion);
     return () => subscription?.remove?.();
   }, []);
 
   useEffect(() => {
-    AsyncStorage.getItem(DAILY_SPIN_KEY)
-      .then((value) => {
-        if (value) setLastSpinDate(value);
-      })
-      .catch(() => undefined);
-  }, []);
+    if (!customerKey) {
+      setLuckySpinStatus({
+        canSpin: false,
+        used: false,
+        luckySpinUsedAt: null,
+        luckySpinRewardAmountUsd: null,
+        source: 'local',
+      });
+      return;
+    }
+
+    let mounted = true;
+
+    void getLuckySpinStatus(isSignedIn ? profileId : '', customerKey).then((status) => {
+      if (mounted) {
+        setLuckySpinStatus(status);
+      }
+    });
+
+    return () => {
+      mounted = false;
+    };
+  }, [customerKey, isSignedIn, profileId]);
 
   useEffect(() => {
     progressWidth.value = withTiming(leadProgress, {
@@ -259,12 +320,18 @@ export default function RewardsScreen() {
     transform: [{ scale: pointerPulse.value }],
   }));
 
-  const consumeDailySpin = useCallback(async () => {
-    await AsyncStorage.setItem(DAILY_SPIN_KEY, today);
-    setLastSpinDate(today);
-  }, [today]);
-
   const openLuckySpin = useCallback(() => {
+    if (!isSignedIn) {
+      return;
+    }
+
+    if (luckySpinUsed) {
+      spinClosedRef.current = false;
+      setModalStep('used');
+      setModalVisible(true);
+      return;
+    }
+
     spinClosedRef.current = false;
     setSelectedPrize(null);
     setModalStep('loading');
@@ -282,20 +349,20 @@ export default function RewardsScreen() {
       },
       reducedMotion ? 420 : 1520
     );
-  }, [loadingProgress, reducedMotion]);
+  }, [isSignedIn, loadingProgress, reducedMotion, luckySpinUsed]);
 
   useEffect(() => {
-    if (autoOpenedRef.current || params.autoSpin !== '1') return;
+    if (!isSignedIn || autoOpenedRef.current || params.autoSpin !== '1') return;
 
     autoOpenedRef.current = true;
     const timer = setTimeout(() => {
-      if (canSpinToday) {
+      if (canSpin) {
         openLuckySpin();
       }
     }, 350);
 
     return () => clearTimeout(timer);
-  }, [canSpinToday, openLuckySpin, params.autoSpin]);
+  }, [canSpin, isSignedIn, openLuckySpin, params.autoSpin]);
 
   const closeSpinModal = useCallback(() => {
     spinClosedRef.current = true;
@@ -313,16 +380,42 @@ export default function RewardsScreen() {
   }, []);
 
   const startSpin = useCallback(async () => {
-    if (!canSpinToday || spinning) return;
+    if (!isSignedIn || !canSpin || spinning || !customerKey) return;
 
-    const prize = pickPrize();
+    setSpinning(true);
+    setSelectedPrize(null);
+
+    let recorded: Awaited<ReturnType<typeof recordLuckySpinUsage>>;
+
+    try {
+      recorded = await recordLuckySpinUsage(profileId, customerKey);
+      setLuckySpinStatus((current) => ({
+        ...current,
+        used: true,
+        canSpin: false,
+        luckySpinUsedAt: new Date().toISOString(),
+        luckySpinRewardAmountUsd: recorded.prizeAmountUsd ?? current.luckySpinRewardAmountUsd,
+        source: recorded.source,
+      }));
+    } catch {
+      setSpinning(false);
+      setModalStep('used');
+      setLuckySpinStatus((current) => ({
+        ...current,
+        used: true,
+        canSpin: false,
+      }));
+      return;
+    }
+
+    const prize =
+      (recorded.prizeAmountUsd != null
+        ? WHEEL_PRIZES.find((item) => item.amount === recorded.prizeAmountUsd)
+        : null) || pickPrize();
     const prizeIndex = WHEEL_PRIZES.findIndex((item) => item.id === prize.id);
     const slice = 360 / WHEEL_PRIZES.length;
     const target = 360 * 7 + (360 - prizeIndex * slice) + slice / 2;
 
-    setSpinning(true);
-    setSelectedPrize(null);
-    await consumeDailySpin();
     void haptic();
 
     spinRotation.value = 0;
@@ -343,25 +436,22 @@ export default function RewardsScreen() {
         setSpinning(false);
         setSelectedPrize(prize);
 
-        if (prize.kind === 'reward') {
-          addLockedReward?.(prize.amount, prize.unlockRequirement, 'Lucky Spin reward', 48);
-          refreshLockedRewards?.();
-          setBurstActive(true);
-          void haptic('success');
-          setTimeout(() => setBurstActive(false), reducedMotion ? 700 : 1800);
-        } else {
-          void haptic();
-        }
-
+        addLockedReward?.(prize.amount, prize.unlockRequirement, 'Lucky Spin reward', 48);
+        refreshLockedRewards?.();
+        setBurstActive(true);
+        void haptic('success');
+        setTimeout(() => setBurstActive(false), reducedMotion ? 700 : 1800);
         setModalStep('reveal');
       },
       reducedMotion ? 1000 : 4350
     );
   }, [
     addLockedReward,
-    canSpinToday,
-    consumeDailySpin,
+    canSpin,
+    customerKey,
+    isSignedIn,
     pointerPulse,
+    profileId,
     reducedMotion,
     refreshLockedRewards,
     spinRotation,
@@ -403,12 +493,16 @@ export default function RewardsScreen() {
               <Text style={styles.heroStatValuePurple}>{lockedBalanceFormatted}</Text>
               <Text style={styles.heroStatLabelDark}>Locked balance</Text>
             </View>
-            <View style={styles.heroStatLight}>
+            <TouchableOpacity
+              style={styles.heroStatLight}
+              activeOpacity={0.9}
+              onPress={() => router.push('/account/wallet' as any)}
+            >
               <Text style={styles.heroStatValueOrange}>
                 {formatMoney?.(Number(balanceConverted || balance || 0), selectedCurrency) || '$0.00'}
               </Text>
               <Text style={styles.heroStatLabelLight}>Wallet</Text>
-            </View>
+            </TouchableOpacity>
           </View>
 
           <View style={styles.ruleRow}>
@@ -441,6 +535,59 @@ export default function RewardsScreen() {
           </Text>
         </View>
 
+        <View style={styles.challengeCard}>
+          <View style={styles.challengeGlow} />
+          <View style={styles.challengeTopRow}>
+            <View style={styles.challengeIcon}>
+              <Ionicons name="people" size={24} color="#fff" />
+            </View>
+            <View style={styles.challengeTitleWrap}>
+              <Text style={styles.challengeKicker}>Verified actions only</Text>
+              <Text style={styles.challengeTitle}>Special Reward Challenge</Text>
+              <Text style={styles.challengeCopy}>Invite, share, and unlock NOOD Balance</Text>
+            </View>
+          </View>
+
+          <TouchableOpacity
+            style={styles.challengePlayButton}
+            activeOpacity={0.9}
+            onPress={() => {
+              markScratchPrizeManualOpen();
+              router.push('/account/special-reward-challenge' as any);
+            }}
+          >
+            <Text style={styles.challengePlayButtonText}>Play</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.scratchCard}>
+          <View style={styles.scratchGlow} />
+          <View style={styles.scratchTopRow}>
+            <View style={styles.scratchIcon}>
+              <Ionicons name="layers-outline" size={24} color="#fff" />
+            </View>
+            <View style={styles.scratchTitleWrap}>
+              <Text style={styles.scratchKicker}>NOOD mini-game</Text>
+              <Text style={styles.scratchTitle}>Scratch Prize</Text>
+              <Text style={styles.scratchCopy}>Scratch and reveal your NOOD reward</Text>
+            </View>
+            <View style={styles.scratchBadge}>
+              <Text style={styles.scratchBadgeText}>{scratchBadgeLabel}</Text>
+            </View>
+          </View>
+
+          <TouchableOpacity
+            style={styles.scratchPlayButton}
+            activeOpacity={0.9}
+            onPress={() => {
+              markScratchPrizeManualOpen();
+              router.push('/scratch-prize' as any);
+            }}
+          >
+            <Text style={styles.scratchPlayButtonText}>Play</Text>
+          </TouchableOpacity>
+        </View>
+
         <View style={styles.luckyCard}>
           <View style={styles.luckyGlow} />
           <View style={styles.luckyTopRow}>
@@ -448,9 +595,11 @@ export default function RewardsScreen() {
               <Ionicons name="sparkles" size={25} color="#fff" />
             </View>
             <View style={styles.luckyTitleWrap}>
-              <Text style={styles.luckyKicker}>One free spin per day</Text>
+              <Text style={styles.luckyKicker}>One free spin per account</Text>
               <Text style={styles.luckyTitle}>Lucky Spin Wheel</Text>
-              <Text style={styles.luckyCopy}>Win TTD $1-$10 locked store credit. TTD $10 is rare.</Text>
+              <Text style={styles.luckyCopy}>
+                Use your one-time Lucky Spin to unlock NOOD store credit.
+              </Text>
             </View>
           </View>
 
@@ -463,12 +612,12 @@ export default function RewardsScreen() {
           </View>
 
           <TouchableOpacity
-            style={[styles.openSpinButton, !canSpinToday && styles.openSpinButtonDisabled]}
+            style={[styles.openSpinButton, luckySpinUsed && styles.openSpinButtonDisabled]}
             activeOpacity={0.9}
             onPress={openLuckySpin}
           >
             <Text style={styles.openSpinButtonText}>
-              {canSpinToday ? 'Lucky Spin' : 'Spin again tomorrow'}
+              {canSpin ? 'Lucky Spin' : 'Lucky Spin Used'}
             </Text>
           </TouchableOpacity>
         </View>
@@ -501,7 +650,7 @@ export default function RewardsScreen() {
                   <View style={styles.lockedRewardHeader}>
                     <View>
                       <Text style={styles.lockedRewardAmount}>
-                        {formatTtd(Number(reward?.amount || 0))}
+                        {formatGameRewardUsd(Number(reward?.amount || 0))}
                       </Text>
                       <Text style={styles.lockedRewardNote}>{reward?.note || 'Locked reward'}</Text>
                     </View>
@@ -513,16 +662,17 @@ export default function RewardsScreen() {
                   </View>
 
                   <Text style={styles.lockedRewardMeta}>
-                    {formatTtd(Number(reward?.totalSpentTowardsUnlock || 0))} / {formatTtd(Number(reward?.unlockRequirement || 0))}
+                    {formatGameRewardUsd(Number(reward?.totalSpentTowardsUnlock || 0))} /{' '}
+                    {formatGameRewardUsd(Number(reward?.unlockRequirement || 0))}
                   </Text>
                   <Text style={styles.lockedRewardHint}>
-                    Spend {formatTtd(rewardSpendLeft)} more to unlock
+                    Spend {formatGameRewardUsd(rewardSpendLeft)} more to unlock
                   </Text>
                 </View>
               );
             })
           ) : (
-            <Text style={styles.emptyCopy}>No active locked rewards yet. Spin once today to start.</Text>
+            <Text style={styles.emptyCopy}>No active locked rewards yet. Use your one-time Lucky Spin to start.</Text>
           )}
         </View>
 
@@ -547,7 +697,9 @@ export default function RewardsScreen() {
                   <Ionicons name="checkmark" size={15} color={PURPLE} />
                 </View>
                 <View style={styles.statusTextWrap}>
-                  <Text style={styles.statusTitle}>{formatTtd(Number(reward?.amount || 0))} moved to wallet</Text>
+                  <Text style={styles.statusTitle}>
+                    {formatGameRewardUsd(Number(reward?.amount || 0))} moved to wallet
+                  </Text>
                   <Text style={styles.statusMeta}>{reward?.note || 'Unlocked reward'}</Text>
                 </View>
               </View>
@@ -565,7 +717,9 @@ export default function RewardsScreen() {
                     <Ionicons name="close" size={15} color="#a76009" />
                   </View>
                   <View style={styles.statusTextWrap}>
-                    <Text style={styles.statusTitle}>{formatTtd(Number(reward?.amount || 0))} expired</Text>
+                    <Text style={styles.statusTitle}>
+                      {formatGameRewardUsd(Number(reward?.amount || 0))} expired
+                    </Text>
                     <Text style={styles.statusMeta}>The unlock goal was not reached in time.</Text>
                   </View>
                 </View>
@@ -634,34 +788,43 @@ export default function RewardsScreen() {
               </View>
 
               <TouchableOpacity
-                style={[styles.spinButton, (!canSpinToday || spinning) && styles.spinButtonDisabled]}
+                style={[styles.spinButton, (!canSpin || spinning) && styles.spinButtonDisabled]}
                 activeOpacity={0.9}
-                disabled={!canSpinToday || spinning}
+                disabled={!canSpin || spinning}
                 onPress={() => void startSpin()}
               >
-                <Text style={styles.spinButtonText}>
-                  {spinning ? 'Spinning...' : canSpinToday ? 'Spin' : 'Spin again tomorrow'}
-                </Text>
+                <Text style={styles.spinButtonText}>{spinning ? 'Spinning...' : 'Spin'}</Text>
               </TouchableOpacity>
               <Text style={styles.qualifyingText}>Reward is provided for qualifying orders only.</Text>
+            </View>
+          ) : null}
+
+          {modalStep === 'used' ? (
+            <View style={styles.revealCard}>
+              <View style={styles.revealGlow} />
+              <Text style={styles.revealKicker}>Lucky Spin</Text>
+              <Text style={styles.revealTitle}>Lucky Spin Used</Text>
+              <Text style={styles.revealCopy}>
+                You already used your Lucky Spin reward for this account.
+              </Text>
+              <View style={styles.revealActions}>
+                <TouchableOpacity style={styles.revealSecondary} activeOpacity={0.9} onPress={viewRewards}>
+                  <Text style={styles.revealSecondaryText}>View Rewards</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.revealPrimary} activeOpacity={0.9} onPress={continueShopping}>
+                  <Text style={styles.revealPrimaryText}>Shop Now</Text>
+                </TouchableOpacity>
+              </View>
             </View>
           ) : null}
 
           {modalStep === 'reveal' && selectedPrize ? (
             <View style={styles.revealCard}>
               <View style={styles.revealGlow} />
-              <Text style={styles.revealKicker}>
-                {selectedPrize.kind === 'reward' ? 'Locked reward added' : 'Lucky Spin'}
-              </Text>
-              <Text style={styles.revealTitle}>
-                {selectedPrize.kind === 'reward'
-                  ? `You won ${selectedPrize.label} locked reward`
-                  : 'Try again tomorrow'}
-              </Text>
+              <Text style={styles.revealKicker}>Locked reward added</Text>
+              <Text style={styles.revealTitle}>You won {selectedPrize.label} locked reward</Text>
               <Text style={styles.revealCopy}>
-                {selectedPrize.kind === 'reward'
-                  ? `Spend ${formatTtd(selectedPrize.unlockRequirement)} to unlock`
-                  : 'No reward was added this spin.'}
+                Spend {formatGameRewardUsd(selectedPrize.unlockRequirement)} to unlock
               </Text>
               <View style={styles.revealActions}>
                 <TouchableOpacity style={styles.revealSecondary} activeOpacity={0.9} onPress={continueShopping}>
@@ -847,6 +1010,161 @@ const styles = StyleSheet.create({
     color: '#444',
     fontSize: 13,
     fontWeight: '800',
+  },
+  challengeCard: {
+    backgroundColor: '#2a1578',
+    borderRadius: 24,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(159, 121, 255, 0.45)',
+    marginBottom: 16,
+    overflow: 'hidden',
+  },
+  challengeGlow: {
+    position: 'absolute',
+    top: -30,
+    right: -20,
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    backgroundColor: 'rgba(255, 106, 0, 0.18)',
+  },
+  challengeTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+  },
+  challengeIcon: {
+    width: 54,
+    height: 54,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.14)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+  },
+  challengeTitleWrap: {
+    flex: 1,
+  },
+  challengeKicker: {
+    color: 'rgba(255,255,255,0.72)',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  challengeTitle: {
+    marginTop: 4,
+    color: '#fff',
+    fontSize: 20,
+    fontWeight: '900',
+  },
+  challengeCopy: {
+    marginTop: 4,
+    color: 'rgba(255,255,255,0.86)',
+    fontSize: 13,
+    fontWeight: '700',
+    lineHeight: 19,
+  },
+  challengePlayButton: {
+    marginTop: 16,
+    minHeight: 54,
+    borderRadius: 18,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  challengePlayButtonText: {
+    color: '#2a1578',
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  scratchCard: {
+    backgroundColor: '#0B0B0F',
+    borderRadius: 26,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(255,106,0,0.35)',
+    overflow: 'hidden',
+    marginBottom: 16,
+  },
+  scratchGlow: {
+    position: 'absolute',
+    right: -30,
+    top: -40,
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    backgroundColor: 'rgba(255,106,0,0.2)',
+  },
+  scratchTopRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+  },
+  scratchIcon: {
+    width: 54,
+    height: 54,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255,106,0,0.22)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,176,0,0.35)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  scratchTitleWrap: {
+    flex: 1,
+    paddingTop: 2,
+  },
+  scratchKicker: {
+    color: 'rgba(255,176,0,0.9)',
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 0.7,
+    textTransform: 'uppercase',
+  },
+  scratchTitle: {
+    marginTop: 4,
+    color: '#fff',
+    fontSize: 20,
+    fontWeight: '900',
+  },
+  scratchCopy: {
+    marginTop: 4,
+    color: 'rgba(255,255,255,0.72)',
+    fontSize: 13,
+    fontWeight: '700',
+    lineHeight: 18,
+  },
+  scratchBadge: {
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+  },
+  scratchBadgeText: {
+    color: '#FFB000',
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 0.2,
+  },
+  scratchPlayButton: {
+    marginTop: 16,
+    minHeight: 54,
+    borderRadius: 18,
+    backgroundColor: ORANGE,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255,176,0,0.35)',
+  },
+  scratchPlayButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '900',
   },
   luckyCard: {
     backgroundColor: '#17112c',
@@ -1354,3 +1672,16 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
 });
+
+export default function RewardsScreen() {
+  return (
+    <RequireSignIn
+      feature="rewards"
+      title="Sign in to view rewards"
+      subtitle="Points, perks, and spin rewards are available after you sign in."
+      icon="gift-outline"
+    >
+      <RewardsContent />
+    </RequireSignIn>
+  );
+}

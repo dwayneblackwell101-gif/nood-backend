@@ -1,6 +1,12 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export const BASE_CURRENCY = 'USD';
+/** Shopify catalog prices are always stored and shown in USD. */
+export const CATALOG_CURRENCY = BASE_CURRENCY;
+
+export function normalizeCatalogCurrencyCode(_currency?: string) {
+  return CATALOG_CURRENCY;
+}
 const RATE_CACHE_KEY = 'NOOD_EXCHANGE_RATES_USD_V1';
 const RATE_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 

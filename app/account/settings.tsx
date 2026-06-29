@@ -11,8 +11,10 @@ import {
 } from 'react-native';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { useRouter } from 'expo-router';
+import { useHistoryEvents } from '../../context/HistoryContext';
 import { useUser } from '../../context/UserContext';
 import { useUpdates } from '../../context/UpdatesContext';
+import NoodDialogShell from '../../components/NoodDialogShell';
 import NoodSpinner from '../../components/NoodSpinner';
 
 type PickerModalProps = {
@@ -33,42 +35,40 @@ function PickerModal({
   onSelect,
 }: PickerModalProps) {
   return (
-    <Modal visible={visible} animationType="slide" transparent>
-      <View style={styles.modalOverlay}>
-        <View style={styles.modalCard}>
-          <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>{title}</Text>
-            <TouchableOpacity onPress={onClose}>
-              <Ionicons name="close" size={24} color="#111" />
-            </TouchableOpacity>
-          </View>
-
-          <ScrollView showsVerticalScrollIndicator={false}>
-            {options.map((item) => {
-              const active = item.value === selectedValue;
-
-              return (
-                <TouchableOpacity
-                  key={item.value}
-                  style={[styles.optionRow, active && styles.optionRowActive]}
-                  onPress={() => {
-                    onSelect(item.value);
-                    onClose();
-                  }}
-                >
-                  <Text style={[styles.optionText, active && styles.optionTextActive]}>
-                    {item.label}
-                  </Text>
-
-                  {active ? (
-                    <Ionicons name="checkmark" size={20} color="#ff6a00" />
-                  ) : null}
-                </TouchableOpacity>
-              );
-            })}
-          </ScrollView>
+    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+      <NoodDialogShell placement="bottom" onBackdropPress={onClose} cardStyle={styles.modalCard}>
+        <View style={styles.modalHeader}>
+          <Text style={styles.modalTitle}>{title}</Text>
+          <TouchableOpacity onPress={onClose}>
+            <Ionicons name="close" size={24} color="#6f5a4e" />
+          </TouchableOpacity>
         </View>
-      </View>
+
+        <ScrollView showsVerticalScrollIndicator={false}>
+          {options.map((item) => {
+            const active = item.value === selectedValue;
+
+            return (
+              <TouchableOpacity
+                key={item.value}
+                style={[styles.optionRow, active && styles.optionRowActive]}
+                onPress={() => {
+                  onSelect(item.value);
+                  onClose();
+                }}
+              >
+                <Text style={[styles.optionText, active && styles.optionTextActive]}>
+                  {item.label}
+                </Text>
+
+                {active ? (
+                  <Ionicons name="checkmark" size={20} color="#ff6a00" />
+                ) : null}
+              </TouchableOpacity>
+            );
+          })}
+        </ScrollView>
+      </NoodDialogShell>
     </Modal>
   );
 }
@@ -88,6 +88,7 @@ export default function SettingsScreen() {
     availableCurrencies,
     availableLanguages,
   } = useUser();
+  const { addHistoryEvent } = useHistoryEvents();
   const {
     notificationSettings,
     expoPushToken,
@@ -110,6 +111,12 @@ export default function SettingsScreen() {
   };
 
   const handleSignOut = async () => {
+    await addHistoryEvent({
+      type: 'account',
+      title: 'Signed out',
+      description: 'Customer signed out of NOOD on this device.',
+      status: 'signed-out',
+    });
     await signOut();
     router.replace('/(tabs)/account');
   };
@@ -233,6 +240,16 @@ export default function SettingsScreen() {
             disabled={!notificationSettings.notificationsEnabled}
             onValueChange={(value) => void updateNotificationSetting('shippingAlerts', value)}
           />
+
+          <TouchableOpacity
+            style={styles.updatesLinkBtn}
+            activeOpacity={0.9}
+            onPress={() => router.push('/account/updates' as any)}
+          >
+            <Ionicons name="notifications-outline" size={18} color="#ff6a00" />
+            <Text style={styles.updatesLinkText}>Open NOOD updates inbox</Text>
+            <Ionicons name="chevron-forward" size={18} color="#999" />
+          </TouchableOpacity>
         </View>
 
         {isSignedIn ? (
@@ -445,17 +462,26 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     fontSize: 16,
   },
-  modalOverlay: {
+  updatesLinkBtn: {
+    marginTop: 4,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#f2c7ab',
+    borderRadius: 18,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  updatesLinkText: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.35)',
-    justifyContent: 'flex-end',
+    marginLeft: 10,
+    color: '#111',
+    fontSize: 15,
+    fontWeight: '800',
   },
   modalCard: {
-    backgroundColor: '#fff',
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    maxHeight: '70%',
-    padding: 16,
+    paddingBottom: 8,
   },
   modalHeader: {
     flexDirection: 'row',

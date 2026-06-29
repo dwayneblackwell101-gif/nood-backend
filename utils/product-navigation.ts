@@ -1,3 +1,9 @@
+import {
+  getFirstPurchasableVariant,
+  getVariantNodes,
+  logProductStockState,
+} from './product-availability';
+
 export type ProductPreviewPayload = {
   id?: string;
   handle: string;
@@ -11,6 +17,9 @@ export type ProductPreviewPayload = {
   description?: string;
   variantId?: string;
   variantTitle?: string;
+  variants?: { edges?: any[] };
+  images?: { edges?: any[] };
+  media?: { edges?: any[] };
   availableForSale?: boolean;
   collectionHandles?: string[];
 };
@@ -54,6 +63,9 @@ export function productPreviewFromGridItem(item: any): ProductPreviewPayload | n
     description: item?.description ? String(item.description) : undefined,
     variantId: item?.variantId ? String(item.variantId) : undefined,
     variantTitle: item?.variantTitle ? String(item.variantTitle) : undefined,
+    variants: item?.variants?.edges?.length ? item.variants : undefined,
+    images: item?.images?.edges?.length ? item.images : undefined,
+    media: item?.media?.edges?.length ? item.media : undefined,
     availableForSale: item?.availableForSale !== false,
     collectionHandles: Array.isArray(item?.collectionHandles)
       ? item.collectionHandles.filter(Boolean)
@@ -61,15 +73,36 @@ export function productPreviewFromGridItem(item: any): ProductPreviewPayload | n
   });
 }
 
+export function productHasRenderableVariants(productData: any) {
+  return (productData?.variants?.edges || []).some((edge: any) =>
+    (edge?.node?.selectedOptions || []).some(
+      (option: any) => String(option?.name || '').trim() && String(option?.value || '').trim()
+    )
+  );
+}
+
 export function buildProductRouteParams(
   item: any,
   extra: Record<string, string> = {}
 ): Record<string, string> {
   const preview = productPreviewFromGridItem(item);
+  const handle = preview?.handle || String(item?.handle || '').trim();
+  if (handle) {
+    void import('./product-data').then((mod) => {
+      mod.prefetchProductDetailOnPress(handle);
+    });
+    console.log('[NOOD product] card pressed', {
+      handle,
+      id: preview?.id || item?.id || null,
+      from: extra.from || null,
+      hasPreview: Boolean(preview),
+    });
+  }
+
   if (!preview) {
     return {
       ...extra,
-      handle: String(item?.handle || '').trim(),
+      handle,
     };
   }
 
@@ -102,7 +135,7 @@ export function parseProductPreviewFromParams(
 
 export function buildProductDetailFromPreview(preview: ProductPreviewPayload) {
   const imageUrl = String(preview.image || '').trim();
-  const currencyCode = preview.currencyCode || 'TTD';
+  const currencyCode = preview.currencyCode || 'USD';
   const priceAmount = Number(preview.priceAmount || 0);
   const collectionHandles = Array.isArray(preview.collectionHandles)
     ? preview.collectionHandles
@@ -118,10 +151,10 @@ export function buildProductDetailFromPreview(preview: ProductPreviewPayload) {
     tags: [],
     availableForSale: preview.availableForSale !== false,
     featuredImage: imageUrl ? { url: imageUrl } : null,
-    images: imageUrl
+    images: preview.images || (imageUrl
       ? { edges: [{ node: { url: imageUrl, altText: null } }] }
-      : { edges: [] },
-    media: { edges: [] },
+      : { edges: [] }),
+    media: preview.media || { edges: [] },
     priceRange: {
       minVariantPrice: {
         amount: String(priceAmount),
@@ -145,7 +178,9 @@ export function buildProductDetailFromPreview(preview: ProductPreviewPayload) {
         },
       })),
     },
-    variants: preview.variantId
+    variants: preview.variants?.edges?.length
+      ? preview.variants
+      : preview.variantId
       ? {
           edges: [
             {
@@ -169,10 +204,13 @@ export function buildProductDetailFromPreview(preview: ProductPreviewPayload) {
 export function applyProductVariantState(
   productData: any,
   setSelectedVariant: (variant: any) => void,
-  setSelectedOptionsMap: (options: Record<string, string>) => void
+  setSelectedOptionsMap: (options: Record<string, string>) => void,
+  source: 'detail' | 'preview' | 'cache' = 'detail'
 ) {
-  if (productData?.variants?.edges?.length) {
-    const initialVariant = productData.variants.edges[0].node;
+  const variantNodes = getVariantNodes(productData);
+
+  if (variantNodes.length) {
+    const initialVariant = getFirstPurchasableVariant(variantNodes);
     setSelectedVariant(initialVariant);
     setSelectedOptionsMap(
       Object.fromEntries(
@@ -182,9 +220,11 @@ export function applyProductVariantState(
         ])
       )
     );
+    logProductStockState(productData, source, { selectedVariant: initialVariant });
     return;
   }
 
   setSelectedVariant(null);
   setSelectedOptionsMap({});
+  logProductStockState(productData, source);
 }
