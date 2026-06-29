@@ -72,6 +72,7 @@ const DEFAULT_MENU_HANDLES = [
 
 const SYNC_STALE_MS = 3 * 60 * 1000;
 const INTER_PAGE_DELAY_MS = 400;
+const AUTO_RESUME_DELAY_MS = 750;
 const MAX_CHUNK_PAGES = 50;
 const MAX_PAGE_SIZE = 50;
 const CHUNK_COMPLETE_MESSAGE = 'chunk complete, resume required';
@@ -161,21 +162,343 @@ function resolveSyncPhase(state, resume, options = {}) {
   return state.phase || 'products';
 }
 
+function resolveProductPreviewImageUrl(productNode) {
+  const featuredImageUrl = safeString(productNode?.featuredImage?.url);
+  if (featuredImageUrl) {
+    return featuredImageUrl;
+  }
+
+  const previewEdges = productNode?.images?.edges || [];
+  for (const edge of previewEdges) {
+    const imageUrl = safeString(edge?.node?.url);
+    if (imageUrl) {
+      return imageUrl;
+    }
+  }
+
+  return '';
+}
+
+function resolveCollectionImageFromAdminPreview(adminCollection) {
+  const collectionImageUrl = safeString(adminCollection?.image?.url);
+  if (collectionImageUrl) {
+    return { imageUrl: collectionImageUrl, imageSource: 'collection' };
+  }
+
+  const productEdges = adminCollection?.products?.edges || [];
+  for (const edge of productEdges) {
+    const productImageUrl = resolveProductPreviewImageUrl(edge?.node);
+    if (productImageUrl) {
+      return { imageUrl: productImageUrl, imageSource: 'product' };
+    }
+  }
+
+  return { imageUrl: '', imageSource: 'fallback' };
+}
+
 function normalizeCollection(adminCollection) {
   const productHandles = (adminCollection?.products?.edges || [])
     .map((edge) => safeString(edge?.node?.handle))
     .filter(Boolean);
+  const resolved = resolveCollectionImageFromAdminPreview(adminCollection);
 
   return {
     id: adminCollection.id,
     title: safeString(adminCollection.title),
     handle: safeString(adminCollection.handle),
-    image: adminCollection?.image?.url
-      ? { url: adminCollection.image.url }
-      : null,
+    image: resolved.imageUrl ? { url: resolved.imageUrl } : null,
+    imageUrl: resolved.imageUrl,
+    previewImage: resolved.imageUrl || null,
+    imageSource: resolved.imageSource,
     productHandles,
     updatedAt: new Date().toISOString(),
   };
+}
+
+async function resolveCollectionImageFromCache(cache, collection) {
+  const collectionImageUrl = safeString(collection?.image?.url);
+  if (collectionImageUrl) {
+    return { imageUrl: collectionImageUrl, imageSource: 'collection' };
+  }
+
+  const displayImageUrl = safeString(collection?.displayImage);
+  if (displayImageUrl) {
+    return { imageUrl: displayImageUrl, imageSource: 'displayImage' };
+  }
+
+  const fallbackImageUrl = safeString(collection?.fallbackImage);
+  if (fallbackImageUrl) {
+    return { imageUrl: fallbackImageUrl, imageSource: 'fallbackImage' };
+  }
+
+  const existingUrl = safeString(collection?.imageUrl);
+  if (existingUrl) {
+    return {
+      imageUrl: existingUrl,
+      imageSource: safeString(collection?.imageSource) || 'cache',
+    };
+  }
+
+  for (const handle of (collection.productHandles || []).slice(0, 24)) {
+    const product = await cache.getProduct(handle);
+    const productImageUrl = safeString(product?.featuredImage?.url);
+    if (productImageUrl) {
+      return { imageUrl: productImageUrl, imageSource: 'product' };
+    }
+
+    const imageEdges = product?.images?.edges || [];
+    for (const edge of imageEdges) {
+      const imageUrl = safeString(edge?.node?.url);
+      if (imageUrl) {
+        return { imageUrl, imageSource: 'product' };
+      }
+    }
+  }
+
+  return { imageUrl: '', imageSource: 'fallback' };
+}
+
+async function enrichCollectionImageUrl(cache, collection, adminCollection) {
+  const adminResolved = resolveCollectionImageFromAdminPreview(adminCollection);
+  if (adminResolved.imageUrl) {
+    collection.imageUrl = adminResolved.imageUrl;
+    collection.previewImage = adminResolved.imageUrl;
+    collection.imageSource = adminResolved.imageSource;
+    collection.image = { url: adminResolved.imageUrl };
+    return collection;
+  }
+
+  const cacheResolved = await resolveCollectionImageFromCache(cache, collection);
+  if (cacheResolved.imageUrl) {
+    collection.imageUrl = cacheResolved.imageUrl;
+    collection.previewImage = cacheResolved.imageUrl;
+    collection.imageSource = cacheResolved.imageSource;
+    collection.image = { url: cacheResolved.imageUrl };
+    return collection;
+  }
+
+  collection.imageUrl = '';
+  collection.previewImage = null;
+  collection.imageSource = 'fallback';
+  return collection;
+}
+
+function normalizeCollectionMatchKey(value) {
+  return safeString(value).toLowerCase().replace(/^#/, '').trim();
+}
+
+function getProductCollectionKeysForReconcile(product) {
+  const keys = new Set();
+
+  for (const handle of Array.isArray(product?.collectionHandles) ? product.collectionHandles : []) {
+    const key = normalizeCollectionMatchKey(handle);
+    if (key) {
+      keys.add(key);
+    }
+  }
+
+  for (const edge of product?.collections?.edges || []) {
+    const handle = normalizeCollectionMatchKey(edge?.node?.handle);
+    const title = normalizeCollectionMatchKey(edge?.node?.title);
+    if (handle) {
+      keys.add(handle);
+    }
+    if (title) {
+      keys.add(title);
+    }
+  }
+
+  return keys;
+}
+
+function collectionMatchKeysForReconcile(collection) {
+  const keys = new Set();
+  const handle = normalizeCollectionMatchKey(collection?.handle);
+  const title = normalizeCollectionMatchKey(collection?.title);
+
+  if (handle) {
+    keys.add(handle);
+    if (handle.endsWith('-1')) {
+      keys.add(handle.slice(0, -2));
+    }
+    if (handle.endsWith('-2')) {
+      keys.add(handle.slice(0, -2));
+    }
+  }
+
+  if (title) {
+    keys.add(title);
+  }
+
+  return keys;
+}
+
+function registerProductHandleOnReconcileIndex(index, key, productHandle) {
+  const normalizedKey = normalizeCollectionMatchKey(key);
+  if (!normalizedKey) {
+    return;
+  }
+
+  if (!index.has(normalizedKey)) {
+    index.set(normalizedKey, []);
+  }
+
+  const bucket = index.get(normalizedKey);
+  if (!bucket.includes(productHandle)) {
+    bucket.push(productHandle);
+  }
+
+  if (normalizedKey.endsWith('-1')) {
+    registerProductHandleOnReconcileIndex(index, normalizedKey.slice(0, -2), productHandle);
+  }
+
+  if (normalizedKey.endsWith('-2')) {
+    registerProductHandleOnReconcileIndex(index, normalizedKey.slice(0, -2), productHandle);
+  }
+}
+
+function buildProductHandlesByCollectionKey(products = []) {
+  const index = new Map();
+
+  for (const product of products) {
+    const productHandle = safeString(product?.handle);
+    if (!productHandle) {
+      continue;
+    }
+
+    if (safeString(product?.status).toUpperCase() === 'ARCHIVED') {
+      continue;
+    }
+
+    for (const key of getProductCollectionKeysForReconcile(product)) {
+      registerProductHandleOnReconcileIndex(index, key, productHandle);
+    }
+  }
+
+  return index;
+}
+
+function resolveCollectionHandlesFromIndex(collection, index) {
+  const matchKeys = collectionMatchKeysForReconcile(collection);
+  const merged = [];
+  const seen = new Set();
+
+  for (const existing of Array.isArray(collection?.productHandles) ? collection.productHandles : []) {
+    const handle = safeString(existing);
+    if (handle && !seen.has(handle)) {
+      seen.add(handle);
+      merged.push(handle);
+    }
+  }
+
+  for (const key of matchKeys) {
+    for (const handle of index.get(key) || []) {
+      if (!seen.has(handle)) {
+        seen.add(handle);
+        merged.push(handle);
+      }
+    }
+  }
+
+  return merged;
+}
+
+async function reconcileCollectionProductHandlesFromProducts(cache) {
+  const products =
+    typeof cache.getAllProducts === 'function' ? await cache.getAllProducts() : [];
+  const collections =
+    typeof cache.getAllCollections === 'function' ? await cache.getAllCollections() : [];
+
+  if (!Array.isArray(products) || !products.length || !Array.isArray(collections) || !collections.length) {
+    return { updated: 0, collections: collections?.length || 0 };
+  }
+
+  const index = buildProductHandlesByCollectionKey(products);
+  let updated = 0;
+
+  for (const collection of collections) {
+    const handle = safeString(collection?.handle);
+    if (!handle) {
+      continue;
+    }
+
+    const nextHandles = resolveCollectionHandlesFromIndex(collection, index);
+    if (!nextHandles.length) {
+      continue;
+    }
+
+    const previousHandles = Array.isArray(collection.productHandles) ? collection.productHandles : [];
+    const changed =
+      nextHandles.length !== previousHandles.length ||
+      nextHandles.some((entry, index) => entry !== previousHandles[index]);
+
+    if (!changed) {
+      continue;
+    }
+
+    const nextCollection = {
+      ...collection,
+      productHandles: nextHandles,
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (typeof cache.setCollection === 'function') {
+      await cache.setCollection(handle, nextCollection);
+      updated += 1;
+    }
+  }
+
+  if (updated > 0 && typeof cache.persist === 'function') {
+    await cache.persist();
+  }
+
+  console.log('[NOOD sync] reconciled collection productHandles from products', {
+    updated,
+    collectionCount: collections.length,
+    productCount: products.length,
+  });
+
+  return { updated, collections: collections.length };
+}
+
+async function reconcileAllCollectionImageUrls(cache) {
+  const collections = await cache.getAllCollections();
+  if (!Array.isArray(collections) || !collections.length) {
+    return { updated: 0, withImage: 0 };
+  }
+
+  let updated = 0;
+  let withImage = 0;
+
+  for (const collection of collections) {
+    if (!collection?.handle) continue;
+
+    const resolved = await resolveCollectionImageFromCache(cache, collection);
+    if (!resolved.imageUrl) continue;
+
+    const existingUrl = safeString(collection.imageUrl);
+    const existingSource = safeString(collection.imageSource);
+    if (existingUrl === resolved.imageUrl && existingSource === resolved.imageSource) {
+      withImage += 1;
+      continue;
+    }
+
+    collection.imageUrl = resolved.imageUrl;
+    collection.previewImage = resolved.imageUrl;
+    collection.imageSource = resolved.imageSource;
+    collection.image = { url: resolved.imageUrl };
+    await cache.setCollection(collection.handle, collection);
+    updated += 1;
+    withImage += 1;
+  }
+
+  console.log('[NOOD sync] reconciled collection imageUrl cache', {
+    total: collections.length,
+    updated,
+    withImage,
+  });
+
+  return { updated, withImage };
 }
 
 async function getSyncState(cache) {
@@ -215,6 +538,14 @@ function isSyncStale(state, options = {}) {
 
 function clearActiveSyncLock() {
   activeSyncPromise = null;
+}
+
+function formatSyncCursor(state = {}) {
+  if (state.phase === 'collections' || state.phase === 'menus') {
+    return state.collectionCursor || 'start';
+  }
+
+  return state.productCursor || 'start';
 }
 
 async function checkpointCache(cache) {
@@ -389,6 +720,7 @@ async function saveCollectionPage(cache, adminCollections) {
       cache,
       collection.productHandles
     );
+    await enrichCollectionImageUrl(cache, collection, adminCollection);
     normalized.push(collection);
   }
 
@@ -480,6 +812,136 @@ async function bumpCatalogVersion(cache, reason = 'catalog-change') {
   return meta;
 }
 
+function extractCollectionIdsFromAdminProduct(adminProduct) {
+  return (adminProduct?.collections?.edges || [])
+    .map((edge) => safeString(edge?.node?.id))
+    .filter(Boolean);
+}
+
+async function resolveCollectionIdForHandle(cache, handle) {
+  const key = safeString(handle);
+  if (!key || typeof cache.getCollection !== 'function') {
+    return '';
+  }
+
+  const collection = await cache.getCollection(key);
+  return safeString(collection?.id);
+}
+
+async function collectAffectedCollectionIds(cache, adminProduct, oldProduct) {
+  const affected = new Set(extractCollectionIdsFromAdminProduct(adminProduct));
+
+  const oldHandles = new Set([
+    ...(Array.isArray(oldProduct?.collectionHandles) ? oldProduct.collectionHandles : []),
+    ...(oldProduct?.collections?.edges || [])
+      .map((edge) => safeString(edge?.node?.handle))
+      .filter(Boolean),
+  ]);
+
+  for (const handle of oldHandles) {
+    const collectionId = await resolveCollectionIdForHandle(cache, handle);
+    if (collectionId) {
+      affected.add(collectionId);
+    }
+  }
+
+  return [...affected];
+}
+
+async function refreshAffectedCollections(cache, adminProduct, oldProduct, context = {}) {
+  const collectionIds = await collectAffectedCollectionIds(cache, adminProduct, oldProduct);
+  if (!collectionIds.length) {
+    return { synced: 0, collectionIds: [] };
+  }
+
+  const reason = safeString(context?.reason) || 'product-collection-refresh';
+  let synced = 0;
+  const syncedHandles = [];
+
+  for (const collectionId of collectionIds) {
+    try {
+      const collection = await syncCollectionByAdminId(cache, collectionId, {
+        reason,
+        bumpVersion: false,
+      });
+      if (collection) {
+        synced += 1;
+        if (collection.handle) {
+          syncedHandles.push(collection.handle);
+        }
+      }
+    } catch (error) {
+      console.warn('[NOOD catalog] affected collection refresh failed', {
+        collectionId,
+        productId: safeString(adminProduct?.id),
+        message: error.message,
+      });
+    }
+  }
+
+  if (synced > 0) {
+    await invalidateDerivedCatalogCaches(cache);
+    await bumpCatalogVersion(cache, reason);
+    console.log('[NOOD cache] refreshed collections after product change', {
+      productId: safeString(adminProduct?.id),
+      productHandle: safeString(adminProduct?.handle),
+      synced,
+      collectionIds,
+      collectionHandles: syncedHandles,
+    });
+  }
+
+  return { synced, collectionIds, collectionHandles: syncedHandles };
+}
+
+async function refreshCollectionsForHandles(cache, handles = [], context = {}) {
+  const uniqueHandles = [...new Set(handles.map((value) => safeString(value)).filter(Boolean))];
+  if (!uniqueHandles.length) {
+    return { synced: 0, collectionHandles: [] };
+  }
+
+  const reason = safeString(context?.reason) || 'product-delete-collection-refresh';
+  let synced = 0;
+  const syncedHandles = [];
+
+  for (const handle of uniqueHandles) {
+    const collectionId = await resolveCollectionIdForHandle(cache, handle);
+    if (!collectionId) {
+      continue;
+    }
+
+    try {
+      const collection = await syncCollectionByAdminId(cache, collectionId, {
+        reason,
+        bumpVersion: false,
+      });
+      if (collection) {
+        synced += 1;
+        if (collection.handle) {
+          syncedHandles.push(collection.handle);
+        }
+      }
+    } catch (error) {
+      console.warn('[NOOD catalog] collection refresh after product delete failed', {
+        handle,
+        collectionId,
+        message: error.message,
+      });
+    }
+  }
+
+  if (synced > 0) {
+    await invalidateDerivedCatalogCaches(cache);
+    await bumpCatalogVersion(cache, reason);
+    console.log('[NOOD cache] refreshed collections after product delete', {
+      synced,
+      collectionHandles: syncedHandles,
+    });
+  }
+
+  return { synced, collectionHandles: syncedHandles };
+}
+
 async function syncSingleProduct(cache, adminProduct, context = {}) {
   const config = getShopifyConfig();
   const product = transformAdminProduct(
@@ -504,6 +966,9 @@ async function syncSingleProduct(cache, adminProduct, context = {}) {
   if (!handle || product.status === 'ARCHIVED') {
     if (handle) {
       const removed = await cache.deleteProduct(handle);
+      await refreshCollectionsForHandles(cache, oldProduct?.collectionHandles || [], {
+        reason: reason || 'product-archived',
+      });
       await invalidateDerivedCatalogCaches(cache);
       await bumpCatalogVersion(cache, reason || 'product-archived');
       console.log('[NOOD cache] product updated', {
@@ -536,6 +1001,10 @@ async function syncSingleProduct(cache, adminProduct, context = {}) {
   if (typeof cache.persist === 'function') {
     await cache.persist();
   }
+
+  await refreshAffectedCollections(cache, adminProduct, oldProduct, {
+    reason: `${reason}:collections`,
+  });
 
   await invalidateDerivedCatalogCaches(cache);
   await bumpCatalogVersion(cache, reason);
@@ -579,6 +1048,9 @@ async function deleteProductFromCache(cache, payload = {}) {
   if (handle) {
     const existing = typeof cache.getProduct === 'function' ? await cache.getProduct(handle) : null;
     const removed = await cache.deleteProduct(handle);
+    await refreshCollectionsForHandles(cache, existing?.collectionHandles || [], {
+      reason: 'product-delete:collections',
+    });
     await invalidateDerivedCatalogCaches(cache);
     await bumpCatalogVersion(cache, 'product-delete');
     console.log('[NOOD cache] product updated', {
@@ -601,6 +1073,9 @@ async function deleteProductFromCache(cache, payload = {}) {
     const product = await cache.getProductById(lookupId);
     if (product?.handle) {
       const removed = await cache.deleteProduct(product.handle);
+      await refreshCollectionsForHandles(cache, product.collectionHandles || [], {
+        reason: 'product-delete:collections',
+      });
       await invalidateDerivedCatalogCaches(cache);
       await bumpCatalogVersion(cache, 'product-delete');
       console.log('[NOOD cache] product updated', {
@@ -626,8 +1101,11 @@ async function syncCollectionByAdminId(cache, adminCollectionId, context = {}) {
   }
 
   await saveCollectionPage(cache, [adminCollection]);
-  await invalidateDerivedCatalogCaches(cache);
-  await bumpCatalogVersion(cache, safeString(context?.reason) || 'collection-sync');
+  const bumpVersion = context.bumpVersion !== false;
+  if (bumpVersion) {
+    await invalidateDerivedCatalogCaches(cache);
+    await bumpCatalogVersion(cache, safeString(context?.reason) || 'collection-sync');
+  }
   return normalizeCollection(adminCollection);
 }
 
@@ -897,11 +1375,12 @@ async function pauseSyncChunk(cache, patch = {}) {
   });
   await checkpointCache(cache);
 
-  if (patch.phase === 'collections') {
-    console.log(`[NOOD sync] chunk complete collections=${counts.collectionCount}`);
-  } else {
-    console.log(`[NOOD sync] chunk complete products=${counts.productCount}`);
-  }
+  const nextCursor =
+    patch.phase === 'collections'
+      ? patch.collectionCursor || null
+      : patch.productCursor || null;
+
+  console.log(`[NOOD sync] chunk complete productCount=${counts.productCount}`);
 
   return {
     status: 'paused',
@@ -909,6 +1388,7 @@ async function pauseSyncChunk(cache, patch = {}) {
     productCount: counts.productCount,
     collectionCount: counts.collectionCount,
     phase: patch.phase || null,
+    nextCursor,
   };
 }
 
@@ -958,6 +1438,8 @@ async function runResumableCatalogSync(cache, options = {}) {
         pageSize: chunk.pageSize,
       });
 
+      await reconcileCollectionProductHandlesFromProducts(cache);
+
       if (productsResult.paused) {
         return pauseSyncChunk(cache, {
           phase: 'products',
@@ -1003,6 +1485,9 @@ async function runResumableCatalogSync(cache, options = {}) {
       });
       await syncMenus(cache, DEFAULT_MENU_HANDLES, { replaceExisting: true });
     }
+
+    await reconcileAllCollectionImageUrls(cache);
+    await reconcileCollectionProductHandlesFromProducts(cache);
 
     const counts = await getCatalogCounts(cache, { phase: 'completed' });
     const meta = await cache.setMeta({
@@ -1064,6 +1549,38 @@ async function runResumableCatalogSync(cache, options = {}) {
   }
 }
 
+async function runCatalogSyncUntilComplete(cache, options = {}) {
+  const chunk = resolveSyncChunkOptions(options);
+  let resume = Boolean(options.resume);
+  let lastResult = null;
+
+  while (true) {
+    const stateBefore = await getSyncState(cache);
+    console.log(`[NOOD sync] chunk started cursor=${formatSyncCursor(stateBefore)}`);
+
+    lastResult = await runResumableCatalogSync(cache, {
+      syncMenus: options.syncMenus !== false,
+      resume,
+      pages: chunk.pages,
+      pageSize: chunk.pageSize,
+    });
+
+    if (lastResult?.status === 'completed') {
+      return lastResult;
+    }
+
+    if (lastResult?.status !== 'paused') {
+      return lastResult;
+    }
+
+    const nextCursor = lastResult.nextCursor || formatSyncCursor(await getSyncState(cache));
+    console.log(`[NOOD sync] auto-resume next cursor=${nextCursor || 'start'}`);
+
+    await sleep(AUTO_RESUME_DELAY_MS);
+    resume = true;
+  }
+}
+
 async function startBackgroundCatalogSync(cache, options = {}) {
   const state = await getSyncState(cache);
   const restart = Boolean(options.restart);
@@ -1080,7 +1597,7 @@ async function startBackgroundCatalogSync(cache, options = {}) {
   }
 
   if (alreadyRunning && !restart) {
-    return { status: 'already_running', message: 'Catalog sync chunk is already running.' };
+    return { status: 'already_running', message: 'Catalog sync is already running.' };
   }
 
   if (stale && activeSyncPromise) {
@@ -1103,7 +1620,7 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     `[NOOD sync] started resume=${shouldResume} restart=${restart} forceResume=${forceResume} stale=${stale} pages=${chunk.pages} pageSize=${chunk.pageSize}`
   );
 
-  activeSyncPromise = runResumableCatalogSync(cache, {
+  activeSyncPromise = runCatalogSyncUntilComplete(cache, {
     syncMenus: options.syncMenus !== false,
     resume: shouldResume,
     pages: chunk.pages,
@@ -1125,15 +1642,19 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     pages: chunk.pages,
     pageSize: chunk.pageSize,
     message: forceResume
-      ? 'Catalog sync resumed from saved phase/cursor.'
-      : 'Catalog sync chunk started in background.',
+      ? 'Catalog sync resumed from saved phase/cursor; auto-continuing until complete.'
+      : shouldResume
+        ? 'Catalog sync resumed in background; auto-continuing until complete.'
+        : 'Catalog sync started in background; auto-continuing until complete.',
   };
 }
 
 async function syncAllProducts(cache, options = {}) {
-  return runResumableCatalogSync(cache, {
+  return runCatalogSyncUntilComplete(cache, {
     syncMenus: options.syncMenus !== false,
-    resume: false,
+    resume: Boolean(options.resume),
+    pages: options.pages,
+    pageSize: options.pageSize,
   });
 }
 
@@ -1169,9 +1690,12 @@ module.exports = {
   syncProductByAdminId,
   deleteProductFromCache,
   syncCollectionByAdminId,
+  refreshAffectedCollections,
+  refreshCollectionsForHandles,
   deleteCollectionFromCache,
   syncCollectionsAndMenusLight,
   syncMenus,
   ensureCatalogWarm,
   normalizeCollection,
+  reconcileCollectionProductHandlesFromProducts,
 };
