@@ -1,0 +1,75 @@
+{
+  "cli": {
+    "version": ">= 16.0.0",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_DEV_CLIENT": "1",
+        "EXPO_PUBLIC_BACKEND_URL": "https://nood-backend.onrender.com",
+        "EXPO_PUBLIC_LOCAL_BACKEND": "false",
+        "EXPO_PUBLIC_PAYPAL_CLIENT_ID": "AU93u5XP5vL8kPxlzqe87Nzqu9qxeB4Pabmz0v83VO95F--bNTOp7s0Sm_9-5mU1tZv-xzNIjPvlAbts",
+        "EXPO_PUBLIC_PAYPAL_ENV": "sandbox",
+        "EXPO_PUBLIC_SHOPIFY_STORE_DOMAIN": "noodcaribbean.myshopify.com",
+        "EXPO_PUBLIC_SHOPIFY_CUSTOMER_ACCOUNT_DOMAIN": "noodcaribbean.account.myshopify.com",
+        "EXPO_PUBLIC_SHOPIFY_CUSTOMER_ACCOUNT_CLIENT_ID": "f3c8b30a-f173-4962-9226-15f56a122578",
+        "EXPO_PUBLIC_SHOPIFY_OAUTH_REDIRECT_URI": "shop.66320990292.nood://auth/callback",
+        "EXPO_PUBLIC_SHOPIFY_REDIRECT_URI": "shop.66320990292.nood://auth/callback",
+        "EXPO_PUBLIC_SHOPIFY_HTTPS_REDIRECT_URI": "https://noodcaribbean.com/auth/callback",
+        "EXPO_PUBLIC_SHOPIFY_APP_REDIRECT_URI": "shop.66320990292.nood://auth/callback",
+        "EXPO_PUBLIC_SHOPIFY_API_VERSION": "2026-04",
+        "EXPO_PUBLIC_SHOPIFY_STOREFRONT_TOKEN": "6d021813e286f637f88a52f9434102ef",
+        "EXPO_PUBLIC_SHOPIFY_LOCALE": "en-TT",
+        "EXPO_PUBLIC_SHOPIFY_REGION_COUNTRY": "TT"
+      },
+      "ios": {
+        "simulator": false
+      },
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_BACKEND_URL": "https://nood-backend.onrender.com",
+        "EXPO_PUBLIC_PAYPAL_CLIENT_ID": "AU93u5XP5vL8kPxlzqe87Nzqu9qxeB4Pabmz0v83VO95F--bNTOp7s0Sm_9-5mU1tZv-xzNIjPvlAbts",
+        "EXPO_PUBLIC_PAYPAL_ENV": "sandbox",
+        "EXPO_PUBLIC_SHOPIFY_STORE_DOMAIN": "noodcaribbean.myshopify.com",
+        "EXPO_PUBLIC_SHOPIFY_CUSTOMER_ACCOUNT_DOMAIN": "noodcaribbean.account.myshopify.com",
+        "EXPO_PUBLIC_SHOPIFY_CUSTOMER_ACCOUNT_CLIENT_ID": "f3c8b30a-f173-4962-9226-15f56a122578",
+        "EXPO_PUBLIC_SHOPIFY_OAUTH_REDIRECT_URI": "shop.66320990292.nood://auth/callback",
+        "EXPO_PUBLIC_SHOPIFY_REDIRECT_URI": "shop.66320990292.nood://auth/callback",
+        "EXPO_PUBLIC_SHOPIFY_HTTPS_REDIRECT_URI": "https://noodcaribbean.com/auth/callback",
+        "EXPO_PUBLIC_SHOPIFY_APP_REDIRECT_URI": "shop.66320990292.nood://auth/callback",
+        "EXPO_PUBLIC_SHOPIFY_API_VERSION": "2026-04",
+        "EXPO_PUBLIC_SHOPIFY_STOREFRONT_TOKEN": "6d021813e286f637f88a52f9434102ef",
+        "EXPO_PUBLIC_SHOPIFY_LOCALE": "en-TT",
+        "EXPO_PUBLIC_SHOPIFY_REGION_COUNTRY": "TT"
+      },
+      "ios": {
+        "simulator": false
+      },
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_BACKEND_URL": "https://nood-backend.onrender.com",
+        "EXPO_PUBLIC_SHOPIFY_STORE_DOMAIN": "noodcaribbean.myshopify.com",
+        "EXPO_PUBLIC_SHOPIFY_CUSTOMER_ACCOUNT_DOMAIN": "noodcaribbean.account.myshopify.com",
+        "EXPO_PUBLIC_SHOPIFY_OAUTH_REDIRECT_URI": "shop.66320990292.nood://auth/callback",
+        "EXPO_PUBLIC_SHOPIFY_REDIRECT_URI": "shop.66320990292.nood://auth/callback",
+        "EXPO_PUBLIC_SHOPIFY_APP_REDIRECT_URI": "shop.66320990292.nood://auth/callback"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

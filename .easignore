@@ -9,3 +9,7 @@ tmp-*.json
 *.sys
 *.dat
 netrtwlane601.*
+
+# Use EAS prebuild + config plugins instead of stale local native projects.
+android/
+ios/
