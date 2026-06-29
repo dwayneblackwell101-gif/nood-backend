@@ -530,11 +530,45 @@ async function getSyncState(cache) {
   return defaultSyncState();
 }
 
-async function setSyncState(cache, patch) {
-  if (typeof cache.setSyncState === 'function') {
-    return cache.setSyncState(patch);
+async function setSyncState(cache, patch, options = {}) {
+  const previousState = await getSyncState(cache);
+  const previousStatus = previousState.status || 'idle';
+  const previousProductCount = syncStateProductCount(previousState);
+  const nextPatch = { ...(patch || {}) };
+  const nextPreview = { ...previousState, ...nextPatch };
+
+  if (
+    (previousStatus === 'running' || activeSyncPromise) &&
+    nextPatch.status === 'idle' &&
+    !options.allowRunningIdle
+  ) {
+    console.log('[NOOD sync] reset blocked during running sync');
+    console.log(
+      `[NOOD sync] state write previousStatus=${previousStatus} newStatus=${previousStatus} previousProductCount=${previousProductCount} newProductCount=${previousProductCount}`
+    );
+    return previousState;
   }
-  return { ...defaultSyncState(), ...patch };
+
+  if (
+    (previousStatus === 'running' || activeSyncPromise) &&
+    nextPatch.status !== 'failed' &&
+    syncStateProductCount(nextPreview) < previousProductCount
+  ) {
+    nextPatch.syncedProductCount = previousProductCount;
+  }
+
+  let writtenState;
+  if (typeof cache.setSyncState === 'function') {
+    writtenState = await cache.setSyncState(nextPatch);
+  } else {
+    writtenState = { ...defaultSyncState(), ...nextPatch };
+  }
+
+  console.log(
+    `[NOOD sync] state write previousStatus=${previousStatus} newStatus=${writtenState.status || 'idle'} previousProductCount=${previousProductCount} newProductCount=${syncStateProductCount(writtenState)}`
+  );
+
+  return writtenState;
 }
 
 function isOrphanedRunning(state) {
@@ -580,6 +614,10 @@ function metaCount(meta, field, fallback = 0) {
   return Number(meta?.[field] ?? fallback) || 0;
 }
 
+function syncStateProductCount(state = {}) {
+  return Number(state?.syncedProductCount ?? state?.productCount ?? 0) || 0;
+}
+
 async function getCatalogCounts(cache, options = {}) {
   const meta = (await cache.getMeta?.()) || null;
   const liveProductCount =
@@ -591,7 +629,11 @@ async function getCatalogCounts(cache, options = {}) {
       ? Number(await cache.getCollectionCount()) || 0
       : 0;
 
-  const productCount = liveProductCount || metaCount(meta, 'productCount', 0);
+  const productCount = Math.max(
+    liveProductCount,
+    metaCount(meta, 'productCount', 0),
+    Number(options.syncedProductCount ?? 0) || 0
+  );
   const collectionCount =
     options.phase === 'collections' || options.phase === 'completed'
       ? liveCollectionCount || metaCount(meta, 'collectionCount', 0)
@@ -604,6 +646,7 @@ async function getCatalogSyncStatus(cache) {
   const state = await getSyncState(cache);
   const counts = await getCatalogCounts(cache, {
     phase: state.phase || null,
+    syncedProductCount: state.syncedProductCount,
     syncedCollectionCount: state.syncedCollectionCount,
   });
   const cursor =
@@ -633,7 +676,13 @@ async function getCatalogSyncStatus(cache) {
   };
 }
 
-async function prepareFreshSync(cache) {
+async function prepareFreshSync(cache, options = {}) {
+  const state = await getSyncState(cache);
+  if ((state.status === 'running' || activeSyncPromise) && !options.allowRunningReset) {
+    console.log('[NOOD sync] reset blocked during running sync');
+    return { reset: false, blocked: true };
+  }
+
   const meta = (await cache.getMeta()) || {};
 
   if (typeof cache.clearProducts === 'function') {
@@ -663,8 +712,9 @@ async function prepareFreshSync(cache) {
   await setSyncState(cache, {
     ...defaultSyncState(),
     status: 'idle',
-  });
+  }, { allowRunningIdle: options.allowRunningReset });
   await checkpointCache(cache);
+  return { reset: true, blocked: false };
 }
 
 async function saveProductPage(cache, adminProducts, config) {
@@ -1187,14 +1237,20 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         typeof cache.getProductCount === 'function'
           ? Number(await cache.getProductCount()) || 0
           : totalSaved;
+      const stableProductCount = Math.max(
+        liveProductCount,
+        totalSaved,
+        Number(state.syncedProductCount || 0)
+      );
+      totalSaved = stableProductCount;
       const productCount = metaCount(
         await cache.setMeta({
-          productCount: liveProductCount,
+          productCount: stableProductCount,
           syncInProgress: true,
           source: 'shopify',
         }),
         'productCount',
-        liveProductCount
+        stableProductCount
       );
 
       await setSyncState(cache, {
@@ -1202,7 +1258,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         phase: 'products',
         productCursor: after,
         productsCompleted: hasNextPage === false,
-        syncedProductCount: totalSaved,
+        syncedProductCount: stableProductCount,
         lastError: null,
         message: null,
         chunkPages: maxPages,
@@ -1237,7 +1293,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         phase: 'products',
         productCursor: after,
         productsCompleted: false,
-        syncedProductCount: totalSaved,
+        syncedProductCount: Math.max(totalSaved, Number(state.syncedProductCount || 0)),
         lastError: safeString(error.message, 'sync page failed'),
         chunkPages: maxPages,
         chunkPageSize: pageSize,
@@ -1323,13 +1379,17 @@ async function syncCollectionsPhase(cache, state, options = {}) {
         typeof cache.getProductCount === 'function'
           ? Number(await cache.getProductCount()) || 0
           : Number(state.syncedProductCount || 0);
+      const stableProductCount = Math.max(
+        liveProductCount,
+        Number(state.syncedProductCount || 0)
+      );
 
       await setSyncState(cache, {
         status: 'running',
         phase: 'collections',
         collectionCursor: after,
         syncedCollectionCount: totalSaved,
-        syncedProductCount: liveProductCount,
+        syncedProductCount: stableProductCount,
         lastError: null,
         message: null,
         chunkPages: maxPages,
@@ -1397,6 +1457,7 @@ async function syncCollectionsPhase(cache, state, options = {}) {
 async function pauseSyncChunk(cache, patch = {}) {
   const counts = await getCatalogCounts(cache, {
     phase: patch.phase || null,
+    syncedProductCount: patch.syncedProductCount,
     syncedCollectionCount: patch.syncedCollectionCount,
   });
 
@@ -1437,9 +1498,12 @@ async function runResumableCatalogSync(cache, options = {}) {
       ? await fetchShopifyProductsCount()
       : options.shopifyProductsCount;
   const liveProductCount =
-    typeof cache.getProductCount === 'function'
-      ? Number(await cache.getProductCount()) || 0
-      : Number(state.syncedProductCount || 0);
+    Math.max(
+      typeof cache.getProductCount === 'function'
+        ? Number(await cache.getProductCount()) || 0
+        : 0,
+      Number(state.syncedProductCount || 0)
+    );
   const phase = resolveSyncPhase(state, resume, {
     productCount: liveProductCount,
     shopifyProductsCount,
@@ -1635,7 +1699,12 @@ async function startBackgroundCatalogSync(cache, options = {}) {
   const stale = isSyncStale(state, { forceResume });
   const chunk = resolveSyncChunkOptions(options);
   const alreadyRunning = state.status === 'running' && !stale;
-  let counts = await getCatalogCounts(cache, { phase: state.phase || null });
+  const backgroundSyncActive = Boolean(activeSyncPromise) && !stale;
+  let counts = await getCatalogCounts(cache, {
+    phase: state.phase || null,
+    syncedProductCount: state.syncedProductCount,
+    syncedCollectionCount: state.syncedCollectionCount,
+  });
   const shopifyProductsCount = await fetchShopifyProductsCount();
 
   if (state.status === 'completed' && !restart && !forceResume) {
@@ -1657,8 +1726,18 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     };
   }
 
-  if (alreadyRunning && !restart) {
-    return { status: 'already_running', message: 'Catalog sync is already running.' };
+  if (alreadyRunning || backgroundSyncActive) {
+    if (restart) {
+      console.log('[NOOD sync] reset blocked during running sync');
+    }
+    return {
+      status: 'already_running',
+      message: restart
+        ? 'Catalog sync is already running; restart reset was blocked.'
+        : 'Catalog sync is already running.',
+      productCount: counts.productCount,
+      shopifyProductsCount,
+    };
   }
 
   if (stale && activeSyncPromise) {
@@ -1674,7 +1753,15 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     state.status !== 'completed';
 
   if (restart || !shouldResume) {
-    await prepareFreshSync(cache);
+    const resetResult = await prepareFreshSync(cache, { allowRunningReset: stale });
+    if (resetResult.blocked) {
+      return {
+        status: 'already_running',
+        message: 'Catalog sync is already running; reset was blocked.',
+        productCount: counts.productCount,
+        shopifyProductsCount,
+      };
+    }
     counts = await getCatalogCounts(cache, { phase: null });
   }
 
@@ -1689,7 +1776,21 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     pageSize: chunk.pageSize,
     shopifyProductsCount,
   })
-    .catch(() => null)
+    .catch(async (error) => {
+      const message = safeString(error?.message || error, 'Catalog sync failed.');
+      console.log(`[NOOD sync] failed error=${message}`);
+      try {
+        await setSyncState(cache, {
+          status: 'failed',
+          lastError: message,
+          message: null,
+        });
+        await checkpointCache(cache);
+      } catch (stateError) {
+        console.log(`[NOOD sync] failed error=${safeString(stateError?.message || stateError)}`);
+      }
+      return null;
+    })
     .finally(() => {
       activeSyncPromise = null;
     });
