@@ -1635,7 +1635,7 @@ async function startBackgroundCatalogSync(cache, options = {}) {
   const stale = isSyncStale(state, { forceResume });
   const chunk = resolveSyncChunkOptions(options);
   const alreadyRunning = state.status === 'running' && !stale;
-  const counts = await getCatalogCounts(cache, { phase: state.phase || null });
+  let counts = await getCatalogCounts(cache, { phase: state.phase || null });
   const shopifyProductsCount = await fetchShopifyProductsCount();
 
   if (state.status === 'completed' && !restart && !forceResume) {
@@ -1673,8 +1673,9 @@ async function startBackgroundCatalogSync(cache, options = {}) {
       (state.status === 'running' && stale)) &&
     state.status !== 'completed';
 
-  if (restart) {
+  if (restart || !shouldResume) {
     await prepareFreshSync(cache);
+    counts = await getCatalogCounts(cache, { phase: null });
   }
 
   console.log(
