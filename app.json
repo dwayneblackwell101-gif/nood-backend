@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "NOOD Caribbean",
+    "name": "NOOD",
     "slug": "nood-app",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -11,7 +11,16 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.noodcaribbean.app",
       "infoPlist": {
-        "NSCameraUsageDescription": "NOOD Caribbean uses the camera for visual product search and scanning product photos."
+        "NSCameraUsageDescription": "NOOD uses the camera for visual product search and scanning product photos.",
+        "NSPhotoLibraryUsageDescription": "NOOD uses your photo library so you can choose a profile picture or search products by image.",
+        "CFBundleURLTypes": [
+          {
+            "CFBundleURLName": "com.noodcaribbean.app.shopify-auth",
+            "CFBundleURLSchemes": [
+              "shop.66320990292.nood"
+            ]
+          }
+        ]
       }
     },
     "android": {
@@ -23,7 +32,9 @@
           "autoVerify": false,
           "data": [
             {
-              "scheme": "shop.66320990292.nood"
+              "scheme": "shop.66320990292.nood",
+              "host": "auth",
+              "pathPrefix": "/callback"
             }
           ],
           "category": [
@@ -33,7 +44,10 @@
         }
       ],
       "permissions": [
-        "CAMERA"
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_EXTERNAL_STORAGE"
       ]
     },
     "web": {
@@ -41,12 +55,14 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
+      "expo-dev-client",
+      "expo-notifications",
       "expo-router",
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/nood-brand-splash.png",
-          "imageWidth": 260,
+          "image": "./assets/images/nood-splash-logo.png",
+          "imageWidth": 220,
           "resizeMode": "contain",
           "backgroundColor": "#ffffff",
           "dark": {
@@ -57,10 +73,30 @@
       "expo-localization",
       "expo-video",
       "expo-font",
-      "expo-web-browser"
+      "expo-web-browser",
+      "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "NOOD uses the camera so you can take a photo and search products by image."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "NOOD uses your photo library so you can choose a profile picture or search products by image."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "20a1823c-474f-43d7-9b39-aed139d50629"
+      }
+    },
+    "owner": "noodcaribbean"
   }
 }

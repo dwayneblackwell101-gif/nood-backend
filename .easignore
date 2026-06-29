@@ -4,8 +4,13 @@ node_modules/
 .expo-*/
 .chrome-check/
 .codex-remote-attachments/
+dist/
 preview/
+eas-inspect/
+eas-inspect2/
+eas-final-inspect/
 tmp-*.json
+*.log
 *.sys
 *.dat
 netrtwlane601.*
