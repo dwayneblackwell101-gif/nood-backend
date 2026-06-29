@@ -1,10 +1,10 @@
 {
   "name": "nood-app",
-  "main": "expo-router/entry",
+  "main": "index.js",
   "version": "1.0.0",
   "scripts": {
     "start": "expo start",
-    "start:dev-client": "expo start --dev-client",
+    "start:dev-client": "expo start --dev-client -c",
     "build:ios:dev": "eas build --platform ios --profile development",
     "build:android:dev": "eas build --platform android --profile development",
     "reset-project": "node ./scripts/reset-project.js",
@@ -15,7 +15,6 @@
     "lint": "expo lint"
   },
   "dependencies": {
-    "@expo/config-plugins": "^5.0.0",
     "@expo/vector-icons": "^15.0.3",
     "@react-native-async-storage/async-storage": "2.2.0",
     "buffer": "^6.0.3",
@@ -37,6 +36,7 @@
     "expo-localization": "~17.0.9",
     "expo-notifications": "~0.32.17",
     "expo-router": "~6.0.14",
+    "expo-secure-store": "~15.0.8",
     "expo-splash-screen": "~31.0.13",
     "expo-status-bar": "~3.0.9",
     "expo-symbols": "~1.0.8",
@@ -59,6 +59,7 @@
   },
   "devDependencies": {
     "@expo/ngrok": "^4.1.0",
+    "@react-native/virtualized-lists": "^0.72.8",
     "@types/react": "~19.1.10",
     "babel-preset-expo": "~54.0.10",
     "eslint": "^9.25.0",
