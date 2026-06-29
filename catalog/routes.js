@@ -1404,6 +1404,9 @@ function createCatalogSyncHandler(cache) {
         stale: Boolean(result.stale),
         pages: result.pages ?? pages,
         pageSize: result.pageSize ?? pageSize,
+        productCount: result.productCount ?? null,
+        shopifyProductsCount: result.shopifyProductsCount ?? null,
+        restartAllowed: Boolean(result.restartAllowed),
         message:
           result.message ||
           (result.status === 'already_running'

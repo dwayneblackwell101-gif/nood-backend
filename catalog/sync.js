@@ -57,6 +57,7 @@ const {
   fetchProductGidByInventoryItemId,
   storefrontGraphql,
   getShopifyConfig,
+  adminGraphql,
   STOREFRONT_MENU_QUERY,
 } = shopify;
 const { transformAdminProduct, safeString } = require('./transform');
@@ -108,8 +109,10 @@ function defaultSyncState() {
     phase: null,
     productCursor: null,
     collectionCursor: null,
+    productsCompleted: false,
     syncedProductCount: 0,
     syncedCollectionCount: 0,
+    shopifyProductsCount: null,
     startedAt: null,
     updatedAt: null,
     lastError: null,
@@ -125,29 +128,25 @@ function parseForceResumeFlag(value) {
 }
 
 function resolveSyncPhase(state, resume, options = {}) {
-  const productCount = Number(options.productCount || 0);
-  const productsAlreadySynced =
-    productCount > 0 ||
-    Number(state.syncedProductCount || 0) > 0 ||
-    Boolean(state.productCursor);
+  const productsCompleted = state.productsCompleted === true;
 
   if (!resume) {
-    if (state.phase === 'collections' || state.phase === 'menus') {
+    if (productsCompleted && (state.phase === 'collections' || state.phase === 'menus')) {
       return 'collections';
     }
 
-    if (productsAlreadySynced && !state.productCursor) {
+    if (productsCompleted) {
       return 'collections';
     }
 
     return 'products';
   }
 
-  if (state.phase === 'completed') {
+  if (state.phase === 'completed' && productsCompleted) {
     return 'completed';
   }
 
-  if (state.phase === 'collections' || state.phase === 'menus') {
+  if (productsCompleted && (state.phase === 'collections' || state.phase === 'menus')) {
     return 'collections';
   }
 
@@ -155,11 +154,34 @@ function resolveSyncPhase(state, resume, options = {}) {
     return 'products';
   }
 
-  if (productsAlreadySynced && !state.collectionCursor) {
+  if (productsCompleted && !state.collectionCursor) {
     return 'collections';
   }
 
-  return state.phase || 'products';
+  return 'products';
+}
+
+async function fetchShopifyProductsCount() {
+  try {
+    const payload = await adminGraphql(
+      `
+        query NoodProductsCount {
+          productsCount {
+            count
+          }
+        }
+      `,
+      {},
+      { requestedQueryCost: 10 }
+    );
+    const count = Number(payload?.data?.productsCount?.count);
+    return Number.isFinite(count) && count >= 0 ? count : null;
+  } catch (error) {
+    console.warn('[NOOD sync] Shopify productsCount unavailable', {
+      message: safeString(error?.message || error),
+    });
+    return null;
+  }
 }
 
 function resolveProductPreviewImageUrl(productNode) {
@@ -1135,11 +1157,11 @@ async function syncProductsPhase(cache, config, state, options = {}) {
   let after =
     options.resume && state.productCursor ? state.productCursor : null;
   let totalSaved = options.resume ? Number(state.syncedProductCount || 0) : 0;
-  let hasMore = true;
+  let hasNextPage = true;
   let pagesProcessed = 0;
   let pageAttempts = 0;
 
-  while (hasMore && pagesProcessed < maxPages) {
+  while (hasNextPage && pagesProcessed < maxPages) {
     let pageItems = null;
     let pageInfo = null;
 
@@ -1153,8 +1175,11 @@ async function syncProductsPhase(cache, config, state, options = {}) {
       pageInfo = page.pageInfo;
       const savedThisPage = await saveProductPage(cache, pageItems, config);
       totalSaved += savedThisPage;
-      after = pageInfo?.endCursor || null;
-      hasMore = Boolean(pageInfo?.hasNextPage && after);
+      hasNextPage = pageInfo?.hasNextPage === true;
+      after = hasNextPage ? safeString(pageInfo?.endCursor) : null;
+      if (hasNextPage && !after) {
+        throw new Error('Shopify products pageInfo.hasNextPage=true but endCursor is missing.');
+      }
       pagesProcessed += 1;
       pageAttempts = 0;
 
@@ -1176,6 +1201,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         status: 'running',
         phase: 'products',
         productCursor: after,
+        productsCompleted: hasNextPage === false,
         syncedProductCount: totalSaved,
         lastError: null,
         message: null,
@@ -1185,7 +1211,13 @@ async function syncProductsPhase(cache, config, state, options = {}) {
       });
 
       await checkpointCache(cache);
-      console.log(`[NOOD sync] page saved products=${productCount}`);
+      console.log('[NOOD sync] product page saved', {
+        hasNextPage,
+        endCursor: pageInfo?.endCursor || null,
+        savedCount: savedThisPage,
+        totalSaved,
+        productCount,
+      });
     } catch (error) {
       const nonRetryable =
         error?.code === 'MISSING_SHOPIFY_SYNC_FUNCTION' ||
@@ -1204,6 +1236,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         status: 'running',
         phase: 'products',
         productCursor: after,
+        productsCompleted: false,
         syncedProductCount: totalSaved,
         lastError: safeString(error.message, 'sync page failed'),
         chunkPages: maxPages,
@@ -1225,8 +1258,8 @@ async function syncProductsPhase(cache, config, state, options = {}) {
   return {
     totalSaved,
     nextCursor: after,
-    completed: !hasMore,
-    paused: hasMore,
+    completed: hasNextPage === false,
+    paused: hasNextPage === true,
     pagesProcessed,
   };
 }
@@ -1399,11 +1432,18 @@ async function runResumableCatalogSync(cache, options = {}) {
   const resume = Boolean(options.resume);
   const state = resume ? previousState : defaultSyncState();
   const chunk = resolveSyncChunkOptions(options);
+  const shopifyProductsCount =
+    options.shopifyProductsCount === undefined
+      ? await fetchShopifyProductsCount()
+      : options.shopifyProductsCount;
   const liveProductCount =
     typeof cache.getProductCount === 'function'
       ? Number(await cache.getProductCount()) || 0
       : Number(state.syncedProductCount || 0);
-  const phase = resolveSyncPhase(state, resume, { productCount: liveProductCount });
+  const phase = resolveSyncPhase(state, resume, {
+    productCount: liveProductCount,
+    shopifyProductsCount,
+  });
 
   if (phase === 'completed') {
     const counts = await getCatalogCounts(cache, { phase: 'completed' });
@@ -1420,8 +1460,10 @@ async function runResumableCatalogSync(cache, options = {}) {
     phase,
     productCursor: resume ? state.productCursor : null,
     collectionCursor: resume ? state.collectionCursor : null,
+    productsCompleted: resume ? state.productsCompleted === true : false,
     syncedProductCount: resume ? Number(state.syncedProductCount || 0) : 0,
     syncedCollectionCount: resume ? Number(state.syncedCollectionCount || 0) : 0,
+    shopifyProductsCount,
     startedAt: resume && state.startedAt ? state.startedAt : new Date().toISOString(),
     lastError: null,
     message: null,
@@ -1444,6 +1486,7 @@ async function runResumableCatalogSync(cache, options = {}) {
         return pauseSyncChunk(cache, {
           phase: 'products',
           productCursor: productsResult.nextCursor,
+          productsCompleted: false,
           syncedProductCount: productsResult.totalSaved,
           chunkPages: chunk.pages,
           chunkPageSize: chunk.pageSize,
@@ -1454,6 +1497,7 @@ async function runResumableCatalogSync(cache, options = {}) {
         phase: 'collections',
         productCursor: null,
         collectionCursor: null,
+        productsCompleted: true,
         syncedProductCount: productsResult.totalSaved,
         syncedCollectionCount: 0,
         chunkPages: chunk.pages,
@@ -1514,8 +1558,10 @@ async function runResumableCatalogSync(cache, options = {}) {
       phase: 'completed',
       productCursor: null,
       collectionCursor: null,
+      productsCompleted: true,
       syncedProductCount: productCount,
       syncedCollectionCount: collectionCount,
+      shopifyProductsCount,
       lastError: null,
       message: null,
       completedAt: new Date().toISOString(),
@@ -1563,6 +1609,7 @@ async function runCatalogSyncUntilComplete(cache, options = {}) {
       resume,
       pages: chunk.pages,
       pageSize: chunk.pageSize,
+      shopifyProductsCount: options.shopifyProductsCount,
     });
 
     if (lastResult?.status === 'completed') {
@@ -1588,11 +1635,25 @@ async function startBackgroundCatalogSync(cache, options = {}) {
   const stale = isSyncStale(state, { forceResume });
   const chunk = resolveSyncChunkOptions(options);
   const alreadyRunning = state.status === 'running' && !stale;
+  const counts = await getCatalogCounts(cache, { phase: state.phase || null });
+  const shopifyProductsCount = await fetchShopifyProductsCount();
 
   if (state.status === 'completed' && !restart && !forceResume) {
+    if (shopifyProductsCount && counts.productCount < shopifyProductsCount) {
+      return {
+        status: 'restart_required',
+        message: `Catalog sync is marked completed at ${counts.productCount}/${shopifyProductsCount} Shopify products. Retry with restart=true.`,
+        productCount: counts.productCount,
+        shopifyProductsCount,
+        restartAllowed: true,
+      };
+    }
+
     return {
       status: 'already_completed',
       message: 'Catalog sync already completed.',
+      productCount: counts.productCount,
+      shopifyProductsCount,
     };
   }
 
@@ -1625,6 +1686,7 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     resume: shouldResume,
     pages: chunk.pages,
     pageSize: chunk.pageSize,
+    shopifyProductsCount,
   })
     .catch(() => null)
     .finally(() => {
@@ -1641,6 +1703,8 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     stale,
     pages: chunk.pages,
     pageSize: chunk.pageSize,
+    productCount: counts.productCount,
+    shopifyProductsCount,
     message: forceResume
       ? 'Catalog sync resumed from saved phase/cursor; auto-continuing until complete.'
       : shouldResume
