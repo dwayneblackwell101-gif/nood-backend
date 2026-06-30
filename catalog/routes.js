@@ -17,6 +17,13 @@ const {
 } = require('./shopify');
 const { getProductRecommendations } = require('./recommendations');
 const { createDiscountsHandler } = require('./discounts');
+const {
+  resolveCanonicalCollectionHandle,
+} = require('./collection-aliases');
+const {
+  reconcileCollectionProductHandlesFromProducts,
+  applyCollectionHandleAliases,
+} = require('./sync');
 
 function sendCatalogResponse(res, payload, source) {
   res.setHeader('X-NOOD-Catalog-Source', source);
@@ -732,11 +739,25 @@ async function loadCollectionProductsPage(cache, collection, first, after) {
 }
 
 async function safeGetCollection(cache, handle) {
+  const requestedHandle = safeString(handle);
+  const canonicalHandle = resolveCanonicalCollectionHandle(requestedHandle);
+
   try {
-    return await cache.getCollection(handle);
+    let collection = await cache.getCollection(requestedHandle);
+    if (!collection && canonicalHandle !== requestedHandle) {
+      collection = await cache.getCollection(canonicalHandle);
+      if (collection) {
+        console.log('[NOOD catalog] collection alias resolved', {
+          requested: requestedHandle,
+          canonical: canonicalHandle,
+        });
+      }
+    }
+    return collection;
   } catch (error) {
     console.warn('[NOOD catalog] cache.getCollection failed; trying Shopify fallback', {
-      handle,
+      handle: requestedHandle,
+      canonicalHandle,
       message: error.message,
     });
     return null;
@@ -794,20 +815,35 @@ function buildCollectionProductsPayload(collection, pageProducts, pageInfo) {
 }
 
 async function tryCollectionProductsShopifyFallback(res, { handle, first, after, reason }) {
-  try {
-    const shopifyPayload = await fetchCollectionProductsFromShopify(handle, first, after);
-    if (shopifyPayload) {
-      console.log('[NOOD catalog] collection products shopify fallback', {
-        handle,
-        reason,
-        returned: shopifyPayload?.data?.collectionByHandle?.products?.edges?.length || 0,
+  const requestedHandle = safeString(handle);
+  const lookupHandles = Array.from(
+    new Set(
+      [requestedHandle, resolveCanonicalCollectionHandle(requestedHandle)].filter(Boolean)
+    )
+  );
+
+  for (const lookupHandle of lookupHandles) {
+    try {
+      const shopifyPayload = await fetchCollectionProductsFromShopify(lookupHandle, first, after);
+      if (shopifyPayload) {
+        console.log('[NOOD catalog] collection products shopify fallback', {
+          handle: requestedHandle,
+          lookupHandle,
+          reason,
+          returned: shopifyPayload?.data?.collectionByHandle?.products?.edges?.length || 0,
+        });
+        sendCatalogResponse(res, shopifyPayload, 'shopify');
+        return true;
+      }
+    } catch (error) {
+      console.warn('[NOOD catalog] collection shopify fallback failed:', {
+        handle: requestedHandle,
+        lookupHandle,
+        message: error.message,
       });
-      sendCatalogResponse(res, shopifyPayload, 'shopify');
-      return true;
     }
-  } catch (error) {
-    console.warn('[NOOD catalog] collection shopify fallback failed:', error.message);
   }
+
   return false;
 }
 
@@ -816,6 +852,39 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
 
   router.get('/sync/shopify/products/status', createCatalogSyncStatusHandler(cache));
   router.post('/sync/shopify/products', requireAdminApiKey, createCatalogSyncHandler(cache));
+  router.post('/admin/rebuild-collections', requireAdminApiKey, async (req, res) => {
+    try {
+      const reconcile = await reconcileCollectionProductHandlesFromProducts(cache);
+      const aliases = await applyCollectionHandleAliases(cache);
+      invalidateCollectionProductHandlesIndex();
+
+      const sample = {};
+      for (const requiredHandle of ['men', 'women', 'kids', 'shoes', 'electronics']) {
+        const collection = await safeGetCollection(cache, requiredHandle);
+        sample[requiredHandle] = collection?.productHandles?.length || 0;
+      }
+
+      console.log('[NOOD catalog] admin rebuild-collections complete', {
+        reconcile,
+        aliases,
+        sample,
+      });
+
+      return res.json({
+        success: true,
+        source: 'cache',
+        reconcile,
+        aliases,
+        sample,
+      });
+    } catch (error) {
+      console.error('[NOOD catalog] admin rebuild-collections failed:', error.message);
+      return res.status(500).json({
+        success: false,
+        message: error.message || 'Collection rebuild failed.',
+      });
+    }
+  });
   console.log('[NOOD sync] status route mounted');
 
   router.get('/discounts', createDiscountsHandler());

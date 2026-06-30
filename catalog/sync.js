@@ -62,6 +62,7 @@ const {
 } = shopify;
 const { transformAdminProduct, safeString } = require('./transform');
 const { clearMixedFeedCache } = require('./feed-mix');
+const { applyCollectionHandleAliases } = require('./collection-aliases');
 
 const DEFAULT_MENU_HANDLES = [
   'main-menu',
@@ -805,6 +806,8 @@ async function saveCollectionPage(cache, adminCollections) {
         saved += 1;
       }
     }
+
+    await applyCollectionHandleAliases(cache);
   }
 
   normalized.length = 0;
@@ -1596,6 +1599,7 @@ async function runResumableCatalogSync(cache, options = {}) {
 
     await reconcileAllCollectionImageUrls(cache);
     await reconcileCollectionProductHandlesFromProducts(cache);
+    await applyCollectionHandleAliases(cache);
 
     const counts = await getCatalogCounts(cache, { phase: 'completed' });
     const meta = await cache.setMeta({
@@ -1864,4 +1868,5 @@ module.exports = {
   ensureCatalogWarm,
   normalizeCollection,
   reconcileCollectionProductHandlesFromProducts,
+  applyCollectionHandleAliases,
 };

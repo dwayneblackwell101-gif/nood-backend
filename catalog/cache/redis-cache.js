@@ -1,5 +1,10 @@
 const { JsonCatalogCache } = require('./json-cache');
 const { safeString } = require('../transform');
+const {
+  connectRedisClient,
+  logRedisStatus,
+  resolveRedisUrl,
+} = require('../../storage/redis-config');
 
 const PRODUCT_SCAN_COUNT = 100;
 const PRODUCT_FETCH_BATCH = 50;
@@ -100,6 +105,47 @@ function parseProductSummary(handle, raw) {
   };
 }
 
+function parseRedisCollection(handle, raw) {
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const collection = JSON.parse(raw);
+    if (!collection || typeof collection !== 'object') {
+      return null;
+    }
+
+    const collectionHandle = safeString(collection.handle) || safeString(handle);
+    if (!collectionHandle) {
+      return null;
+    }
+
+    if (!collection.handle) {
+      collection.handle = collectionHandle;
+    }
+
+    if (!Array.isArray(collection.productHandles)) {
+      collection.productHandles = [];
+    }
+
+    return collection;
+  } catch {
+    return null;
+  }
+}
+
+function parseCollectionHashValues(rawMap = {}) {
+  const items = [];
+  for (const [handle, value] of Object.entries(rawMap || {})) {
+    const collection = parseRedisCollection(handle, value);
+    if (collection) {
+      items.push(collection);
+    }
+  }
+  return items;
+}
+
 function parseProductMixMeta(handle, raw) {
   if (!raw) {
     return null;
@@ -141,23 +187,9 @@ function parseProductMixMeta(handle, raw) {
 }
 
 async function createRedisCache(redisUrl) {
-  let Redis;
-  try {
-    Redis = require('ioredis');
-  } catch (error) {
-    throw new Error('ioredis is not installed. Run npm install ioredis to use Redis.');
-  }
-
-  const useTls = redisUrl.startsWith('rediss://');
-  const client = new Redis(redisUrl, {
+  const client = await connectRedisClient(redisUrl, {
     maxRetriesPerRequest: 3,
-    lazyConnect: true,
-    connectTimeout: 20000,
-    commandTimeout: 120000,
-    tls: useTls ? { rejectUnauthorized: false } : undefined,
   });
-
-  await client.connect();
 
   class RedisCatalogCache {
     constructor() {
@@ -655,7 +687,7 @@ async function createRedisCache(redisUrl) {
 
       if (hashCount > 0) {
         const raw = await this.client.hgetall(COLLECTIONS_HASH_KEY);
-        return parseHashValues(raw);
+        return parseCollectionHashValues(raw);
       }
 
       const legacy = await this.getJson(LEGACY_COLLECTIONS_KEY, null);
@@ -749,15 +781,37 @@ async function createRedisCache(redisUrl) {
 }
 
 async function createCatalogCache() {
-  const redisUrl = String(process.env.REDIS_URL || '').trim();
-  if (redisUrl) {
+  if (String(process.env.NOOD_CATALOG_FORCE_JSON || '').trim() === '1') {
+    console.log('[NOOD catalog] using JSON file cache (NOOD_CATALOG_FORCE_JSON=1)');
+    return new JsonCatalogCache();
+  }
+
+  const resolved = resolveRedisUrl();
+  if (resolved.url) {
     try {
-      const cache = await createRedisCache(redisUrl);
+      const cache = await createRedisCache(resolved.url);
+      logRedisStatus('catalog', {
+        driver: resolved.driver,
+        connected: true,
+        source: resolved.source,
+      });
       console.log('[NOOD catalog] using Redis cache');
       return cache;
     } catch (error) {
+      logRedisStatus('catalog', {
+        driver: resolved.driver,
+        connected: false,
+        source: resolved.source,
+        error,
+      });
       console.warn('[NOOD catalog] Redis unavailable, falling back to JSON cache:', error.message);
     }
+  } else {
+    logRedisStatus('catalog', {
+      driver: 'memory',
+      connected: false,
+      source: resolved.source,
+    });
   }
 
   console.log('[NOOD catalog] using JSON file cache');
