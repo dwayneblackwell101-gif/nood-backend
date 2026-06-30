@@ -60,7 +60,7 @@ const {
   adminGraphql,
   STOREFRONT_MENU_QUERY,
 } = shopify;
-const { transformAdminProduct, safeString } = require('./transform');
+const { transformAdminProduct, compactProductForCache, safeString } = require('./transform');
 const { clearMixedFeedCache } = require('./feed-mix');
 const { applyCollectionHandleAliases } = require('./collection-aliases');
 
@@ -389,10 +389,6 @@ function buildProductHandlesByCollectionKey(products = []) {
       continue;
     }
 
-    if (safeString(product?.status).toUpperCase() === 'ARCHIVED') {
-      continue;
-    }
-
     for (const key of getProductCollectionKeysForReconcile(product)) {
       registerProductHandleOnReconcileIndex(index, key, productHandle);
     }
@@ -550,14 +546,6 @@ async function setSyncState(cache, patch, options = {}) {
     return previousState;
   }
 
-  if (
-    (previousStatus === 'running' || activeSyncPromise) &&
-    nextPatch.status !== 'failed' &&
-    syncStateProductCount(nextPreview) < previousProductCount
-  ) {
-    nextPatch.syncedProductCount = previousProductCount;
-  }
-
   let writtenState;
   if (typeof cache.setSyncState === 'function') {
     writtenState = await cache.setSyncState(nextPatch);
@@ -619,28 +607,39 @@ function syncStateProductCount(state = {}) {
   return Number(state?.syncedProductCount ?? state?.productCount ?? 0) || 0;
 }
 
+async function getLiveProductCount(cache) {
+  return typeof cache.getProductCount === 'function'
+    ? Number(await cache.getProductCount()) || 0
+    : 0;
+}
+
+async function getLiveCollectionCount(cache) {
+  return typeof cache.getCollectionCount === 'function'
+    ? Number(await cache.getCollectionCount()) || 0
+    : 0;
+}
+
 async function getCatalogCounts(cache, options = {}) {
   const meta = (await cache.getMeta?.()) || null;
-  const liveProductCount =
-    typeof cache.getProductCount === 'function'
-      ? Number(await cache.getProductCount()) || 0
-      : 0;
-  const liveCollectionCount =
-    typeof cache.getCollectionCount === 'function'
-      ? Number(await cache.getCollectionCount()) || 0
-      : 0;
+  const liveProductCount = await getLiveProductCount(cache);
+  const liveCollectionCount = await getLiveCollectionCount(cache);
 
-  const productCount = Math.max(
-    liveProductCount,
-    metaCount(meta, 'productCount', 0),
-    Number(options.syncedProductCount ?? 0) || 0
-  );
+  const productCount = liveProductCount || metaCount(meta, 'productCount', 0);
   const collectionCount =
     options.phase === 'collections' || options.phase === 'completed'
       ? liveCollectionCount || metaCount(meta, 'collectionCount', 0)
-      : Number(options.syncedCollectionCount ?? 0) || 0;
+      : liveCollectionCount || Number(options.syncedCollectionCount ?? 0) || 0;
 
   return { productCount, collectionCount };
+}
+
+function isCatalogProductCountSatisfied(productCount, shopifyProductsCount) {
+  const liveCount = Number(productCount) || 0;
+  const targetCount = Number(shopifyProductsCount) || 0;
+  if (!targetCount) {
+    return liveCount > 0;
+  }
+  return liveCount >= targetCount;
 }
 
 async function getCatalogSyncStatus(cache) {
@@ -723,16 +722,10 @@ async function saveProductPage(cache, adminProducts, config) {
   let saved = 0;
 
   for (const adminProduct of adminProducts) {
-    const product = transformAdminProduct(
-      adminProduct,
-      config.catalogCurrencyCode || config.currencyCode
+    const product = compactProductForCache(
+      transformAdminProduct(adminProduct, config.catalogCurrencyCode || config.currencyCode)
     );
-    if (!product.handle) {
-      continue;
-    }
-
-    if (safeString(product.status).toUpperCase() === 'ARCHIVED') {
-      await cache.deleteProduct(product.handle);
+    if (!product?.handle || !product?.id) {
       continue;
     }
 
@@ -1019,9 +1012,8 @@ async function refreshCollectionsForHandles(cache, handles = [], context = {}) {
 
 async function syncSingleProduct(cache, adminProduct, context = {}) {
   const config = getShopifyConfig();
-  const product = transformAdminProduct(
-    adminProduct,
-    config.catalogCurrencyCode || config.currencyCode
+  const product = compactProductForCache(
+    transformAdminProduct(adminProduct, config.catalogCurrencyCode || config.currencyCode)
   );
   const handle = safeString(product?.handle);
   const productId = safeString(product?.id);
@@ -1038,24 +1030,7 @@ async function syncSingleProduct(cache, adminProduct, context = {}) {
   const oldSnapshot = productCacheSnapshot(oldProduct);
   const newSnapshot = productCacheSnapshot(product);
 
-  if (!handle || product.status === 'ARCHIVED') {
-    if (handle) {
-      const removed = await cache.deleteProduct(handle);
-      await refreshCollectionsForHandles(cache, oldProduct?.collectionHandles || [], {
-        reason: reason || 'product-archived',
-      });
-      await invalidateDerivedCatalogCaches(cache);
-      await bumpCatalogVersion(cache, reason || 'product-archived');
-      console.log('[NOOD cache] product updated', {
-        productId,
-        handle,
-        cacheKey: productCacheKey(handle),
-        action: 'removed',
-        old: oldSnapshot,
-        new: null,
-        writeSuccess: removed,
-      });
-    }
+  if (!handle || !productId) {
     return null;
   }
 
@@ -1209,7 +1184,6 @@ async function syncProductsPhase(cache, config, state, options = {}) {
   const pageSize = Math.max(1, Number(options.pageSize) || 25);
   let after =
     options.resume && state.productCursor ? state.productCursor : null;
-  let totalSaved = options.resume ? Number(state.syncedProductCount || 0) : 0;
   let hasNextPage = true;
   let pagesProcessed = 0;
   let pageAttempts = 0;
@@ -1227,7 +1201,6 @@ async function syncProductsPhase(cache, config, state, options = {}) {
       pageItems = page.items;
       pageInfo = page.pageInfo;
       const savedThisPage = await saveProductPage(cache, pageItems, config);
-      totalSaved += savedThisPage;
       hasNextPage = pageInfo?.hasNextPage === true;
       after = hasNextPage ? safeString(pageInfo?.endCursor) : null;
       if (hasNextPage && !after) {
@@ -1236,24 +1209,15 @@ async function syncProductsPhase(cache, config, state, options = {}) {
       pagesProcessed += 1;
       pageAttempts = 0;
 
-      const liveProductCount =
-        typeof cache.getProductCount === 'function'
-          ? Number(await cache.getProductCount()) || 0
-          : totalSaved;
-      const stableProductCount = Math.max(
-        liveProductCount,
-        totalSaved,
-        Number(state.syncedProductCount || 0)
-      );
-      totalSaved = stableProductCount;
+      const liveProductCount = await getLiveProductCount(cache);
       const productCount = metaCount(
         await cache.setMeta({
-          productCount: stableProductCount,
+          productCount: liveProductCount,
           syncInProgress: true,
           source: 'shopify',
         }),
         'productCount',
-        stableProductCount
+        liveProductCount
       );
 
       await setSyncState(cache, {
@@ -1261,7 +1225,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         phase: 'products',
         productCursor: after,
         productsCompleted: hasNextPage === false,
-        syncedProductCount: stableProductCount,
+        syncedProductCount: liveProductCount,
         lastError: null,
         message: null,
         chunkPages: maxPages,
@@ -1274,7 +1238,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         hasNextPage,
         endCursor: pageInfo?.endCursor || null,
         savedCount: savedThisPage,
-        totalSaved,
+        liveProductCount,
         productCount,
       });
     } catch (error) {
@@ -1296,7 +1260,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         phase: 'products',
         productCursor: after,
         productsCompleted: false,
-        syncedProductCount: Math.max(totalSaved, Number(state.syncedProductCount || 0)),
+        syncedProductCount: await getLiveProductCount(cache),
         lastError: safeString(error.message, 'sync page failed'),
         chunkPages: maxPages,
         chunkPageSize: pageSize,
@@ -1315,7 +1279,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
   }
 
   return {
-    totalSaved,
+    totalSaved: await getLiveProductCount(cache),
     nextCursor: after,
     completed: hasNextPage === false,
     paused: hasNextPage === true,
@@ -1378,21 +1342,14 @@ async function syncCollectionsPhase(cache, state, options = {}) {
         liveCollectionCount
       );
 
-      const liveProductCount =
-        typeof cache.getProductCount === 'function'
-          ? Number(await cache.getProductCount()) || 0
-          : Number(state.syncedProductCount || 0);
-      const stableProductCount = Math.max(
-        liveProductCount,
-        Number(state.syncedProductCount || 0)
-      );
+      const liveProductCount = await getLiveProductCount(cache);
 
       await setSyncState(cache, {
         status: 'running',
         phase: 'collections',
         collectionCursor: after,
         syncedCollectionCount: totalSaved,
-        syncedProductCount: stableProductCount,
+        syncedProductCount: liveProductCount,
         lastError: null,
         message: null,
         chunkPages: maxPages,
@@ -1500,13 +1457,7 @@ async function runResumableCatalogSync(cache, options = {}) {
     options.shopifyProductsCount === undefined
       ? await fetchShopifyProductsCount()
       : options.shopifyProductsCount;
-  const liveProductCount =
-    Math.max(
-      typeof cache.getProductCount === 'function'
-        ? Number(await cache.getProductCount()) || 0
-        : 0,
-      Number(state.syncedProductCount || 0)
-    );
+  const liveProductCount = await getLiveProductCount(cache);
   const phase = resolveSyncPhase(state, resume, {
     productCount: liveProductCount,
     shopifyProductsCount,
@@ -1514,6 +1465,17 @@ async function runResumableCatalogSync(cache, options = {}) {
 
   if (phase === 'completed') {
     const counts = await getCatalogCounts(cache, { phase: 'completed' });
+    if (!isCatalogProductCountSatisfied(counts.productCount, shopifyProductsCount)) {
+      return {
+        status: 'restart_required',
+        message: `Catalog sync is marked completed at ${counts.productCount}/${shopifyProductsCount || 'unknown'} Shopify products. Retry with restart=true.`,
+        productCount: counts.productCount,
+        collectionCount: counts.collectionCount,
+        shopifyProductsCount,
+        restartAllowed: true,
+      };
+    }
+
     return {
       status: 'completed',
       message: 'Catalog sync already completed.',
@@ -1620,6 +1582,34 @@ async function runResumableCatalogSync(cache, options = {}) {
     });
     const productCount = metaCount(meta, 'productCount', counts.productCount);
     const collectionCount = metaCount(meta, 'collectionCount', counts.collectionCount);
+
+    if (!isCatalogProductCountSatisfied(productCount, shopifyProductsCount)) {
+      const incompleteMessage = `Catalog sync finished pagination with ${productCount}/${shopifyProductsCount || 'unknown'} Shopify products in Redis. Retry with restart=true.`;
+      await setSyncState(cache, {
+        status: 'failed',
+        phase: 'products',
+        productCursor: null,
+        collectionCursor: null,
+        productsCompleted: false,
+        syncedProductCount: productCount,
+        syncedCollectionCount: collectionCount,
+        shopifyProductsCount,
+        lastError: incompleteMessage,
+        message: incompleteMessage,
+        completedAt: null,
+      });
+      await checkpointCache(cache);
+      console.log(`[NOOD sync] incomplete productCount=${productCount} shopifyProductsCount=${shopifyProductsCount}`);
+
+      return {
+        status: 'restart_required',
+        message: incompleteMessage,
+        productCount,
+        collectionCount,
+        shopifyProductsCount,
+        restartAllowed: true,
+      };
+    }
 
     await setSyncState(cache, {
       status: 'completed',

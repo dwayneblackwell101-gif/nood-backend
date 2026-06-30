@@ -166,6 +166,90 @@ function transformStorefrontProduct(node, currencyCode = 'USD') {
   };
 }
 
+const CACHE_MAX_IMAGES = 1;
+const CACHE_MAX_DESCRIPTION_HTML_CHARS = 800;
+const CACHE_MAX_VARIANTS = 20;
+
+function compactVariantForCache(variant) {
+  if (!variant) {
+    return null;
+  }
+
+  return {
+    id: variant.id,
+    title: safeString(variant.title, 'Default Title'),
+    availableForSale: Boolean(variant.availableForSale),
+    quantityAvailable: Number(variant.quantityAvailable ?? variant.inventoryQuantity ?? 0),
+    price: variant.price || toStorefrontMoney(0, 'USD'),
+    selectedOptions: Array.isArray(variant.selectedOptions)
+      ? variant.selectedOptions.map((option) => ({
+          name: safeString(option?.name),
+          value: safeString(option?.value),
+        }))
+      : [],
+  };
+}
+
+function compactProductForCache(product) {
+  if (!product || !product.handle || !product.id) {
+    return null;
+  }
+
+  const imageEdges = (product?.images?.edges || []).slice(0, CACHE_MAX_IMAGES);
+  const collectionEdges = product?.collections?.edges || [];
+  const collectionHandles = Array.isArray(product.collectionHandles) && product.collectionHandles.length
+    ? product.collectionHandles
+    : collectionEdges.map((edge) => safeString(edge?.node?.handle)).filter(Boolean);
+  const variantEdges = (product?.variants?.edges || [])
+    .slice(0, CACHE_MAX_VARIANTS)
+    .map((edge) => {
+      const compactVariant = compactVariantForCache(edge?.node);
+      return compactVariant ? { node: compactVariant } : null;
+    })
+    .filter(Boolean);
+
+  const compact = {
+    id: product.id,
+    title: product.title,
+    handle: product.handle,
+    descriptionHtml: safeString(product.descriptionHtml).slice(0, CACHE_MAX_DESCRIPTION_HTML_CHARS),
+    description: stripHtml(product.descriptionHtml || product.description || '').slice(
+      0,
+      CACHE_MAX_DESCRIPTION_HTML_CHARS
+    ),
+    vendor: safeString(product.vendor),
+    productType: safeString(product.productType),
+    tags: Array.isArray(product.tags) ? product.tags.slice(0, 20) : [],
+    status: safeString(product.status, 'ACTIVE'),
+    availableForSale: Boolean(product.availableForSale),
+    featuredImage: product.featuredImage || null,
+    images: { edges: imageEdges },
+    priceRange: product.priceRange || {
+      minVariantPrice: toStorefrontMoney(0, 'USD'),
+    },
+    collections: {
+      edges: collectionEdges.slice(0, 10).map((edge) => ({
+        node: {
+          id: edge?.node?.id || '',
+          handle: edge?.node?.handle || '',
+          title: edge?.node?.title || '',
+        },
+      })),
+    },
+    variants: { edges: variantEdges },
+    updatedAt: product.updatedAt || new Date().toISOString(),
+    collectionHandles,
+    firstVariantId: product.firstVariantId || null,
+    firstVariantTitle: product.firstVariantTitle || null,
+  };
+
+  if (product.compareAtPriceRange?.maxVariantPrice) {
+    compact.compareAtPriceRange = product.compareAtPriceRange;
+  }
+
+  return compact;
+}
+
 function toProductEdge(product) {
   return { node: product };
 }
@@ -312,6 +396,7 @@ module.exports = {
   stripHtml,
   transformAdminProduct,
   transformStorefrontProduct,
+  compactProductForCache,
   toStorefrontListProduct,
   paginateItems,
   paginateListProducts,
