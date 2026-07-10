@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const shopify = require('./shopify');
 
 const MISSING_SHOPIFY_PRODUCTS_PAGE_FETCHER =
@@ -78,6 +79,14 @@ const AUTO_RESUME_DELAY_MS = 750;
 const MAX_CHUNK_PAGES = 50;
 const MAX_PAGE_SIZE = 50;
 const CHUNK_COMPLETE_MESSAGE = 'chunk complete, resume required';
+const CATALOG_SYNC_LOCK_KEY = `${String(process.env.REDIS_NAMESPACE || 'nood').trim() || 'nood'}:catalog:sync:lock`;
+const CATALOG_SYNC_LOCK_TTL_SECONDS = Number(process.env.CATALOG_SYNC_LOCK_TTL_SECONDS || 900);
+const RELEASE_LOCK_SCRIPT = `
+  if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+  end
+  return 0
+`;
 
 let activeSyncPromise = null;
 
@@ -611,6 +620,33 @@ async function getLiveProductCount(cache) {
   return typeof cache.getProductCount === 'function'
     ? Number(await cache.getProductCount()) || 0
     : 0;
+}
+
+async function acquireCatalogSyncLock(cache) {
+  if (!cache?.client) {
+    return null;
+  }
+
+  const token = crypto.randomBytes(18).toString('hex');
+  const result = await cache.client.set(
+    CATALOG_SYNC_LOCK_KEY,
+    token,
+    'NX',
+    'EX',
+    Math.max(60, CATALOG_SYNC_LOCK_TTL_SECONDS)
+  );
+
+  if (result !== 'OK') {
+    return { acquired: false };
+  }
+
+  return {
+    acquired: true,
+    token,
+    async release() {
+      await cache.client.eval(RELEASE_LOCK_SCRIPT, 1, CATALOG_SYNC_LOCK_KEY, token);
+    },
+  };
 }
 
 async function getLiveCollectionCount(cache) {
@@ -1898,6 +1934,16 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     clearActiveSyncLock();
   }
 
+  const redisSyncLock = await acquireCatalogSyncLock(cache);
+  if (redisSyncLock && !redisSyncLock.acquired) {
+    return {
+      status: 'already_running',
+      message: 'Catalog sync is already running on another backend instance.',
+      productCount: counts.productCount,
+      shopifyProductsCount,
+    };
+  }
+
   const shouldResume =
     !restart &&
     (forceResume ||
@@ -1947,6 +1993,13 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     })
     .finally(() => {
       activeSyncPromise = null;
+      if (redisSyncLock?.acquired) {
+        void redisSyncLock.release().catch((error) => {
+          console.warn('[NOOD sync] failed to release Redis sync lock', {
+            message: error.message,
+          });
+        });
+      }
     });
 
   void activeSyncPromise;

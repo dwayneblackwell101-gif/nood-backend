@@ -79,7 +79,7 @@ async function mountCatalog(app, { requireAdminApiKey }) {
   try {
     const cache = await getCatalogCache();
     const catalogRouter = createCatalogRouter({ cache, requireAdminApiKey });
-    const webhookRouter = createWebhookRouter({ cache });
+    const webhookRouter = createWebhookRouter({ cache, requireAdminApiKey });
 
     app.use('/api/catalog', catalogRouter);
     app.use('/webhooks', webhookRouter);

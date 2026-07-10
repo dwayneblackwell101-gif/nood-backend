@@ -47,6 +47,7 @@ const {
 const { createCustomerAuthMiddleware } = require('./auth/customer-auth');
 const { createRedisLockService } = require('./storage/redis-lock');
 const { createRedisWalletService } = require('./wallet/redis-wallet');
+const { createPaymentStateService } = require('./payments/payment-state');
 const {
   getShopifyOrderAccessToken,
   hasShopifyOrderAdminAccessToken,
@@ -64,6 +65,7 @@ const walletTransactions = storage.walletTransactions.items;
 const redisNamespace = safeString(process.env.REDIS_NAMESPACE, 'nood');
 const lockService = createRedisLockService({ redis: storage.redis, namespace: redisNamespace });
 const redisWallet = createRedisWalletService({ redis: storage.redis, namespace: redisNamespace });
+const paymentState = createPaymentStateService({ redis: storage.redis, namespace: redisNamespace });
 const requireCustomerAuth = createCustomerAuthMiddleware();
 
 const { createReturnRequestHandlers } = require('./refunds/return-requests');
@@ -486,6 +488,68 @@ function isHttpsPaymentUrl(value) {
 function getPayPalApprovalUrl(data) {
   const links = Array.isArray(data?.links) ? data.links : [];
   return links.find((link) => link?.rel === 'approve')?.href || null;
+}
+
+function getRequestIdempotencyKey(req, fallback = '') {
+  return safeString(
+    req.get?.('idempotency-key') ||
+      req.get?.('x-idempotency-key') ||
+      req.body?.idempotencyKey ||
+      req.body?.idempotency_key ||
+      fallback
+  );
+}
+
+function getCartFingerprint(cartItems = []) {
+  const normalized = (Array.isArray(cartItems) ? cartItems : []).map((item) => ({
+    variantId: safeString(item?.variantId || item?.id),
+    quantity: Number(item?.quantity || 1),
+    price: safeMoney(item?.price || 0),
+  }));
+  return crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+}
+
+function getPayPalCaptureDetails(captureData = {}) {
+  const capture =
+    captureData?.purchase_units?.[0]?.payments?.captures?.[0] ||
+    captureData?.purchase_units?.[0]?.payments?.authorizations?.[0] ||
+    {};
+  return {
+    id: safeString(capture?.id || captureData?.id),
+    status: safeString(capture?.status || captureData?.status),
+    amount: safeString(capture?.amount?.value || captureData?.purchase_units?.[0]?.amount?.value),
+    currency: safeString(capture?.amount?.currency_code || captureData?.purchase_units?.[0]?.amount?.currency_code).toUpperCase(),
+  };
+}
+
+function verifyPayPalCaptureAmount({ captureData, expectedAmountCents, expectedCurrency = 'USD' }) {
+  const details = getPayPalCaptureDetails(captureData);
+  if (captureData?.status !== 'COMPLETED' && details.status !== 'COMPLETED') {
+    const error = new Error(`PayPal payment was ${captureData?.status || details.status || 'not completed'}.`);
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (!details.id) {
+    const error = new Error('PayPal capture ID missing.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (details.currency !== expectedCurrency) {
+    const error = new Error('PayPal capture currency mismatch.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const capturedCents = usdToCents(details.amount);
+  if (capturedCents !== Number(expectedAmountCents)) {
+    const error = new Error('PayPal capture amount mismatch.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return { ...details, amountCents: capturedCents };
 }
 
 function normalizeShopifyVariantGid(rawVariantId) {
@@ -2070,6 +2134,10 @@ async function getBackendReadiness() {
 
   addCheck('critical_storage_redis', storage.storageDriver === 'redis' && Boolean(storage.redis));
   addCheck('wallet_atomic_support', Boolean(redisWallet));
+  addCheck('payment_state_storage', Boolean(paymentState));
+  addCheck('webhook_queue_storage', Boolean(storage.redis), {
+    message: storage.redis ? 'redis_configured' : 'Redis is required for persistent webhook jobs.',
+  });
 
   const payPalEnabled = ['1', 'true', 'yes'].includes(
     safeString(process.env.PAYPAL_ENABLED, 'true').toLowerCase()
@@ -2103,7 +2171,7 @@ async function getBackendReadiness() {
   };
 }
 
-app.post('/api/orders', async (req, res) => {
+app.post('/api/orders', requireCustomerAuth, async (req, res) => {
   try {
     if (!hasPayPalCredentials()) {
       return res.status(500).json({
@@ -2116,6 +2184,11 @@ app.post('/api/orders', async (req, res) => {
     const payPalAmounts = getPayPalCheckoutAmounts(req.body);
     const total = payPalAmounts.shopifyTotal;
     const cartItems = getCartItemsFromBody(req.body);
+    const customer = req.customer || {};
+    const operationKey = getRequestIdempotencyKey(
+      req,
+      checkoutSessionId || getCartFingerprint(cartItems)
+    );
 
     if (!cartItems.length) {
       return res.status(400).json({
@@ -2127,6 +2200,12 @@ app.post('/api/orders', async (req, res) => {
     if (checkoutSessionId) {
       const existingPending = findPendingByCheckoutSessionId(checkoutSessionId);
       if (existingPending?.pending?.paypalOrderId) {
+        if (safeString(existingPending.pending.customerId) !== safeString(customer.id)) {
+          return res.status(403).json({
+            error: true,
+            message: 'Authenticated customer does not own this checkout.',
+          });
+        }
         return res.status(201).json({
           id: existingPending.pending.paypalOrderId,
           status: 'CREATED',
@@ -2142,10 +2221,11 @@ app.post('/api/orders', async (req, res) => {
     );
     const shippingAddress = req.body?.shippingAddress || {};
     const customerName = safeString(
-      req.body?.name || shippingAddress?.fullName || shippingAddress?.name
+      req.body?.name || shippingAddress?.fullName || shippingAddress?.name,
+      `${safeString(customer.firstName)} ${safeString(customer.lastName)}`.trim() || 'NOOD Customer'
     );
-    const customerEmail = safeString(req.body?.email || shippingAddress?.email);
-    const customerPhone = safeString(req.body?.phone || shippingAddress?.phone, '');
+    const customerEmail = safeString(customer.email || req.body?.email || shippingAddress?.email);
+    const customerPhone = safeString(customer.phone || req.body?.phone || shippingAddress?.phone, '');
 
     const validationErrors = validateCheckoutData({
       total,
@@ -2185,6 +2265,22 @@ app.post('/api/orders', async (req, res) => {
       links: order?.links?.map((link) => ({ rel: link?.rel, href: link?.href })),
     });
 
+    if (paymentState) {
+      await paymentState.createPayment({
+        provider: 'paypal',
+        providerOrderId: order.id,
+        expectedAmountCents: usdToCents(payPalAmounts.paypalTotalUsd),
+        expectedCurrency: 'USD',
+        providerAmountCents: usdToCents(payPalAmounts.paypalTotalUsd),
+        providerCurrency: 'USD',
+        customerId: customer.id,
+        state: 'provider_pending',
+        idempotencyKey: `paypal:create:${operationKey}`,
+        cartFingerprint: getCartFingerprint(cartItems),
+        metadata: { checkoutSessionId: checkoutSessionId || orderId, orderId },
+      });
+    }
+
     setPendingOrder(order.id, {
       type: 'checkout',
       provider: 'paypal',
@@ -2194,6 +2290,7 @@ app.post('/api/orders', async (req, res) => {
       pendingCheckoutId: safeString(req.body?.pendingCheckoutId || req.body?.localOrderId || checkoutSessionId || orderId),
       checkoutSessionId: checkoutSessionId || orderId,
       paypalOrderId: order.id,
+      customerId: customer.id,
       total,
       currency: payPalAmounts.shopifyCurrency,
       paypalTotalUsd: payPalAmounts.paypalTotalUsd,
@@ -2228,7 +2325,7 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-app.post('/api/orders/:orderID/capture', async (req, res) => {
+app.post('/api/orders/:orderID/capture', requireCustomerAuth, async (req, res) => {
   try {
     if (!hasPayPalCredentials()) {
       return res.status(500).json({
@@ -2238,6 +2335,7 @@ app.post('/api/orders/:orderID/capture', async (req, res) => {
     }
 
     const orderId = safeString(req.params.orderID);
+    const customer = req.customer || {};
 
     if (!orderId) {
       return res.status(400).json({
@@ -2246,38 +2344,63 @@ app.post('/api/orders/:orderID/capture', async (req, res) => {
       });
     }
 
-    const captureResponse = await capturePayPalOrder(orderId);
+    const pending = pendingOrders.get(orderId);
+
+    if (!pending) {
+      return res.status(404).json({
+        success: false,
+        error: true,
+        message: 'PayPal checkout session was not found.',
+      });
+    }
+
+    if (safeString(pending.customerId) !== safeString(customer.id)) {
+      return res.status(403).json({
+        success: false,
+        error: true,
+        message: 'Authenticated customer does not own this PayPal checkout.',
+      });
+    }
+
+    const existingPayment = paymentState
+      ? await paymentState.getByProviderTransaction('paypal', orderId)
+      : null;
+
+    if (existingPayment?.state === 'completed') {
+      return res.json({
+        success: true,
+        idempotent: true,
+        status: 'COMPLETED',
+        transaction_id: existingPayment.providerTransactionId,
+        shopify_order_id: existingPayment.shopifyOrderId || '',
+        shopify_order_name: existingPayment.shopifyOrderName || '',
+        payment: paymentState.publicPayment(existingPayment),
+      });
+    }
+
+    const runCapture = async () => {
+      const captureResponse = await capturePayPalOrder(orderId);
     console.log('[NOOD backend] PayPal capture response', {
       id: captureResponse?.id,
       status: captureResponse?.status,
       captures: captureResponse?.purchase_units?.[0]?.payments?.captures || [],
     });
-    const captureId =
-      captureResponse?.purchase_units?.[0]?.payments?.captures?.[0]?.id ||
-      captureResponse?.id ||
-      orderId;
-
-    if (captureResponse?.status !== 'COMPLETED') {
-      return res.status(400).json({
-        success: false,
-        error: true,
-        status: captureResponse?.status || 'UNKNOWN',
-        message: `PayPal payment was ${captureResponse?.status || 'not completed'}.`,
-        paypal: captureResponse,
+      const verifiedCapture = verifyPayPalCaptureAmount({
+        captureData: captureResponse,
+        expectedAmountCents: usdToCents(pending.paypalTotalUsd || pending.total),
+        expectedCurrency: 'USD',
       });
-    }
+      const captureId = verifiedCapture.id;
 
-    const pending = pendingOrders.get(orderId);
-
-    if (!pending) {
-      return res.status(409).json({
-        success: false,
-        error: true,
-        message: 'PayPal was captured, but the matching pending order was not found. Recover this order manually before charging again.',
-        paypal: captureResponse,
-        transaction_id: captureId,
-      });
-    }
+      let nextPayment = existingPayment;
+      if (paymentState && existingPayment) {
+        nextPayment = await paymentState.transitionPayment(existingPayment.paymentId, 'provider_verified', {
+          providerTransactionId: captureId,
+          providerAmountCents: verifiedCapture.amountCents,
+          providerCurrency: verifiedCapture.currency,
+        });
+        nextPayment = await paymentState.transitionPayment(nextPayment.paymentId, 'order_creating');
+      }
 
     const shopifyResult = await createShopifyOrderFromPaidPayment({
       method: 'paypal',
@@ -2288,7 +2411,12 @@ app.post('/api/orders/:orderID/capture', async (req, res) => {
     });
 
     if (!shopifyResult.success) {
-      return res.status(202).json({
+        if (paymentState && nextPayment) {
+          await paymentState.transitionPayment(nextPayment.paymentId, 'recovery_required', {
+            lastSafeErrorCode: 'shopify_order_create_failed',
+          });
+        }
+        return res.status(202).json({
         success: false,
         payment_received: true,
         status: 'payment_received_order_review',
@@ -2304,6 +2432,13 @@ app.post('/api/orders/:orderID/capture', async (req, res) => {
 
     const shopifyOrder = shopifyResult.shopifyOrder;
 
+      if (paymentState && nextPayment) {
+        await paymentState.transitionPayment(nextPayment.paymentId, 'completed', {
+          shopifyOrderId: safeString(shopifyOrder?.id),
+          shopifyOrderName: safeString(shopifyOrder?.name),
+        });
+      }
+
     removePendingOrder(orderId);
 
     return res.json({
@@ -2315,6 +2450,13 @@ app.post('/api/orders/:orderID/capture', async (req, res) => {
       shopifyOrder,
       paypal: captureResponse,
     });
+    };
+
+    if (lockService) {
+      return await lockService.withLock(`paypal:capture:${orderId}`, Number(process.env.PAYMENT_LOCK_TTL_SECONDS || 60), runCapture);
+    }
+
+    return await runCapture();
   } catch (error) {
     const errorData = error.response?.data || error.message;
     console.error('PAYPAL CAPTURE ORDER ERROR:', errorData);
@@ -2331,7 +2473,7 @@ app.post('/api/orders/:orderID/capture', async (req, res) => {
   }
 });
 
-app.post('/api/shopify/orders', async (req, res) => {
+app.post('/api/shopify/orders', requireAdminApiKey, async (req, res) => {
   const paymentMethod = safeString(req.body?.paymentMethod, 'NOOD Wallet');
   const provider = paymentMethod.toLowerCase().includes('paypal')
     ? 'paypal'
@@ -2665,8 +2807,18 @@ app.post('/api/failed-paid-orders/:recoveryId/retry', requireAdminApiKey, async 
   }
 });
 
-app.post('/create-wipay-payment', async (req, res) => {
+app.post('/create-wipay-payment', requireCustomerAuth, async (req, res) => {
   try {
+    const wiPayEnabled = ['1', 'true', 'yes'].includes(
+      safeString(process.env.WIPAY_ENABLED, 'false').toLowerCase()
+    );
+    if (!wiPayEnabled) {
+      return res.status(503).json({
+        success: false,
+        error: true,
+        message: 'WiPay checkout is disabled until provider verification and USD currency support are confirmed.',
+      });
+    }
     const { name, email, phone, shippingAddress = {} } = req.body;
     const cartItems = getCartItemsFromBody(req.body);
     const checkoutSessionId = resolveCheckoutSessionId(req.body);
@@ -2844,9 +2996,16 @@ app.post('/create-wipay-payment', async (req, res) => {
   }
 });
 
-app.post('/create-paypal-payment', async (req, res) => {
+app.post('/create-paypal-payment', requireCustomerAuth, async (req, res) => {
   try {
-    const { name, email, phone, shippingAddress = {} } = req.body;
+    const { shippingAddress = {} } = req.body;
+    const customer = req.customer || {};
+    const name = safeString(
+      req.body?.name || shippingAddress?.fullName || shippingAddress?.name,
+      `${safeString(customer.firstName)} ${safeString(customer.lastName)}`.trim() || 'NOOD Customer'
+    );
+    const email = safeString(customer.email || req.body?.email || shippingAddress?.email);
+    const phone = safeString(customer.phone || req.body?.phone || shippingAddress?.phone);
 
     if (!hasPayPalCredentials()) {
       return res.status(500).json({
@@ -2915,6 +3074,7 @@ app.post('/create-paypal-payment', async (req, res) => {
       paypalTotalUsd: payPalAmounts.paypalTotalUsd,
       paypalCurrency: payPalAmounts.paypalCurrency,
       exchangeRate: payPalAmounts.exchangeRate,
+      customerId: customer.id,
       name: customerName,
       email: customerEmail,
       phone: customerPhone,

@@ -18,6 +18,20 @@ const WEBHOOK_DEDUP_TTL_SECONDS = Math.ceil(WEBHOOK_DEDUP_TTL_MS / 1000);
 const WEBHOOK_DEDUP_MAX = 5000;
 const WEBHOOK_JOB_DEBOUNCE_MS = 1200;
 const REDIS_NAMESPACE = safeString(process.env.REDIS_NAMESPACE, 'nood');
+const WEBHOOK_QUEUE_KEY = `${REDIS_NAMESPACE}:webhook:queue`;
+const WEBHOOK_PROCESSING_KEY = `${REDIS_NAMESPACE}:webhook:processing`;
+const WEBHOOK_FAILED_KEY = `${REDIS_NAMESPACE}:webhook:failed`;
+
+function createWebhookJobId(job) {
+  return crypto
+    .createHash('sha256')
+    .update(`${job.webhookId || ''}:${job.dedupeKey || ''}:${Date.now()}`)
+    .digest('hex');
+}
+
+function webhookJobKey(jobId) {
+  return `${REDIS_NAMESPACE}:webhook:job:${jobId}`;
+}
 
 function createWebhookRedis() {
   const redisUrl = safeString(process.env.REDIS_URL);
@@ -145,6 +159,51 @@ function createWebhookQueue() {
   const queue = [];
   let processing = false;
 
+  async function persistJob(job) {
+    const redis = await webhookRedis.ready;
+    if (!redis) return { jobId: null };
+
+    const jobId = createWebhookJobId(job);
+    const now = new Date().toISOString();
+    const record = {
+      jobId,
+      webhookId: job.webhookId || null,
+      topic: job.topic,
+      action: job.action,
+      shop: job.shop,
+      dedupeKey: job.dedupeKey,
+      resourceId: job.resourceId || '',
+      handle: job.handle || '',
+      status: 'pending',
+      retryCount: 0,
+      receivedAt: now,
+      updatedAt: now,
+    };
+
+    await redis.multi().set(webhookJobKey(jobId), JSON.stringify(record)).rpush(WEBHOOK_QUEUE_KEY, jobId).exec();
+    return { jobId, record };
+  }
+
+  async function updateJobStatus(job, status, patch = {}) {
+    if (!job.jobId) return;
+    const redis = await webhookRedis.ready;
+    if (!redis) return;
+
+    const key = webhookJobKey(job.jobId);
+    const existing = JSON.parse((await redis.get(key)) || '{}');
+    const next = {
+      ...existing,
+      ...patch,
+      status,
+      updatedAt: new Date().toISOString(),
+    };
+    const multi = redis.multi().set(key, JSON.stringify(next));
+    if (status === 'processing') multi.sadd(WEBHOOK_PROCESSING_KEY, job.jobId);
+    if (status === 'completed') multi.srem(WEBHOOK_PROCESSING_KEY, job.jobId);
+    if (status === 'failed') multi.sadd(WEBHOOK_FAILED_KEY, job.jobId).srem(WEBHOOK_PROCESSING_KEY, job.jobId);
+    await multi.exec();
+  }
+
   function pruneSeenWebhookIds() {
     const cutoff = Date.now() - WEBHOOK_DEDUP_TTL_MS;
     for (const [id, seenAt] of seenWebhookIds.entries()) {
@@ -207,6 +266,7 @@ function createWebhookQueue() {
       await new Promise((resolve) => setTimeout(resolve, WEBHOOK_JOB_DEBOUNCE_MS));
 
       const startedAt = Date.now();
+      await updateJobStatus(job, 'processing');
       console.log('[NOOD webhook] sync queued', {
         topic: job.topic,
         action: job.action,
@@ -228,6 +288,10 @@ function createWebhookQueue() {
           handle: job.handle || result?.handle || '',
           durationMs: Date.now() - startedAt,
         });
+        await updateJobStatus(job, 'completed', {
+          completedAt: new Date().toISOString(),
+          durationMs: Date.now() - startedAt,
+        });
       } catch (error) {
         console.error('[NOOD webhook] sync failed', {
           topic: job.topic,
@@ -237,6 +301,10 @@ function createWebhookQueue() {
           resourceId: job.resourceId || '',
           handle: job.handle || '',
           message: error.message,
+        });
+        await updateJobStatus(job, 'failed', {
+          retryCount: Number(job.retryCount || 0) + 1,
+          lastError: safeString(error.message).slice(0, 300),
         });
       }
     }
@@ -259,14 +327,34 @@ function createWebhookQueue() {
       return { accepted: true, coalesced: true };
     }
 
-    pendingByKey.set(job.dedupeKey, job);
+    const persisted = await persistJob(job);
+    const queuedJob = { ...job, jobId: persisted.jobId };
+    pendingByKey.set(job.dedupeKey, queuedJob);
     queue.push(job.dedupeKey);
     void drain();
 
-    return { accepted: true, coalesced: false };
+    return { accepted: true, coalesced: false, jobId: persisted.jobId };
   }
 
-  return { enqueue };
+  async function getStats() {
+    const redis = await webhookRedis.ready;
+    if (!redis) {
+      return {
+        driver: 'memory',
+        pending: queue.length,
+        processing: processing ? 1 : 0,
+        failed: 0,
+      };
+    }
+    const [pending, processingCount, failed] = await Promise.all([
+      redis.llen(WEBHOOK_QUEUE_KEY),
+      redis.scard(WEBHOOK_PROCESSING_KEY),
+      redis.scard(WEBHOOK_FAILED_KEY),
+    ]);
+    return { driver: 'redis', pending, processing: processingCount, failed };
+  }
+
+  return { enqueue, getStats };
 }
 
 async function resolveInventoryProductGid(payload) {
@@ -291,8 +379,7 @@ async function resolveInventoryProductGid(payload) {
   }
 }
 
-function createWebhookHandler({ cache }) {
-  const queue = createWebhookQueue();
+function createWebhookHandler({ cache, queue = createWebhookQueue() }) {
   const webhookSecret = safeString(process.env.SHOPIFY_WEBHOOK_SECRET);
 
   return async function handleShopifyWebhook(req, res) {
@@ -450,11 +537,17 @@ function createWebhookHandler({ cache }) {
   };
 }
 
-function createWebhookRouter({ cache }) {
+function createWebhookRouter({ cache, requireAdminApiKey }) {
   const router = require('express').Router();
-  const handleShopifyWebhook = createWebhookHandler({ cache });
+  const queue = createWebhookQueue();
+  const handleShopifyWebhook = createWebhookHandler({ cache, queue });
 
   router.post('/shopify', handleShopifyWebhook);
+  if (requireAdminApiKey) {
+    router.get('/admin/queue/status', requireAdminApiKey, async (_req, res) => {
+      res.json({ success: true, queue: await queue.getStats() });
+    });
+  }
 
   return router;
 }
