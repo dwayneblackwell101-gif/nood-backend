@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { safeString } = require('./transform');
 
-const WEBHOOK_BODY_LIMIT = '50mb';
+const WEBHOOK_BODY_LIMIT = process.env.SHOPIFY_WEBHOOK_BODY_LIMIT || '1mb';
 const {
   syncProductByAdminId,
   deleteProductFromCache,

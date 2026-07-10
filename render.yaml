@@ -24,7 +24,7 @@ services:
       - key: NOOD_ALLOWED_ORIGINS
         sync: false
       - key: SHOPIFY_CURRENCY
-        value: USD
+        sync: false
       - key: SHOPIFY_STORE_DOMAIN
         sync: false
       - key: SHOPIFY_ADMIN_ACCESS_TOKEN
@@ -42,8 +42,8 @@ services:
       - key: PAYPAL_ENV
         sync: false
       - key: WIPAY_ACCOUNT_NUMBER
-        value: "3815671283"
+        sync: false
       - key: WIPAY_API_KEY
         sync: false
       - key: WIPAY_ENVIRONMENT
-        value: sandbox
+        sync: false

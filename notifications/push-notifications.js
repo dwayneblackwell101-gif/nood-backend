@@ -1,7 +1,13 @@
 const express = require('express');
 const axios = require('axios');
+const rateLimit = require('express-rate-limit');
 
 const EXPO_PUSH_SEND_URL = 'https://exp.host/--/api/v2/push/send';
+const MAX_TITLE_LENGTH = 120;
+const MAX_BODY_LENGTH = 500;
+const MAX_DATA_KEYS = 20;
+const MAX_DATA_VALUE_LENGTH = 500;
+const VALID_AUDIENCES = new Set(['all']);
 const INVALID_TOKEN_ERRORS = new Set([
   'DeviceNotRegistered',
   'InvalidCredentials',
@@ -34,8 +40,72 @@ function chunkArray(items, size) {
   return chunks;
 }
 
-function createNotificationsRouter({ pushTokens }) {
+function rejectMissingAdminAuth(_req, res) {
+  return res.status(503).json({
+    ok: false,
+    message: 'Admin notification auth is not configured.',
+  });
+}
+
+function sanitizeNotificationData(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return {};
+  }
+
+  const safeData = {};
+  for (const [key, value] of Object.entries(data).slice(0, MAX_DATA_KEYS)) {
+    const safeKey = safeString(key).replace(/[^\w.-]/g, '').slice(0, 64);
+    if (!safeKey) continue;
+
+    if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) {
+      safeData[safeKey] = String(value).slice(0, MAX_DATA_VALUE_LENGTH);
+    }
+  }
+
+  return safeData;
+}
+
+function validateSendRequest(body = {}) {
+  const title = safeString(body.title).slice(0, MAX_TITLE_LENGTH);
+  const messageBody = safeString(body.body).slice(0, MAX_BODY_LENGTH);
+  const audience = safeString(body.audience || 'all').toLowerCase();
+  const errors = [];
+
+  if (!title) errors.push('title is required.');
+  if (!messageBody) errors.push('body is required.');
+  if (safeString(body.title).length > MAX_TITLE_LENGTH) {
+    errors.push(`title must be ${MAX_TITLE_LENGTH} characters or less.`);
+  }
+  if (safeString(body.body).length > MAX_BODY_LENGTH) {
+    errors.push(`body must be ${MAX_BODY_LENGTH} characters or less.`);
+  }
+  if (!VALID_AUDIENCES.has(audience)) {
+    errors.push('audience must be "all".');
+  }
+
+  return {
+    errors,
+    value: {
+      title,
+      body: messageBody,
+      audience,
+      data: sanitizeNotificationData(body.data),
+    },
+  };
+}
+
+function createNotificationsRouter({ pushTokens, requireAdminApiKey = rejectMissingAdminAuth }) {
   const router = express.Router();
+  const sendLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: Number(process.env.NOTIFICATION_SEND_RATE_LIMIT || 10),
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      ok: false,
+      message: 'Too many notification send attempts. Please try again shortly.',
+    },
+  });
 
   router.get('/health', (req, res) => {
     res.json({ ok: true, service: 'notifications' });
@@ -102,29 +172,26 @@ function createNotificationsRouter({ pushTokens }) {
     return response.data;
   }
 
-  router.post('/send', async (req, res) => {
+  router.post('/send', sendLimiter, requireAdminApiKey, async (req, res) => {
     try {
-      const title = safeString(req.body?.title);
-      const body = safeString(req.body?.body);
-      const data =
-        req.body?.data && typeof req.body.data === 'object' && !Array.isArray(req.body.data)
-          ? req.body.data
-          : {};
+      const validation = validateSendRequest(req.body);
 
-      if (!title || !body) {
+      if (validation.errors.length) {
         return res.status(400).json({
           ok: false,
-          message: 'title and body are required.',
+          message: validation.errors[0],
+          validationErrors: validation.errors,
         });
       }
 
+      const { title, body, data, audience } = validation.value;
       const savedTokens = pushTokens
         .values()
         .map((entry) => safeString(entry?.token))
         .filter((token) => isValidExpoPushToken(token));
 
       const uniqueTokens = Array.from(new Set(savedTokens));
-      logNotifications('send started', { tokenCount: uniqueTokens.length });
+      logNotifications('send started', { audience, tokenCount: uniqueTokens.length });
 
       if (!uniqueTokens.length) {
         return res.json({
@@ -208,3 +275,5 @@ function createNotificationsRouter({ pushTokens }) {
 
 module.exports = createNotificationsRouter;
 module.exports.isValidExpoPushToken = isValidExpoPushToken;
+module.exports.sanitizeNotificationData = sanitizeNotificationData;
+module.exports.validateSendRequest = validateSendRequest;

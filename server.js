@@ -1,12 +1,15 @@
 const path = require('path');
 
 require('dotenv').config({ path: path.join(__dirname, '.env') });
+require('dotenv').config({ path: path.join(__dirname, '.env.local'), override: true });
 
 const crypto = require('crypto');
 const os = require('os');
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 let createStorage;
 try {
@@ -68,6 +71,7 @@ const returnRequestHandlers = createReturnRequestHandlers({
 const createNotificationsRouter = require('./notifications/push-notifications');
 const notificationsRouter = createNotificationsRouter({
   pushTokens: storage.pushTokens,
+  requireAdminApiKey,
 });
 
 const PORT = Number(process.env.PORT || 3000);
@@ -84,8 +88,6 @@ const SHOPIFY_CURRENCY = safeString(process.env.SHOPIFY_CURRENCY, 'USD').toUpper
 const PAYPAL_USD_TO_TTD_RATE = Number(process.env.PAYPAL_USD_TO_TTD_RATE || 6.8);
 const BACKEND_BASE_URL = getBackendBaseUrl();
 
-const WIPAY_ACCOUNT_NUMBER_DEFAULT = '3815671283';
-
 function normalizeWiPayAccountNumber(rawValue) {
   return String(rawValue || '').replace(/\D/g, '');
 }
@@ -94,16 +96,6 @@ function resolveWiPayAccountNumber() {
   const fromEnv = normalizeWiPayAccountNumber(process.env.WIPAY_ACCOUNT_NUMBER);
   if (fromEnv) {
     return fromEnv;
-  }
-
-  if (IS_PRODUCTION) {
-    const productionDefault = normalizeWiPayAccountNumber(WIPAY_ACCOUNT_NUMBER_DEFAULT);
-    if (productionDefault) {
-      console.warn(
-        '[NOOD backend] WIPAY_ACCOUNT_NUMBER missing or invalid in env; using digits-only production default'
-      );
-      return productionDefault;
-    }
   }
 
   return '';
@@ -131,29 +123,13 @@ function resolveWiPayEnvironmentConfig() {
       return { environment: 'live', source, raw };
     }
 
-    console.warn(`[WIPAY ENV] unrecognized value "${raw}" from ${source}; defaulting to sandbox`);
-    return { environment: 'sandbox', source, raw };
+    throw new Error(`Invalid ${source}. Expected "sandbox" or "live".`);
   }
 
   return { environment: 'sandbox', source: 'default', raw: '' };
 }
 
 function finalizeWiPayEnvironmentConfig(config) {
-  const allowLive = ['1', 'true', 'yes'].includes(
-    safeString(process.env.WIPAY_ALLOW_LIVE).toLowerCase()
-  );
-
-  if (IS_PRODUCTION && config.environment === 'live' && !allowLive) {
-    console.warn(
-      '[WIPAY ENV] live configured but WIPAY_ALLOW_LIVE is not enabled; forcing sandbox for test checkout'
-    );
-    return {
-      environment: 'sandbox',
-      source: `${config.source}+sandbox_override`,
-      raw: config.raw,
-    };
-  }
-
   return config;
 }
 
@@ -195,10 +171,30 @@ function getConfiguredAdminApiKey() {
 
 assertProductionConfig();
 
+if (IS_PRODUCTION) {
+  app.set('trust proxy', 1);
+}
+
+app.use(helmet());
+
 app.use(
   cors({
     origin: getCorsOrigin(),
     credentials: true,
+  })
+);
+
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: IS_PRODUCTION ? 300 : 2000,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      success: false,
+      error: true,
+      message: 'Too many requests. Please try again shortly.',
+    },
   })
 );
 mountShopifyWebhookBodyParser(app);
@@ -207,7 +203,7 @@ app.use((req, res, next) => {
   if (req._shopifyWebhookRawBody) {
     return next();
   }
-  return express.json()(req, res, next);
+  return express.json({ limit: process.env.REQUEST_BODY_LIMIT || '1mb' })(req, res, next);
 });
 
 function safeString(value, fallback = '') {
@@ -353,7 +349,10 @@ function requireAdminApiKey(req, res, next) {
   const providedKey = getProvidedAdminApiKey(req);
   const configured = configuredKeys.length > 0;
   const headerProvided = providedKey.length > 0;
-  const match = configured && headerProvided && configuredKeys.includes(providedKey);
+  const match =
+    configured &&
+    headerProvided &&
+    configuredKeys.some((configuredKey) => timingSafeStringEqual(configuredKey, providedKey));
 
   if (!configured) {
     return res.status(503).json({
@@ -375,6 +374,24 @@ function requireAdminApiKey(req, res, next) {
   return next();
 }
 
+function timingSafeStringEqual(expected, received) {
+  const expectedValue = trimValue(expected);
+  const receivedValue = trimValue(received);
+
+  if (!expectedValue || !receivedValue) {
+    return false;
+  }
+
+  const expectedBuffer = Buffer.from(expectedValue, 'utf8');
+  const receivedBuffer = Buffer.from(receivedValue, 'utf8');
+
+  if (expectedBuffer.length !== receivedBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+}
+
 function assertProductionConfig() {
   if (!IS_PRODUCTION) return;
 
@@ -384,6 +401,18 @@ function assertProductionConfig() {
 
   if (!getConfiguredAdminApiKey()) {
     throw new Error('ADMIN_API_KEY or NOOD_ADMIN_API_KEY is required in production.');
+  }
+
+  if (storage.storageDriver !== 'redis' || !safeString(process.env.REDIS_URL)) {
+    throw new Error('Production requires STORAGE_DRIVER=redis and REDIS_URL for persistent state.');
+  }
+
+  if (!WIPAY_ACCOUNT_NUMBER) {
+    throw new Error('WIPAY_ACCOUNT_NUMBER is required in production.');
+  }
+
+  if (WIPAY_ENVIRONMENT === 'live' && !WIPAY_API_KEY) {
+    throw new Error('WIPAY_API_KEY is required when WIPAY_ENVIRONMENT=live.');
   }
 }
 

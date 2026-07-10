@@ -1,13 +1,28 @@
 .env
-.env.local
+.env.*
+!.env.example
 node_modules/
 .expo/
 
-# Local JSON caches and payment storage (use Redis + remote storage in production)
+# Local JSON caches and runtime storage (use Redis + remote storage in production)
 catalog-cache.json
 pending-orders.json
 failed-paid-orders.json
 payment-records.json
+wallet-transactions.json
+refund-requests.json
+push-tokens.json
+webhook-jobs.json
+webhook-dedup*.json
+*.credentials
+*.credentials.*
+*.secret
+*.secret.*
+*credential*.json
+*secret*.json
 
 *.log
+*.err.log
+backend*.log
+backend*.err.log
 .DS_Store
