@@ -14,6 +14,9 @@ try {
 const STORAGE_DRIVER = String(process.env.STORAGE_DRIVER || 'json').trim().toLowerCase();
 const REDIS_URL = String(process.env.REDIS_URL || '').trim();
 const USE_REDIS_PAYMENT_STORAGE = STORAGE_DRIVER === 'redis' || Boolean(REDIS_URL);
+const LOCAL_STATE_FALLBACK_ENABLED = ['1', 'true', 'yes'].includes(
+  String(process.env.LOCAL_STATE_FALLBACK_ENABLED || '').trim().toLowerCase()
+);
 
 // Local development storage only. These JSON files are convenient for testing,
 // but production should use Redis for payment recovery state so records survive deploys.
@@ -87,6 +90,20 @@ function createStorage() {
     paymentRecordsDriver: 'json',
   };
 
+  if (process.env.NODE_ENV === 'production' && STORAGE_DRIVER !== 'redis') {
+    throw new Error('Production requires STORAGE_DRIVER=redis. Local JSON state is not allowed.');
+  }
+
+  if (process.env.NODE_ENV === 'production' && !REDIS_URL) {
+    throw new Error('Production requires REDIS_URL for critical backend state.');
+  }
+
+  if (STORAGE_DRIVER === 'json' && !LOCAL_STATE_FALLBACK_ENABLED) {
+    console.warn(
+      '[NOOD storage] local JSON fallback is disabled. Set LOCAL_STATE_FALLBACK_ENABLED=true for local development only.'
+    );
+  }
+
   if (STORAGE_DRIVER === 'redis' && !REDIS_URL) {
     throw new Error(
       'STORAGE_DRIVER=redis requires REDIS_URL. Configure a Redis instance for payment recovery storage.'
@@ -107,17 +124,33 @@ function createStorage() {
     storageState.paymentRecordsDriver = 'redis';
   }
 
-  const pendingOrders = new JsonCollection({
-    name: 'pending orders',
-    fileName: 'pending-orders.json',
-    keyField: 'orderId',
-  });
+  const pendingOrders = redis
+    ? new RedisCollection({
+        name: 'pending orders',
+        keyPrefix: 'nood:storage:pendingOrders:',
+        keyField: 'orderId',
+        redis,
+        migrateFileName: 'pending-orders.json',
+      })
+    : new JsonCollection({
+        name: 'pending orders',
+        fileName: 'pending-orders.json',
+        keyField: 'orderId',
+      });
 
-  const walletTransactions = new JsonCollection({
-    name: 'wallet transactions',
-    fileName: 'wallet-transactions.json',
-    keyField: 'walletTransactionId',
-  });
+  const walletTransactions = redis
+    ? new RedisCollection({
+        name: 'wallet transactions',
+        keyPrefix: 'nood:storage:walletTransactions:',
+        keyField: 'walletTransactionId',
+        redis,
+        migrateFileName: 'wallet-transactions.json',
+      })
+    : new JsonCollection({
+        name: 'wallet transactions',
+        fileName: 'wallet-transactions.json',
+        keyField: 'walletTransactionId',
+      });
 
   const failedPaidOrders = redis
     ? new RedisCollection({
@@ -161,19 +194,30 @@ function createStorage() {
         keyField: 'request_id',
       });
 
-  const pushTokens = new JsonCollection({
-    name: 'push tokens',
-    fileName: 'push-tokens.json',
-    keyField: 'token',
-  });
+  const pushTokens = redis
+    ? new RedisCollection({
+        name: 'push tokens',
+        keyPrefix: 'nood:storage:pushTokens:',
+        keyField: 'token',
+        redis,
+        migrateFileName: 'push-tokens.json',
+      })
+    : new JsonCollection({
+        name: 'push tokens',
+        fileName: 'push-tokens.json',
+        keyField: 'token',
+      });
 
   const ready = (async () => {
     if (redis) {
       await redis.connect();
       await redis.ping();
+      await pendingOrders.init();
+      await walletTransactions.init();
       await failedPaidOrders.init();
       await paymentRecords.init();
       await refundRequests.init();
+      await pushTokens.init();
       storageState.paymentStorageRedisReady = true;
       console.log('[NOOD storage] payment recovery storage ready (redis)', {
         storageDriver: STORAGE_DRIVER,
@@ -203,6 +247,7 @@ function createStorage() {
     refundRequests,
     walletTransactions,
     pushTokens,
+    redis,
     ready,
     storageDriver: STORAGE_DRIVER,
     get paymentStorageDriver() {

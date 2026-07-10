@@ -1,7 +1,11 @@
 const { createCatalogCache } = require('./cache/redis-cache');
 const { createCatalogRouter, mountCatalogSyncRoutes } = require('./routes');
 const { createWebhookRouter } = require('./webhooks');
-const { ensureCatalogWarm } = require('./sync');
+const { ensureCatalogWarm, startBackgroundCatalogSync } = require('./sync');
+
+function isProductionEnv() {
+  return String(process.env.NODE_ENV || '').trim() === 'production';
+}
 
 let catalogCachePromise = null;
 let mountedCache = null;
@@ -87,9 +91,16 @@ async function mountCatalog(app, { requireAdminApiKey }) {
     catalogMounted = true;
     catalogMountError = null;
 
-    void ensureCatalogWarm(cache).then((result) => {
-      console.log('[NOOD catalog] startup warm check', result);
-    });
+    void (async () => {
+      if (isProductionEnv()) {
+        const result = await ensureCatalogWarm(cache);
+        console.log('[NOOD catalog] startup warm check', result);
+        return;
+      }
+
+      const syncResult = await startBackgroundCatalogSync(cache, { syncMenus: true });
+      console.log('[NOOD catalog] startup auto-sync', syncResult);
+    })();
 
     return cache;
   } catch (error) {

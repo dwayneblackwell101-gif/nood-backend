@@ -34,7 +34,57 @@ function sendCatalogResponse(res, payload, source) {
   });
 }
 
+function getImageNodeUrl(node) {
+  return safeString(node?.url || node?.src || node?.image?.url || node?.previewImage?.url);
+}
+
+function getImageNodeAlt(node) {
+  return safeString(node?.altText || node?.alt || node?.image?.altText || node?.previewImage?.altText);
+}
+
+function addGalleryImage(images, seen, node) {
+  const url = getImageNodeUrl(node);
+  if (!url || seen.has(url)) {
+    return;
+  }
+
+  seen.add(url);
+  images.push({
+    id: safeString(node?.id) || url,
+    url,
+    src: url,
+    altText: getImageNodeAlt(node) || null,
+    width: node?.width ?? node?.image?.width ?? null,
+    height: node?.height ?? node?.image?.height ?? null,
+  });
+}
+
+function buildProductGalleryImages(product) {
+  const images = [];
+  const seen = new Set();
+
+  for (const edge of product?.images?.edges || []) {
+    addGalleryImage(images, seen, edge?.node);
+  }
+
+  if (!images.length) {
+    for (const edge of product?.media?.edges || []) {
+      addGalleryImage(images, seen, edge?.node);
+    }
+  }
+
+  if (!images.length) {
+    addGalleryImage(images, seen, product?.thumbnail || product?.featuredImage);
+  }
+
+  return images;
+}
+
 function formatCachedProductDetail(product) {
+  const galleryImages = buildProductGalleryImages(product);
+  const thumbnail = galleryImages[0]?.url || safeString(product?.thumbnail?.url || product?.featuredImage?.url) || null;
+  const imagesConnection = product.images || { edges: [] };
+
   return {
     id: product.id,
     title: product.title,
@@ -44,9 +94,15 @@ function formatCachedProductDetail(product) {
     vendor: product.vendor || '',
     productType: product.productType || '',
     tags: Array.isArray(product.tags) ? product.tags : [],
+    status: product.status || 'ACTIVE',
     availableForSale: Boolean(product.availableForSale),
     featuredImage: product.featuredImage || null,
-    images: product.images || { edges: [] },
+    thumbnail,
+    galleryImages,
+    imageUrls: galleryImages.map((image) => image.url),
+    images: galleryImages,
+    imagesConnection,
+    shopifyImages: imagesConnection,
     media: product.media || { edges: [] },
     priceRange: product.priceRange || null,
     compareAtPriceRange: product.compareAtPriceRange || { maxVariantPrice: null },
@@ -55,13 +111,15 @@ function formatCachedProductDetail(product) {
   };
 }
 
+function isVisibleCatalogProduct(product) {
+  if (!product || !product.id || !product.handle) {
+    return false;
+  }
+  return safeString(product?.status, 'ACTIVE').toUpperCase() === 'ACTIVE';
+}
+
 function getActiveProducts(products) {
-  return (Array.isArray(products) ? products : []).filter((product) => {
-    if (!product || !product.id || !product.handle) {
-      return false;
-    }
-    return safeString(product?.status).toUpperCase() !== 'ARCHIVED';
-  });
+  return (Array.isArray(products) ? products : []).filter(isVisibleCatalogProduct);
 }
 
 let searchableProductsCache = null;
@@ -536,12 +594,12 @@ async function getOrBuildOrderedMixedHandles(cache, mixMetaRows, mixKey) {
   return built;
 }
 
-async function loadMixedCatalogProductsPage(cache, { mixKey, limit, after }) {
+async function loadMixedCatalogProductsPage(cache, { mixKey, limit, after, inStockOnly = false }) {
   const pageLimit = Math.max(1, Math.min(Number(limit) || 50, 250));
   const start = Number(after) > 0 ? Number(after) : 0;
 
   console.log(
-    `[NOOD catalog] mixed feed fast path mixKey=${mixKey} after=${after ?? 'null'} limit=${pageLimit}`
+    `[NOOD catalog] mixed feed fast path mixKey=${mixKey} after=${after ?? 'null'} limit=${pageLimit} inStockOnly=${inStockOnly}`
   );
 
   const mixMetaRows = await loadMixMetaIndex(cache);
@@ -550,36 +608,53 @@ async function loadMixedCatalogProductsPage(cache, { mixKey, limit, after }) {
     mixMetaRows,
     mixKey
   );
-  const pageHandles = orderedHandles.slice(start, start + pageLimit);
 
-  console.log(`[NOOD catalog] mixed handles selected count=${pageHandles.length}`);
-
-  const fetchedProducts = await fetchProductsByHandles(cache, pageHandles);
-  const productsByHandle = new Map(
-    fetchedProducts.filter(isActiveCatalogProduct).map((product) => [product.handle, product])
-  );
-
-  let skippedMissing = 0;
   const pageProducts = [];
+  let scanIndex = start;
+  let skippedMissing = 0;
+  let skippedSoldOut = 0;
+  const batchSize = Math.max(pageLimit, COLLECTION_PRODUCTS_BATCH_SIZE);
 
-  for (const handle of pageHandles) {
-    const product = productsByHandle.get(safeString(handle));
-    if (!product) {
-      skippedMissing += 1;
-      continue;
+  while (scanIndex < orderedHandles.length && pageProducts.length < pageLimit) {
+    const batchHandles = orderedHandles.slice(scanIndex, scanIndex + batchSize);
+    if (!batchHandles.length) {
+      break;
     }
-    pageProducts.push(product);
+
+    const fetchedProducts = await fetchProductsByHandles(cache, batchHandles);
+    const productsByHandle = new Map(
+      fetchedProducts.filter(isActiveCatalogProduct).map((product) => [product.handle, product])
+    );
+
+    for (const handle of batchHandles) {
+      scanIndex += 1;
+      const product = productsByHandle.get(safeString(handle));
+      if (!product) {
+        skippedMissing += 1;
+        continue;
+      }
+      if (inStockOnly && !isCatalogProductInStock(product)) {
+        skippedSoldOut += 1;
+        continue;
+      }
+      pageProducts.push(product);
+      if (pageProducts.length >= pageLimit) {
+        break;
+      }
+    }
   }
 
   if (skippedMissing > 0) {
     console.log(`[NOOD catalog] skipped missing mixed handles count=${skippedMissing}`);
   }
+  if (skippedSoldOut > 0) {
+    console.log(`[NOOD catalog] skipped sold-out mixed handles count=${skippedSoldOut}`);
+  }
 
-  const nextIndex = start + pageHandles.length;
-  const hasNextPage = nextIndex < orderedHandles.length;
+  const hasNextPage = scanIndex < orderedHandles.length;
 
   console.log(
-    `[NOOD catalog] mixed products returned count=${pageProducts.length} nextCursor=${hasNextPage ? String(nextIndex) : 'null'} hasMore=${hasNextPage}`
+    `[NOOD catalog] mixed products returned count=${pageProducts.length} nextCursor=${hasNextPage ? String(scanIndex) : 'null'} hasMore=${hasNextPage}`
   );
 
   return {
@@ -588,15 +663,20 @@ async function loadMixedCatalogProductsPage(cache, { mixKey, limit, after }) {
     cacheHit,
     paginate: false,
     hasNextPage,
-    endCursor: hasNextPage ? String(nextIndex) : null,
+    endCursor: hasNextPage ? String(scanIndex) : null,
   };
 }
 
+function isHomeInStockFeed(sortKey) {
+  return sortKey === 'home' || sortKey === 'updated_in_stock';
+}
+
 async function loadCatalogProductsForList(cache, { mixKey, sortKey, limit, after }) {
+  const inStockOnly = isHomeInStockFeed(sortKey);
   const hasMixKey = mixKey !== undefined && mixKey !== null && String(mixKey).length > 0;
 
   if (hasMixKey) {
-    return loadMixedCatalogProductsPage(cache, { mixKey, limit, after });
+    return loadMixedCatalogProductsPage(cache, { mixKey, limit, after, inStockOnly });
   }
 
   if (typeof cache.listProductsPage === 'function') {
@@ -617,12 +697,27 @@ async function loadCatalogProductsForList(cache, { mixKey, sortKey, limit, after
   }
 
   const allProducts = getActiveProducts(await cache.getAllProducts());
+  const feedProducts = inStockOnly
+    ? allProducts.filter(isCatalogProductInStock)
+    : allProducts;
+
   return {
-    items: sortProducts(allProducts, sortKey),
-    total: allProducts.length,
+    items: sortProducts(feedProducts, inStockOnly ? 'updated' : sortKey),
+    total: feedProducts.length,
     cacheHit: false,
     paginate: true,
   };
+}
+
+function isCatalogProductInStock(product) {
+  if (!isVisibleCatalogProduct(product)) {
+    return false;
+  }
+  return Boolean(product.availableForSale);
+}
+
+function compareProductsByUpdatedAt(left, right) {
+  return String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''));
 }
 
 function sortProducts(products, sortKey = 'updated') {
@@ -630,7 +725,16 @@ function sortProducts(products, sortKey = 'updated') {
   if (sortKey === 'created') {
     return copy.sort((a, b) => String(b.id).localeCompare(String(a.id)));
   }
-  return copy.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+  if (sortKey === 'home' || sortKey === 'updated_in_stock') {
+    return copy.sort((a, b) => {
+      const stockDelta = Number(isCatalogProductInStock(b)) - Number(isCatalogProductInStock(a));
+      if (stockDelta !== 0) {
+        return stockDelta;
+      }
+      return compareProductsByUpdatedAt(a, b);
+    });
+  }
+  return copy.sort(compareProductsByUpdatedAt);
 }
 
 function buildCollectionStorefront(collection, productsByHandle, first, after) {
@@ -660,10 +764,7 @@ const COLLECTION_SEARCH_TERMS = {
 };
 
 function isActiveCatalogProduct(product) {
-  if (!product?.id || !product?.handle) {
-    return false;
-  }
-  return safeString(product?.status).toUpperCase() !== 'ARCHIVED';
+  return isVisibleCatalogProduct(product);
 }
 
 async function fetchProductsByHandles(cache, handles = []) {
@@ -1031,12 +1132,15 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
 
       let product = await safeGetProduct(cache, handle);
 
-      if (!product?.handle || !product?.id) {
+      if (!isVisibleCatalogProduct(product)) {
         console.log(`[NOOD product] cache miss handle=${handle}`);
         try {
           const shopifyPayload = await fetchProductDetailFromShopify(handle);
-          if (shopifyPayload?.data?.productByHandle) {
+          if (isVisibleCatalogProduct(shopifyPayload?.data?.productByHandle)) {
             const detail = formatCachedProductDetail(shopifyPayload.data.productByHandle);
+            if (process.env.NODE_ENV !== 'production') {
+              console.log(`Product gallery images count: ${detail.handle} ${detail.galleryImages.length}`);
+            }
             console.log(`[NOOD product] shopify fallback handle=${handle} title=${safeString(detail.title)}`);
             return sendCatalogResponse(
               res,
@@ -1062,6 +1166,9 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
 
       console.log(`[NOOD product] cache hit handle=${handle} title=${safeString(product.title)}`);
       const detail = formatCachedProductDetail(product);
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`Product gallery images count: ${detail.handle} ${detail.galleryImages.length}`);
+      }
       console.log(`[NOOD product] detail returned handle=${handle} title=${safeString(detail.title)}`);
 
       return sendCatalogResponse(
@@ -1343,18 +1450,23 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
   router.get('/search', async (req, res) => {
     const startedAt = Date.now();
     const query = safeString(req.query.q || req.query.query);
-    const first = Number(req.query.first || 50);
+    const first = Math.max(1, Math.min(Number(req.query.first || req.query.limit || 48), 250));
+    const after = Number(req.query.after ?? req.query.offset ?? 0) || 0;
 
     try {
       const allProducts = await warmSearchableProductsCache(cache);
       const matches = searchProducts(allProducts, query);
-      const page = paginateListProducts(matches, first, 0);
+      const page = paginateListProducts(matches, first, after);
+      const nextOffset = page.pageInfo?.hasNextPage ? Number(page.pageInfo.endCursor) : null;
 
       console.log('[NOOD catalog] GET /search', {
         source: 'cache',
         query,
         returned: page.edges.length,
         totalMatches: matches.length,
+        after,
+        nextOffset,
+        hasMore: Boolean(page.pageInfo?.hasNextPage),
         ms: Date.now() - startedAt,
       });
 
@@ -1364,6 +1476,10 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
           data: {
             products: page,
           },
+          totalMatches: matches.length,
+          nextOffset,
+          nextCursor: nextOffset,
+          hasMore: Boolean(page.pageInfo?.hasNextPage),
         },
         'cache'
       );

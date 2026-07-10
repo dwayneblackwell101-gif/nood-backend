@@ -94,7 +94,7 @@ function parseProductSummary(handle, raw) {
     return null;
   }
 
-  if (safeString(product.status).toUpperCase() === 'ARCHIVED') {
+  if (safeString(product.status, 'ACTIVE').toUpperCase() !== 'ACTIVE') {
     return null;
   }
 
@@ -102,6 +102,7 @@ function parseProductSummary(handle, raw) {
     handle: product.handle,
     id: product.id,
     updatedAt: product.updatedAt || '',
+    availableForSale: Boolean(product.availableForSale),
   };
 }
 
@@ -162,7 +163,7 @@ function parseProductMixMeta(handle, raw) {
       return null;
     }
 
-    if (safeString(parsed.status).toUpperCase() === 'ARCHIVED') {
+    if (safeString(parsed.status, 'ACTIVE').toUpperCase() !== 'ACTIVE') {
       return null;
     }
 
@@ -634,12 +635,25 @@ async function createRedisCache(redisUrl) {
     }
 
     async listProductsPage({ limit = 50, after = null, sortKey = 'updated' } = {}) {
-      const summaries = await this.listProductSummaries();
+      let summaries = await this.listProductSummaries();
       const pageLimit = Math.max(1, Math.min(Number(limit) || 50, 250));
       const start = Number(after) > 0 ? Number(after) : 0;
 
+      if (sortKey === 'home' || sortKey === 'updated_in_stock') {
+        summaries = summaries.filter((summary) => Boolean(summary.availableForSale));
+      }
+
       if (sortKey === 'created') {
         summaries.sort((left, right) => String(right.id).localeCompare(String(left.id)));
+      } else if (sortKey === 'home' || sortKey === 'updated_in_stock') {
+        summaries.sort((left, right) => {
+          const stockDelta =
+            Number(Boolean(right.availableForSale)) - Number(Boolean(left.availableForSale));
+          if (stockDelta !== 0) {
+            return stockDelta;
+          }
+          return String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''));
+        });
       } else {
         summaries.sort((left, right) =>
           String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''))

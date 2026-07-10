@@ -214,14 +214,83 @@ const ADMIN_PRODUCTS_PAGE_QUERY = `
               node {
                 url
                 altText
+                width
+                height
               }
             }
           }
-          variants(first: 100) {
+          media(first: 30) {
+            edges {
+              node {
+                __typename
+                mediaContentType
+                ... on MediaImage {
+                  id
+                  image {
+                    url
+                    altText
+                    width
+                    height
+                  }
+                }
+                ... on Video {
+                  id
+                  preview {
+                    image {
+                      url
+                      altText
+                      width
+                      height
+                    }
+                  }
+                  sources {
+                    url
+                    mimeType
+                    format
+                    height
+                    width
+                  }
+                }
+                ... on ExternalVideo {
+                  id
+                  embedUrl
+                  originUrl
+                  preview {
+                    image {
+                      url
+                      altText
+                      width
+                      height
+                    }
+                  }
+                }
+                ... on Model3d {
+                  id
+                  preview {
+                    image {
+                      url
+                      altText
+                      width
+                      height
+                    }
+                  }
+                  sources {
+                    url
+                    mimeType
+                    format
+                    filesize
+                  }
+                }
+              }
+            }
+          }
+          variants(first: 250) {
             edges {
               node {
                 id
                 title
+                sku
+                barcode
                 price
                 compareAtPrice
                 inventoryQuantity
@@ -271,14 +340,83 @@ const ADMIN_PRODUCT_BY_ID_QUERY = `
           node {
             url
             altText
+            width
+            height
           }
         }
       }
-      variants(first: 100) {
+      media(first: 30) {
+        edges {
+          node {
+            __typename
+            mediaContentType
+            ... on MediaImage {
+              id
+              image {
+                url
+                altText
+                width
+                height
+              }
+            }
+            ... on Video {
+              id
+              preview {
+                image {
+                  url
+                  altText
+                  width
+                  height
+                }
+              }
+              sources {
+                url
+                mimeType
+                format
+                height
+                width
+              }
+            }
+            ... on ExternalVideo {
+              id
+              embedUrl
+              originUrl
+              preview {
+                image {
+                  url
+                  altText
+                  width
+                  height
+                }
+              }
+            }
+            ... on Model3d {
+              id
+              preview {
+                image {
+                  url
+                  altText
+                  width
+                  height
+                }
+              }
+              sources {
+                url
+                mimeType
+                format
+                filesize
+              }
+            }
+          }
+        }
+      }
+      variants(first: 250) {
         edges {
           node {
             id
             title
+            sku
+            barcode
             price
             compareAtPrice
             inventoryQuantity

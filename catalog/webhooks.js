@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const { safeString } = require('./transform');
+const { createRedisClient } = require('../storage/redis-collection');
 
 const WEBHOOK_BODY_LIMIT = process.env.SHOPIFY_WEBHOOK_BODY_LIMIT || '1mb';
 const {
@@ -13,8 +14,31 @@ const {
 const { fetchProductGidByInventoryItemId } = require('./shopify');
 
 const WEBHOOK_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
+const WEBHOOK_DEDUP_TTL_SECONDS = Math.ceil(WEBHOOK_DEDUP_TTL_MS / 1000);
 const WEBHOOK_DEDUP_MAX = 5000;
 const WEBHOOK_JOB_DEBOUNCE_MS = 1200;
+const REDIS_NAMESPACE = safeString(process.env.REDIS_NAMESPACE, 'nood');
+
+function createWebhookRedis() {
+  const redisUrl = safeString(process.env.REDIS_URL);
+  if (!redisUrl) {
+    return { client: null, ready: Promise.resolve(null) };
+  }
+
+  const client = createRedisClient(redisUrl);
+  const ready = client
+    .connect()
+    .then(() => client.ping())
+    .then(() => client)
+    .catch((error) => {
+      console.error('[NOOD webhook] Redis unavailable; falling back to memory dedupe locally', {
+        message: error.message,
+      });
+      return null;
+    });
+
+  return { client, ready };
+}
 
 function verifyShopifyWebhook(rawBody, hmacHeader, secret) {
   if (!secret || !hmacHeader || !rawBody) {
@@ -115,6 +139,7 @@ function mountShopifyWebhookBodyParser(app) {
 }
 
 function createWebhookQueue() {
+  const webhookRedis = createWebhookRedis();
   const seenWebhookIds = new Map();
   const pendingByKey = new Map();
   const queue = [];
@@ -139,10 +164,18 @@ function createWebhookQueue() {
     }
   }
 
-  function hasSeenWebhook(webhookId) {
+  async function hasSeenWebhook(webhookId) {
     if (!webhookId) {
       return false;
     }
+
+    const redis = await webhookRedis.ready;
+    if (redis) {
+      const key = `${REDIS_NAMESPACE}:webhook:dedupe:${webhookId}`;
+      const claimed = await redis.set(key, String(Date.now()), 'NX', 'EX', WEBHOOK_DEDUP_TTL_SECONDS);
+      return claimed !== 'OK';
+    }
+
     pruneSeenWebhookIds();
     return seenWebhookIds.has(webhookId);
   }
@@ -211,8 +244,8 @@ function createWebhookQueue() {
     processing = false;
   }
 
-  function enqueue(job) {
-    if (job.webhookId && hasSeenWebhook(job.webhookId)) {
+  async function enqueue(job) {
+    if (job.webhookId && (await hasSeenWebhook(job.webhookId))) {
       return { accepted: false, duplicate: true };
     }
 
@@ -386,7 +419,7 @@ function createWebhookHandler({ cache }) {
       };
     }
 
-    const queued = queue.enqueue({
+    const queued = await queue.enqueue({
       topic,
       action,
       shop,

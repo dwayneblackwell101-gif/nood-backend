@@ -49,9 +49,10 @@ function normalizeRequest(raw = {}) {
     request_id: requestId,
     order_id: safeString(raw.order_id || raw.orderId),
     order_number: safeString(raw.order_number || raw.orderNumber || raw.order_id || raw.orderId),
+    customer_id: safeString(raw.customer_id || raw.customerId),
     customer_email: safeString(raw.customer_email || raw.customerEmail).toLowerCase(),
     amount: Number(raw.amount || 0),
-    currency: safeString(raw.currency, 'TTD').toUpperCase(),
+    currency: safeString(raw.currency, 'USD').toUpperCase(),
     refund_method: normalizeRefundMethod(raw.refund_method || raw.refundMethod),
     payment_provider: safeString(raw.payment_provider || raw.paymentProvider),
     payment_method: safeString(raw.payment_method || raw.paymentMethod),
@@ -184,7 +185,8 @@ function createReturnRequestHandlers({ refundRequests, shopifyRefundSync, wallet
 
   async function listRequests(req, res) {
     try {
-    const email = safeString(req.query.email || req.query.customerEmail).toLowerCase();
+    const email = safeString(req.customer?.email || req.query.email || req.query.customerEmail).toLowerCase();
+    const customerId = safeString(req.customer?.id);
     if (!email) {
       return res.status(400).json({
         ok: false,
@@ -195,7 +197,9 @@ function createReturnRequestHandlers({ refundRequests, shopifyRefundSync, wallet
     }
 
     const rows = refundRequests.values().filter(
-      (entry) => safeString(entry.customer_email).toLowerCase() === email
+      (entry) =>
+        safeString(entry.customer_id) === customerId ||
+        safeString(entry.customer_email).toLowerCase() === email
     );
 
     const reconciled = [];
@@ -240,6 +244,20 @@ function createReturnRequestHandlers({ refundRequests, shopifyRefundSync, wallet
     }
 
     record = await reconcileRequestWithShopify(record);
+
+    const authEmail = safeString(req.customer?.email).toLowerCase();
+    const authCustomerId = safeString(req.customer?.id);
+    if (
+      (safeString(record.customer_id) && safeString(record.customer_id) !== authCustomerId) ||
+      (safeString(record.customer_email).toLowerCase() &&
+        safeString(record.customer_email).toLowerCase() !== authEmail)
+    ) {
+      return res.status(403).json({
+        ok: false,
+        success: false,
+        message: 'Authenticated customer does not own this return request.',
+      });
+    }
 
     console.log('[REFUND STATUS SYNC]', {
       requestId,
@@ -313,6 +331,9 @@ function createReturnRequestHandlers({ refundRequests, shopifyRefundSync, wallet
     let record = normalizeRequest({
       ...body,
       request_id: requestId,
+      customer_id: safeString(req.customer?.id),
+      customer_email: safeString(req.customer?.email).toLowerCase(),
+      currency: 'USD',
       status: 'pending_review',
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),

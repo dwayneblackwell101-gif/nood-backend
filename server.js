@@ -39,6 +39,15 @@ const { mountShopifyWebhookBodyParser } = require('./catalog/webhooks');
 const { adminGraphql } = require('./catalog/shopify');
 const { createDiscountsHandler } = require('./catalog/discounts');
 const {
+  assertUsdCurrency,
+  centsToUsd,
+  requirePositiveCents,
+  usdToCents,
+} = require('./lib/money');
+const { createCustomerAuthMiddleware } = require('./auth/customer-auth');
+const { createRedisLockService } = require('./storage/redis-lock');
+const { createRedisWalletService } = require('./wallet/redis-wallet');
+const {
   getShopifyOrderAccessToken,
   hasShopifyOrderAdminAccessToken,
   getShopifyOrderTokenSource,
@@ -52,6 +61,10 @@ const pendingOrders = storage.pendingOrders.items;
 const failedPaidOrders = storage.failedPaidOrders.items;
 const paymentRecords = storage.paymentRecords.items;
 const walletTransactions = storage.walletTransactions.items;
+const redisNamespace = safeString(process.env.REDIS_NAMESPACE, 'nood');
+const lockService = createRedisLockService({ redis: storage.redis, namespace: redisNamespace });
+const redisWallet = createRedisWalletService({ redis: storage.redis, namespace: redisNamespace });
+const requireCustomerAuth = createCustomerAuthMiddleware();
 
 const { createReturnRequestHandlers } = require('./refunds/return-requests');
 const shopifyRefundSync = require('./refunds/shopify-refund-sync');
@@ -61,7 +74,7 @@ const walletRefundService = createWalletRefundService({
   persistWalletTransactions,
   safeMoney,
   safeString,
-  defaultCurrency: 'TTD',
+  defaultCurrency: 'USD',
 });
 const returnRequestHandlers = createReturnRequestHandlers({
   refundRequests: storage.refundRequests,
@@ -85,6 +98,8 @@ const SHOPIFY_APP_AUTH_CALLBACK_URI = safeString(
 );
 const PAYPAL_CURRENCY = safeString(process.env.PAYPAL_CURRENCY, 'USD').toUpperCase();
 const SHOPIFY_CURRENCY = safeString(process.env.SHOPIFY_CURRENCY, 'USD').toUpperCase();
+const WALLET_CURRENCY = safeString(process.env.WALLET_CURRENCY, 'USD').toUpperCase();
+const PAYMENT_CURRENCY = safeString(process.env.PAYMENT_CURRENCY, 'USD').toUpperCase();
 const PAYPAL_USD_TO_TTD_RATE = Number(process.env.PAYPAL_USD_TO_TTD_RATE || 6.8);
 const BACKEND_BASE_URL = getBackendBaseUrl();
 
@@ -401,6 +416,14 @@ function assertProductionConfig() {
 
   if (!getConfiguredAdminApiKey()) {
     throw new Error('ADMIN_API_KEY or NOOD_ADMIN_API_KEY is required in production.');
+  }
+
+  if (SHOPIFY_CURRENCY !== 'USD' || WALLET_CURRENCY !== 'USD' || PAYMENT_CURRENCY !== 'USD') {
+    throw new Error('Production requires SHOPIFY_CURRENCY, WALLET_CURRENCY, and PAYMENT_CURRENCY to be USD.');
+  }
+
+  if (!process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN) {
+    throw new Error('SHOPIFY_STOREFRONT_ACCESS_TOKEN is required for customer authentication.');
   }
 
   if (storage.storageDriver !== 'redis' || !safeString(process.env.REDIS_URL)) {
@@ -831,14 +854,14 @@ function getUsdToTtdRate() {
 }
 
 function assertPayPalCurrency() {
-  if (PAYPAL_CURRENCY !== 'USD') {
+  if (PAYPAL_CURRENCY !== 'USD' || SHOPIFY_CURRENCY !== 'USD' || PAYMENT_CURRENCY !== 'USD') {
     const error = new Error('PayPal checkout is configured for USD only right now.');
     error.statusCode = 500;
     throw error;
   }
 }
 
-function normalizeCurrency(value, fallback = 'TTD') {
+function normalizeCurrency(value, fallback = 'USD') {
   return safeString(value, fallback).toUpperCase();
 }
 
@@ -873,7 +896,7 @@ function getPayPalCheckoutAmounts(body = {}) {
     return {
       shopifyTotal,
       shopifyTotalUsd: shopifyTotal,
-      shopifyTotalTtd: convertUsdToTtd(shopifyTotal),
+      shopifyTotalTtd: shopifyTotal,
       paypalTotalUsd: shopifyTotal,
       paypalCurrency: PAYPAL_CURRENCY,
       shopifyCurrency: SHOPIFY_CURRENCY,
@@ -930,10 +953,10 @@ function getPayPalAmounts(body = {}) {
 
   return {
     paypalTotalUsd: usdTotal,
-    shopifyTotalTtd: convertUsdToTtd(usdTotal),
+    shopifyTotalTtd: usdTotal,
     paypalCurrency: PAYPAL_CURRENCY,
     shopifyCurrency: SHOPIFY_CURRENCY,
-    exchangeRate: PAYPAL_USD_TO_TTD_RATE,
+    exchangeRate: null,
   };
 }
 
@@ -1183,15 +1206,38 @@ function getConfirmedWalletBalance(customerId) {
   return safeMoney(balance);
 }
 
+async function getConfirmedWalletBalanceUsd(customerId) {
+  if (redisWallet) {
+    return centsToUsd(await redisWallet.getBalanceCents(customerId));
+  }
+
+  return getConfirmedWalletBalance(customerId);
+}
+
 function findWalletTransactionByProviderOrderId(provider, orderId) {
   return Array.from(walletTransactions.values()).find(
     (tx) => tx?.provider === provider && safeString(tx?.orderId) === safeString(orderId)
   );
 }
 
-function debitWalletForCheckout({ customerId, amount, checkoutSessionId, transactionId }) {
+async function debitWalletForCheckout({ customerId, amount, checkoutSessionId, transactionId }) {
   const normalizedCustomerId = safeString(customerId);
   const walletTransactionId = `wallet_checkout_${safeString(checkoutSessionId, transactionId)}`;
+
+  if (redisWallet) {
+    const amountCents = usdToCents(amount);
+    requirePositiveCents(amountCents, 'wallet checkout amount');
+    return redisWallet.debit({
+      customerId: normalizedCustomerId,
+      amountCents,
+      idempotencyKey: walletTransactionId,
+      source: 'wallet_checkout',
+      metadata: {
+        checkoutSessionId: safeString(checkoutSessionId),
+      },
+    });
+  }
+
   const existing = walletTransactions.get(walletTransactionId);
 
   if (existing) {
@@ -1239,7 +1285,21 @@ function debitWalletForCheckout({ customerId, amount, checkoutSessionId, transac
   return record;
 }
 
-function rollbackWalletDebit(walletTransactionId) {
+async function rollbackWalletDebit(walletTransactionId, { customerId = '', amount = '' } = {}) {
+  if (redisWallet && customerId && amount) {
+    const amountCents = usdToCents(amount);
+    requirePositiveCents(amountCents, 'wallet rollback amount');
+    return redisWallet.credit({
+      customerId,
+      amountCents,
+      idempotencyKey: `${walletTransactionId}:rollback`,
+      source: 'wallet_checkout_rollback',
+      metadata: {
+        relatedTransactionId: walletTransactionId,
+      },
+    });
+  }
+
   const record = walletTransactions.get(walletTransactionId);
   if (!record || record.status === 'rolled_back') {
     return;
@@ -1271,6 +1331,7 @@ function rollbackWalletDebit(walletTransactionId) {
 
 async function handleWalletCheckout(req, res) {
   try {
+    const authenticatedCustomer = req.customer || {};
     const checkoutSessionId = resolveCheckoutSessionId(req.body);
     const cartItems = getCartItemsFromBody(req.body);
     const total = assertCheckoutTotalMatches(req.body);
@@ -1278,9 +1339,11 @@ async function handleWalletCheckout(req, res) {
     const customerName = safeString(
       req.body?.name || shippingAddress?.fullName || shippingAddress?.name
     );
-    const customerEmail = safeString(req.body?.email || shippingAddress?.email);
-    const customerPhone = safeString(req.body?.phone || shippingAddress?.phone, '');
-    const customerId = safeString(req.body?.customerId || customerEmail || customerPhone);
+    const customerEmail = safeString(authenticatedCustomer.email || req.body?.email || shippingAddress?.email);
+    const customerPhone = safeString(authenticatedCustomer.phone || req.body?.phone || shippingAddress?.phone, '');
+    const customerId = safeString(authenticatedCustomer.id);
+
+    assertUsdCurrency(SHOPIFY_CURRENCY, 'Shopify currency');
 
     const validationErrors = validateCheckoutData({
       total,
@@ -1310,7 +1373,7 @@ async function handleWalletCheckout(req, res) {
           transaction_id: existingPayment.transactionId,
           shopify_order_id: existingPayment.shopifyOrder?.id || '',
           shopify_order_name: existingPayment.shopifyOrder?.name || '',
-          wallet_balance: getConfirmedWalletBalance(customerId),
+          wallet_balance: await getConfirmedWalletBalanceUsd(customerId),
           shopifyOrder: existingPayment.shopifyOrder,
         });
       }
@@ -1320,7 +1383,7 @@ async function handleWalletCheckout(req, res) {
     let debitRecord = null;
 
     try {
-      debitRecord = debitWalletForCheckout({
+      debitRecord = await debitWalletForCheckout({
         customerId,
         amount: total,
         checkoutSessionId,
@@ -1359,12 +1422,15 @@ async function handleWalletCheckout(req, res) {
         transaction_id: walletDebitId,
         shopify_order_id: shopifyOrder?.id || '',
         shopify_order_name: shopifyOrder?.name || '',
-        wallet_balance: getConfirmedWalletBalance(customerId),
+        wallet_balance: await getConfirmedWalletBalanceUsd(customerId),
         shopifyOrder,
       });
     } catch (shopifyError) {
       if (debitRecord?.walletTransactionId) {
-        rollbackWalletDebit(debitRecord.walletTransactionId);
+        await rollbackWalletDebit(debitRecord.walletTransactionId, {
+          customerId,
+          amount: total,
+        });
       }
 
       const shopifyErrorDetails = getShopifyErrorDetails(shopifyError);
@@ -1411,13 +1477,24 @@ async function createPayPalWalletTopup(req, res) {
       });
     }
 
-    const { amount, name, email, phone, customerId } = req.body;
+    const authenticatedCustomer = req.customer || {};
+    const amount = req.body?.amount;
+    const name = safeString(
+      req.body?.name ||
+        `${safeString(authenticatedCustomer.firstName)} ${safeString(authenticatedCustomer.lastName)}`.trim(),
+      'NOOD Customer'
+    );
+    const email = safeString(authenticatedCustomer.email || req.body?.email);
+    const phone = safeString(authenticatedCustomer.phone || req.body?.phone);
+    const customerId = safeString(authenticatedCustomer.id);
     const payPalAmounts = getPayPalAmounts({
       ...req.body,
       total: amount || req.body?.total,
-      currency: req.body?.currency || req.body?.paypalCurrency,
+      currency: 'USD',
     });
     const walletAmountTtd = payPalAmounts.shopifyTotalTtd;
+    const walletAmountCents = usdToCents(walletAmountTtd);
+    requirePositiveCents(walletAmountCents, 'PayPal wallet top-up amount');
 
     if (!isValidPositiveMoney(walletAmountTtd)) {
       return res.status(400).json({
@@ -1453,6 +1530,7 @@ async function createPayPalWalletTopup(req, res) {
       clientOrderId: localOrderId,
       paypalOrderId: paypalOrder.id,
       amount: walletAmountTtd,
+      amountCents: walletAmountCents,
       currency: payPalAmounts.shopifyCurrency,
       paypalTotalUsd: payPalAmounts.paypalTotalUsd,
       paypalCurrency: payPalAmounts.paypalCurrency,
@@ -1538,6 +1616,14 @@ async function capturePayPalWalletTopup(req, res) {
       });
     }
 
+    if (safeString(req.customer?.id) && safeString(pending.customerId) !== safeString(req.customer.id)) {
+      return res.status(403).json({
+        success: false,
+        error: true,
+        message: 'Authenticated customer does not own this wallet top-up.',
+      });
+    }
+
     const captureData = await capturePayPalOrder(paypalOrderId);
     const captureId =
       captureData?.purchase_units?.[0]?.payments?.captures?.[0]?.id ||
@@ -1554,13 +1640,24 @@ async function capturePayPalWalletTopup(req, res) {
       });
     }
 
-    const walletRecord = saveWalletTransaction({
-      provider: 'paypal',
-      transactionId: captureId,
-      pending,
-      rawReturn: captureData,
-    });
-    const confirmedBalance = getConfirmedWalletBalance(walletRecord.customerId);
+    const walletRecord = redisWallet
+      ? await redisWallet.credit({
+          customerId: pending.customerId,
+          amountCents: pending.amountCents || usdToCents(pending.amount),
+          idempotencyKey: `paypal_wallet:${captureId}`,
+          source: 'paypal_wallet_topup',
+          providerTransactionId: captureId,
+          metadata: {
+            paypalOrderId,
+          },
+        })
+      : saveWalletTransaction({
+          provider: 'paypal',
+          transactionId: captureId,
+          pending,
+          rawReturn: captureData,
+        });
+    const confirmedBalance = await getConfirmedWalletBalanceUsd(walletRecord.customerId);
 
     savePaymentRecord({
       provider: 'paypal_wallet',
@@ -1922,7 +2019,7 @@ console.log('[NOTIFICATIONS] routes mounted at /api/notifications');
 
 app.get('/ready', async (req, res) => {
   try {
-    const readiness = await getCatalogReadiness();
+    const readiness = await getBackendReadiness();
     const statusCode = readiness.ready ? 200 : 503;
 
     return res.status(statusCode).json({
@@ -1936,6 +2033,75 @@ app.get('/ready', async (req, res) => {
     });
   }
 });
+
+async function getBackendReadiness() {
+  const checks = [];
+
+  function addCheck(name, ok, detail = {}) {
+    checks.push({ name, ok: Boolean(ok), ...detail });
+  }
+
+  addCheck('currency_usd', SHOPIFY_CURRENCY === 'USD' && WALLET_CURRENCY === 'USD' && PAYMENT_CURRENCY === 'USD', {
+    shopifyCurrency: SHOPIFY_CURRENCY,
+    walletCurrency: WALLET_CURRENCY,
+    paymentCurrency: PAYMENT_CURRENCY,
+  });
+
+  addCheck('customer_auth_config', Boolean(safeString(process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN)));
+  addCheck('shopify_webhook_secret', Boolean(safeString(process.env.SHOPIFY_WEBHOOK_SECRET)));
+  addCheck('shopify_order_access', Boolean(shopifyOrderAccessState.ok), {
+    missingOrderScopes: shopifyOrderAccessState.missingOrderScopes || [],
+    message: shopifyOrderAccessState.message,
+  });
+
+  if (storage.redis) {
+    try {
+      await storage.redis.ping();
+      const probeKey = `${redisNamespace}:ready:${process.pid}`;
+      await storage.redis.set(probeKey, '1', 'EX', 30);
+      const probe = await storage.redis.get(probeKey);
+      addCheck('redis_read_write', probe === '1');
+    } catch (error) {
+      addCheck('redis_read_write', false, { message: error.message });
+    }
+  } else {
+    addCheck('redis_read_write', false, { message: 'Redis is not configured.' });
+  }
+
+  addCheck('critical_storage_redis', storage.storageDriver === 'redis' && Boolean(storage.redis));
+  addCheck('wallet_atomic_support', Boolean(redisWallet));
+
+  const payPalEnabled = ['1', 'true', 'yes'].includes(
+    safeString(process.env.PAYPAL_ENABLED, 'true').toLowerCase()
+  );
+  if (payPalEnabled) {
+    addCheck('paypal_config', hasPayPalCredentials() && PAYPAL_CURRENCY === 'USD');
+  }
+
+  const wiPayEnabled = ['1', 'true', 'yes'].includes(
+    safeString(process.env.WIPAY_ENABLED, 'false').toLowerCase()
+  );
+  if (wiPayEnabled) {
+    addCheck('wipay_config', Boolean(WIPAY_ACCOUNT_NUMBER && WIPAY_API_KEY && WIPAY_ENVIRONMENT));
+    addCheck('wipay_currency_mode', safeString(process.env.WIPAY_TRANSACTION_CURRENCY).toUpperCase() === 'USD', {
+      message: 'WiPay must be confirmed for USD before live checkout.',
+    });
+  }
+
+  try {
+    const catalog = await getCatalogReadiness();
+    addCheck('catalog', catalog.ready, catalog);
+  } catch (error) {
+    addCheck('catalog', false, { message: error.message });
+  }
+
+  const ready = checks.every((check) => check.ok);
+  return {
+    ready,
+    status: ready ? 'ready' : 'not_ready',
+    checks,
+  };
+}
 
 app.post('/api/orders', async (req, res) => {
   try {
@@ -2359,9 +2525,9 @@ app.post('/api/shopify/orders', async (req, res) => {
     });
   }
 });
-app.get('/api/customer/orders', async (req, res) => {
-  const email = safeString(req.query.email).toLowerCase();
-  const customerId = safeString(req.query.customerId || req.query.customer_id);
+app.get('/api/customer/orders', requireCustomerAuth, async (req, res) => {
+  const email = safeString(req.customer?.email).toLowerCase();
+  const customerId = safeString(req.customer?.id || req.customer?.numericId);
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 50);
 
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -2397,9 +2563,9 @@ app.get('/api/customer/orders', async (req, res) => {
   }
 });
 
-app.post('/api/refunds/requests', returnRequestHandlers.createRequest);
-app.get('/api/refunds/requests', returnRequestHandlers.listRequests);
-app.get('/api/refunds/requests/:id/status', returnRequestHandlers.getRequestStatus);
+app.post('/api/refunds/requests', requireCustomerAuth, returnRequestHandlers.createRequest);
+app.get('/api/refunds/requests', requireCustomerAuth, returnRequestHandlers.listRequests);
+app.get('/api/refunds/requests/:id/status', requireCustomerAuth, returnRequestHandlers.getRequestStatus);
 app.patch('/api/refunds/requests/:id', requireAdminApiKey, returnRequestHandlers.patchRequest);
 console.log('[NOOD refunds] routes registered', {
   create: 'POST /api/refunds/requests',
@@ -3065,7 +3231,16 @@ app.post('/paypal-sdk/orders/:paypalOrderId/capture', async (req, res) => {
 
 const createWalletTopup = async (req, res) => {
   try {
-    const { amount, name, email, phone, customerId } = req.body;
+    const { amount } = req.body;
+    const authenticatedCustomer = req.customer || {};
+    const name = safeString(
+      req.body?.name ||
+        `${safeString(authenticatedCustomer.firstName)} ${safeString(authenticatedCustomer.lastName)}`.trim(),
+      'NOOD Customer'
+    );
+    const email = safeString(authenticatedCustomer.email || req.body?.email);
+    const phone = safeString(authenticatedCustomer.phone || req.body?.phone);
+    const customerId = safeString(authenticatedCustomer.id);
 
     if (!WIPAY_ACCOUNT_NUMBER) {
       return res.status(500).json({
@@ -3081,6 +3256,8 @@ const createWalletTopup = async (req, res) => {
       });
     }
 
+    assertUsdCurrency(req.body?.currency || 'USD', 'wallet top-up currency');
+
     if (!isValidPositiveMoney(amount)) {
       return res.status(400).json({
         error: true,
@@ -3089,10 +3266,12 @@ const createWalletTopup = async (req, res) => {
     }
 
     const parsedAmount = safeMoney(amount);
+    const amountCents = usdToCents(parsedAmount);
+    requirePositiveCents(amountCents, 'wallet top-up amount');
     const customerName = safeString(name);
     const customerEmail = safeString(email);
     const customerPhone = safeString(phone);
-    const normalizedCustomerId = safeString(customerId || email || phone);
+    const normalizedCustomerId = safeString(customerId);
 
     const missingFields = [];
     if (!customerName) missingFields.push('Customer name is required.');
@@ -3114,10 +3293,14 @@ const createWalletTopup = async (req, res) => {
 
     setPendingOrder(orderId, {
       type: 'wallet_topup',
+      provider: 'wipay',
       orderId,
       returnToken,
       amount: parsedAmount,
-      currency: 'TTD',
+      amountCents,
+      currency: 'USD',
+      providerAmount: parsedAmount,
+      providerCurrency: 'USD',
       customerId: normalizedCustomerId,
       name: customerName,
       email: customerEmail,
@@ -3130,7 +3313,7 @@ const createWalletTopup = async (req, res) => {
     const payload = new URLSearchParams({
       account_number: WIPAY_ACCOUNT_NUMBER,
       country_code: 'TT',
-      currency: 'TTD',
+      currency: 'USD',
       environment: WIPAY_ENVIRONMENT,
       fee_structure: 'customer_pay',
       method: 'credit_card',
@@ -3196,10 +3379,10 @@ const createWalletTopup = async (req, res) => {
   }
 };
 
-app.post('/create-wallet-topup', createWalletTopup);
+app.post('/create-wallet-topup', requireCustomerAuth, createWalletTopup);
 
-app.get('/api/wallet/balance', (req, res) => {
-  const customerId = safeString(req.query.customerId || req.query.email || req.query.customer_id);
+app.get('/api/wallet/balance', requireCustomerAuth, async (req, res) => {
+  const customerId = safeString(req.customer?.id);
 
   if (!customerId) {
     return res.status(400).json({
@@ -3212,18 +3395,18 @@ app.get('/api/wallet/balance', (req, res) => {
   return res.json({
     success: true,
     customerId,
-    balance: getConfirmedWalletBalance(customerId),
-    currency: SHOPIFY_CURRENCY,
+    balance: await getConfirmedWalletBalanceUsd(customerId),
+    currency: 'USD',
   });
 });
 
-app.post('/api/wallet/checkout', handleWalletCheckout);
+app.post('/api/wallet/checkout', requireCustomerAuth, handleWalletCheckout);
 
-app.post('/api/wallet/paypal/orders', createPayPalWalletTopup);
-app.post('/api/wallet/paypal/orders/:orderID/capture', capturePayPalWalletTopup);
-app.post('/wallet/topup/paypal/:orderID/capture', capturePayPalWalletTopup);
+app.post('/api/wallet/paypal/orders', requireCustomerAuth, createPayPalWalletTopup);
+app.post('/api/wallet/paypal/orders/:orderID/capture', requireCustomerAuth, capturePayPalWalletTopup);
+app.post('/wallet/topup/paypal/:orderID/capture', requireCustomerAuth, capturePayPalWalletTopup);
 
-app.post('/wallet/topup', (req, res) => {
+app.post('/wallet/topup', requireCustomerAuth, (req, res) => {
   const provider = safeString(req.body?.provider || req.body?.paymentMethod, 'wipay').toLowerCase();
 
   if (provider === 'paypal') {

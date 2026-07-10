@@ -2,7 +2,7 @@ const { shuffleProducts, safeString } = require('./transform');
 const { resolveProductFromReference } = require('./product-lookup');
 
 function getActiveProducts(products) {
-  return products.filter((product) => safeString(product?.status).toUpperCase() !== 'ARCHIVED');
+  return products.filter((product) => safeString(product?.status, 'ACTIVE').toUpperCase() === 'ACTIVE');
 }
 
 function toRecommendationItem(product) {

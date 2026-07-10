@@ -13,7 +13,7 @@ function parseJsonProductMixMeta(product) {
     return null;
   }
 
-  if (safeString(product.status).toUpperCase() === 'ARCHIVED') {
+  if (safeString(product.status, 'ACTIVE').toUpperCase() !== 'ACTIVE') {
     return null;
   }
 
@@ -100,6 +100,7 @@ class JsonCatalogCache {
   async setMeta(meta) {
     this.state.meta = { ...this.state.meta, ...meta };
     await this.persist();
+    return { ...this.state.meta };
   }
 
   async getProduct(handle) {
@@ -187,6 +188,42 @@ class JsonCatalogCache {
     }
     await this.persist();
     return true;
+  }
+
+  async clearProducts() {
+    this.state.products = {};
+    this.state.productsById = {};
+    jsonMixMetaIndexCache.clear();
+    jsonMixedHandleOrderCache.clear();
+    await this.persist();
+  }
+
+  async deleteProducts(handles = []) {
+    const keys = [...new Set(handles.map((handle) => String(handle || '').trim()).filter(Boolean))];
+    if (!keys.length) {
+      return 0;
+    }
+
+    let removed = 0;
+    for (const key of keys) {
+      const product = this.state.products[key];
+      if (!product) {
+        continue;
+      }
+      delete this.state.products[key];
+      if (product.id) {
+        delete this.state.productsById[String(product.id)];
+      }
+      removed += 1;
+    }
+
+    if (removed > 0) {
+      jsonMixMetaIndexCache.clear();
+      jsonMixedHandleOrderCache.clear();
+      await this.persist();
+    }
+
+    return removed;
   }
 
   async getProductCount() {

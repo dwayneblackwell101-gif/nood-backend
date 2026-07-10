@@ -639,7 +639,22 @@ function isCatalogProductCountSatisfied(productCount, shopifyProductsCount) {
   if (!targetCount) {
     return liveCount > 0;
   }
-  return liveCount >= targetCount;
+  return liveCount === targetCount;
+}
+
+function needsCatalogProductResync(productCount, shopifyProductsCount) {
+  const liveCount = Number(productCount) || 0;
+  const targetCount = Number(shopifyProductsCount) || 0;
+  if (!targetCount) {
+    return liveCount === 0;
+  }
+  return liveCount !== targetCount;
+}
+
+function hasStaleDeletedProducts(productCount, shopifyProductsCount) {
+  const liveCount = Number(productCount) || 0;
+  const targetCount = Number(shopifyProductsCount) || 0;
+  return targetCount > 0 && liveCount > targetCount;
 }
 
 async function getCatalogSyncStatus(cache) {
@@ -865,11 +880,16 @@ async function bumpCatalogVersion(cache, reason = 'catalog-change') {
   const current = (await cache.getMeta()) || {};
   const nextVersion = (Number(current.catalogVersion) || 0) + 1;
   const catalogUpdatedAt = new Date().toISOString();
-  const meta = await cache.setMeta({
+  const meta = (await cache.setMeta({
     catalogVersion: nextVersion,
     catalogUpdatedAt,
     lastCatalogChangeReason: safeString(reason),
-  });
+  })) || {
+    ...current,
+    catalogVersion: nextVersion,
+    catalogUpdatedAt,
+    lastCatalogChangeReason: safeString(reason),
+  };
 
   console.log('[NOOD catalog version] bumped', {
     catalogVersion: meta.catalogVersion ?? nextVersion,
@@ -1093,6 +1113,91 @@ async function syncProductByAdminId(cache, adminProductId, context = {}) {
   });
 }
 
+async function pruneProductsNotInHandleSet(cache, activeHandles) {
+  const active =
+    activeHandles instanceof Set
+      ? activeHandles
+      : new Set(
+          (Array.isArray(activeHandles) ? activeHandles : [])
+            .map((handle) => safeString(handle))
+            .filter(Boolean)
+        );
+
+  const allProducts =
+    typeof cache.getAllProducts === 'function' ? await cache.getAllProducts() : [];
+  const staleHandles = [];
+
+  for (const product of allProducts) {
+    const handle = safeString(product?.handle);
+    if (!handle || active.has(handle)) {
+      continue;
+    }
+    staleHandles.push(handle);
+  }
+
+  let removed = 0;
+  if (staleHandles.length && typeof cache.deleteProducts === 'function') {
+    removed = await cache.deleteProducts(staleHandles);
+  } else if (typeof cache.deleteProduct === 'function') {
+    for (const handle of staleHandles) {
+      const deleted = await cache.deleteProduct(handle);
+      if (deleted) {
+        removed += 1;
+      }
+    }
+  }
+
+  if (removed > 0) {
+    await invalidateDerivedCatalogCaches(cache);
+    await reconcileCollectionProductHandlesFromProducts(cache);
+    const liveProductCount = await getLiveProductCount(cache);
+    await cache.setMeta({
+      productCount: liveProductCount,
+      lastSyncAt: new Date().toISOString(),
+      source: 'shopify',
+    });
+    await bumpCatalogVersion(cache, 'prune-deleted-products');
+    console.log('[NOOD sync] pruned deleted products from cache', {
+      removed,
+      remaining: liveProductCount,
+      activeHandleCount: active.size,
+    });
+  }
+
+  return removed;
+}
+
+async function collectShopifyProductHandles() {
+  const handles = new Set();
+  let after = null;
+  let hasMore = true;
+
+  while (hasMore) {
+    const page = await fetchAdminProductsPage(after, { pageSize: 50 });
+    for (const item of page.items || []) {
+      const handle = safeString(item?.handle);
+      if (handle) {
+        handles.add(handle);
+      }
+    }
+
+    hasMore = Boolean(page.pageInfo?.hasNextPage && page.pageInfo?.endCursor);
+    after = hasMore ? safeString(page.pageInfo?.endCursor) : null;
+  }
+
+  return handles;
+}
+
+async function pruneDeletedProductsFromShopify(cache) {
+  const shopifyHandles = await collectShopifyProductHandles();
+  const removed = await pruneProductsNotInHandleSet(cache, shopifyHandles);
+  return {
+    removed,
+    shopifyHandleCount: shopifyHandles.size,
+    productCount: await getLiveProductCount(cache),
+  };
+}
+
 async function deleteProductFromCache(cache, payload = {}) {
   const handle = safeString(payload?.handle);
   if (handle) {
@@ -1182,11 +1287,16 @@ async function syncCollectionsAndMenusLight(cache) {
 async function syncProductsPhase(cache, config, state, options = {}) {
   const maxPages = Math.max(1, Number(options.maxPages) || 10);
   const pageSize = Math.max(1, Number(options.pageSize) || 25);
-  let after =
-    options.resume && state.productCursor ? state.productCursor : null;
+  const resume = Boolean(options.resume);
+  let after = resume && state.productCursor ? state.productCursor : null;
   let hasNextPage = true;
   let pagesProcessed = 0;
   let pageAttempts = 0;
+  const syncedHandles = new Set(
+    Array.isArray(state.syncedProductHandles)
+      ? state.syncedProductHandles.map((handle) => safeString(handle)).filter(Boolean)
+      : []
+  );
 
   while (hasNextPage && pagesProcessed < maxPages) {
     let pageItems = null;
@@ -1201,6 +1311,13 @@ async function syncProductsPhase(cache, config, state, options = {}) {
       pageItems = page.items;
       pageInfo = page.pageInfo;
       const savedThisPage = await saveProductPage(cache, pageItems, config);
+      for (const adminProduct of pageItems || []) {
+        const handle = safeString(adminProduct?.handle);
+        const status = safeString(adminProduct?.status, 'ACTIVE').toUpperCase();
+        if (handle && status === 'ACTIVE') {
+          syncedHandles.add(handle);
+        }
+      }
       hasNextPage = pageInfo?.hasNextPage === true;
       after = hasNextPage ? safeString(pageInfo?.endCursor) : null;
       if (hasNextPage && !after) {
@@ -1226,6 +1343,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
         productCursor: after,
         productsCompleted: hasNextPage === false,
         syncedProductCount: liveProductCount,
+        syncedProductHandles: [...syncedHandles],
         lastError: null,
         message: null,
         chunkPages: maxPages,
@@ -1278,12 +1396,23 @@ async function syncProductsPhase(cache, config, state, options = {}) {
     }
   }
 
+  const completed = hasNextPage === false;
+  let prunedCount = 0;
+
+  if (completed) {
+    prunedCount = await pruneProductsNotInHandleSet(cache, syncedHandles);
+    await setSyncState(cache, {
+      syncedProductHandles: null,
+    });
+  }
+
   return {
     totalSaved: await getLiveProductCount(cache),
     nextCursor: after,
-    completed: hasNextPage === false,
+    completed,
     paused: hasNextPage === true,
     pagesProcessed,
+    prunedCount,
   };
 }
 
@@ -1465,6 +1594,22 @@ async function runResumableCatalogSync(cache, options = {}) {
 
   if (phase === 'completed') {
     const counts = await getCatalogCounts(cache, { phase: 'completed' });
+
+    if (hasStaleDeletedProducts(counts.productCount, shopifyProductsCount)) {
+      const pruneResult = await pruneDeletedProductsFromShopify(cache);
+      const refreshedCounts = await getCatalogCounts(cache, { phase: 'completed' });
+      if (!needsCatalogProductResync(refreshedCounts.productCount, shopifyProductsCount)) {
+        return {
+          status: 'pruned',
+          message: `Removed ${pruneResult.removed} deleted products from cache.`,
+          productCount: refreshedCounts.productCount,
+          collectionCount: refreshedCounts.collectionCount,
+          shopifyProductsCount,
+          pruned: pruneResult.removed,
+        };
+      }
+    }
+
     if (!isCatalogProductCountSatisfied(counts.productCount, shopifyProductsCount)) {
       return {
         status: 'restart_required',
@@ -1688,7 +1833,7 @@ async function runCatalogSyncUntilComplete(cache, options = {}) {
 
 async function startBackgroundCatalogSync(cache, options = {}) {
   const state = await getSyncState(cache);
-  const restart = Boolean(options.restart);
+  let restart = Boolean(options.restart);
   const forceResume = parseForceResumeFlag(options.forceResume);
   const stale = isSyncStale(state, { forceResume });
   const chunk = resolveSyncChunkOptions(options);
@@ -1702,22 +1847,37 @@ async function startBackgroundCatalogSync(cache, options = {}) {
   const shopifyProductsCount = await fetchShopifyProductsCount();
 
   if (state.status === 'completed' && !restart && !forceResume) {
-    if (shopifyProductsCount && counts.productCount < shopifyProductsCount) {
-      return {
-        status: 'restart_required',
-        message: `Catalog sync is marked completed at ${counts.productCount}/${shopifyProductsCount} Shopify products. Retry with restart=true.`,
-        productCount: counts.productCount,
-        shopifyProductsCount,
-        restartAllowed: true,
-      };
+    if (hasStaleDeletedProducts(counts.productCount, shopifyProductsCount)) {
+      console.log(
+        `[NOOD sync] cache has stale deleted products cache=${counts.productCount} shopify=${shopifyProductsCount}; pruning`
+      );
+      const pruneResult = await pruneDeletedProductsFromShopify(cache);
+      counts = await getCatalogCounts(cache, { phase: 'completed' });
+
+      if (!needsCatalogProductResync(counts.productCount, shopifyProductsCount)) {
+        return {
+          status: 'pruned',
+          message: `Removed ${pruneResult.removed} deleted products from cache.`,
+          productCount: counts.productCount,
+          shopifyProductsCount,
+          pruned: pruneResult.removed,
+        };
+      }
     }
 
-    return {
-      status: 'already_completed',
-      message: 'Catalog sync already completed.',
-      productCount: counts.productCount,
-      shopifyProductsCount,
-    };
+    if (needsCatalogProductResync(counts.productCount, shopifyProductsCount)) {
+      restart = true;
+      console.log(
+        `[NOOD sync] product count mismatch cache=${counts.productCount} shopify=${shopifyProductsCount}; restarting sync`
+      );
+    } else {
+      return {
+        status: 'already_completed',
+        message: 'Catalog sync already completed.',
+        productCount: counts.productCount,
+        shopifyProductsCount,
+      };
+    }
   }
 
   if (alreadyRunning || backgroundSyncActive) {
@@ -1849,6 +2009,8 @@ module.exports = {
   syncSingleProduct,
   syncProductByAdminId,
   deleteProductFromCache,
+  pruneDeletedProductsFromShopify,
+  pruneProductsNotInHandleSet,
   syncCollectionByAdminId,
   refreshAffectedCollections,
   refreshCollectionsForHandles,
