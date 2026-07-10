@@ -1,6 +1,4 @@
-const path = require('path');
-
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+require('../config/env').loadEnv();
 
 const { createCatalogCache } = require('../catalog/cache/redis-cache');
 const {

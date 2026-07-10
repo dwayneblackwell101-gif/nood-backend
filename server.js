@@ -1,7 +1,5 @@
-const path = require('path');
-
-require('dotenv').config({ path: path.join(__dirname, '.env') });
-require('dotenv').config({ path: path.join(__dirname, '.env.local'), override: true });
+const { loadEnv } = require('./config/env');
+loadEnv();
 
 const crypto = require('crypto');
 const os = require('os');
@@ -2002,7 +2000,14 @@ function cleanupOldPendingOrders() {
   }
 }
 
-setInterval(cleanupOldPendingOrders, 1000 * 60 * 30);
+let pendingOrdersCleanupTimer = null;
+
+function startRecurringJobs() {
+  if (pendingOrdersCleanupTimer || process.env.NOOD_DISABLE_BACKGROUND_WORKERS === 'true') {
+    return;
+  }
+  pendingOrdersCleanupTimer = setInterval(cleanupOldPendingOrders, 1000 * 60 * 30);
+}
 
 app.get('/', (req, res) => {
   res.send(`Backend is running on ${BACKEND_BASE_URL}`);
@@ -4173,18 +4178,29 @@ async function startServer() {
     throw error;
   }
 
-  try {
-    shopifyOrderAccessState = await validateShopifyOrderCreateAccess();
-  } catch (error) {
+  if (NODE_ENV === 'test') {
     shopifyOrderAccessState = {
       ok: false,
-      message: error?.message || 'Shopify order access validation failed.',
+      message: 'Shopify order access validation skipped in test mode.',
       scopes: [],
-      tokenSource: getShopifyOrderTokenSource(),
-      missingOrderScopes: ['write_orders'],
-      hasShopifyOrderAdminAccessToken: hasShopifyOrderAdminAccessToken(),
+      tokenSource: 'test',
+      missingOrderScopes: [],
+      hasShopifyOrderAdminAccessToken: false,
     };
-    console.error('[ORDER CREATE FAILED] startup validation threw', shopifyOrderAccessState);
+  } else {
+    try {
+      shopifyOrderAccessState = await validateShopifyOrderCreateAccess();
+    } catch (error) {
+      shopifyOrderAccessState = {
+        ok: false,
+        message: error?.message || 'Shopify order access validation failed.',
+        scopes: [],
+        tokenSource: getShopifyOrderTokenSource(),
+        missingOrderScopes: ['write_orders'],
+        hasShopifyOrderAdminAccessToken: hasShopifyOrderAdminAccessToken(),
+      };
+      console.error('[ORDER CREATE FAILED] startup validation threw', shopifyOrderAccessState);
+    }
   }
 
   try {
@@ -4202,7 +4218,9 @@ async function startServer() {
     console.error('[NOOD catalog] sync routes not mounted because cache is unavailable');
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  startRecurringJobs();
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
     const localUrl = `http://localhost:${PORT}`;
     const loopbackUrl = `http://127.0.0.1:${PORT}`;
     const networkUrl = `http://${LOCAL_IP}:${PORT}`;
@@ -4234,11 +4252,22 @@ async function startServer() {
       });
     }
   });
+
+  return server;
 }
 
-startServer().catch((error) => {
-  console.error('[NOOD backend] failed to start:', error.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  startServer().catch((error) => {
+    console.error('[NOOD backend] failed to start:', error.message);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  app,
+  getBackendReadiness,
+  startRecurringJobs,
+  startServer,
+};
 
 

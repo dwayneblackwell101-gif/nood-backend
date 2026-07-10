@@ -7,6 +7,13 @@ function isProductionEnv() {
   return String(process.env.NODE_ENV || '').trim() === 'production';
 }
 
+function workersDisabled() {
+  return (
+    String(process.env.NODE_ENV || '').trim() === 'test' ||
+    String(process.env.NOOD_DISABLE_BACKGROUND_WORKERS || '').trim().toLowerCase() === 'true'
+  );
+}
+
 let catalogCachePromise = null;
 let mountedCache = null;
 let catalogMounted = false;
@@ -91,7 +98,8 @@ async function mountCatalog(app, { requireAdminApiKey }) {
     catalogMounted = true;
     catalogMountError = null;
 
-    void (async () => {
+    if (!workersDisabled()) {
+      void (async () => {
       if (isProductionEnv()) {
         const result = await ensureCatalogWarm(cache);
         console.log('[NOOD catalog] startup warm check', result);
@@ -100,7 +108,10 @@ async function mountCatalog(app, { requireAdminApiKey }) {
 
       const syncResult = await startBackgroundCatalogSync(cache, { syncMenus: true });
       console.log('[NOOD catalog] startup auto-sync', syncResult);
-    })();
+      })();
+    } else {
+      console.log('[NOOD catalog] background workers disabled');
+    }
 
     return cache;
   } catch (error) {

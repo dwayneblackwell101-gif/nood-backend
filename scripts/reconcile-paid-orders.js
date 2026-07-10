@@ -1,4 +1,4 @@
-require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+require('../config/env').loadEnv();
 
 const { createRedisClient } = require('../storage/redis-collection');
 
