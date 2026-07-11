@@ -48,6 +48,11 @@ const { createRedisLockService } = require('./storage/redis-lock');
 const { createRedisWalletService } = require('./wallet/redis-wallet');
 const { createPaymentStateService } = require('./payments/payment-state');
 const { createPayPalPaymentService } = require('./payments/paypal-service');
+const { createReturnRequestHandlers } = require('./refunds/return-requests');
+const shopifyRefundSync = require('./refunds/shopify-refund-sync');
+const { createWalletRefundService } = require('./refunds/wallet-refund');
+const { createRefundService } = require('./refunds/refund-service');
+const { fetchRefundableShopifyOrder } = require('./refunds/shopify-refund-verifier');
 const {
   getShopifyOrderAccessToken,
   hasShopifyOrderAdminAccessToken,
@@ -78,10 +83,6 @@ const paypalPaymentService = createPayPalPaymentService({
   lockTtlSeconds: Number(process.env.PAYMENT_LOCK_TTL_SECONDS || 60),
 });
 const requireCustomerAuth = createCustomerAuthMiddleware();
-
-const { createReturnRequestHandlers } = require('./refunds/return-requests');
-const shopifyRefundSync = require('./refunds/shopify-refund-sync');
-const { createWalletRefundService } = require('./refunds/wallet-refund');
 const walletRefundService = createWalletRefundService({
   walletTransactions,
   persistWalletTransactions,
@@ -89,11 +90,22 @@ const walletRefundService = createWalletRefundService({
   safeString,
   defaultCurrency: 'USD',
 });
-const returnRequestHandlers = createReturnRequestHandlers({
+const refundService = createRefundService({
   refundRequests: storage.refundRequests,
-  shopifyRefundSync,
+  lockService,
+  redisWallet,
   walletRefundService,
+  fetchShopifyOrder: fetchRefundableShopifyOrder,
+  paypalRefundsEnabled: ['1', 'true', 'yes'].includes(
+    safeString(process.env.PAYPAL_REFUNDS_ENABLED, 'false').toLowerCase()
+  ),
+  shippingPolicy: safeString(process.env.REFUND_SHIPPING_POLICY, 'none').toLowerCase(),
 });
+const returnRequestHandlers = createReturnRequestHandlers({
+  refundService,
+  shopifyRefundSync,
+});
+
 const createNotificationsRouter = require('./notifications/push-notifications');
 const notificationsRouter = createNotificationsRouter({
   pushTokens: storage.pushTokens,
@@ -2207,6 +2219,31 @@ async function getBackendReadiness() {
     addCheck('paypal_hosted_sdk_state_machine', Boolean(paymentState && lockService), {
       message: 'Hosted PayPal SDK routes require persistent payment state and locks.',
     });
+  }
+
+  const refundsEnabled = ['1', 'true', 'yes'].includes(
+    safeString(process.env.REFUNDS_ENABLED, 'true').toLowerCase()
+  );
+  if (refundsEnabled) {
+    addCheck('refund_persistent_storage', storage.storageDriver === 'redis' && Boolean(storage.redis), {
+      message: storage.redis ? 'refund_storage_redis_ready' : 'Redis refund storage is required for production refunds.',
+    });
+    addCheck('refund_locking', Boolean(lockService), {
+      message: lockService ? 'refund_locks_ready' : 'Redis refund locks are required for money movement.',
+    });
+    addCheck('refund_shopify_order_lookup', hasShopifyOrderAdminAccessToken(), {
+      tokenSource: getShopifyOrderTokenSource(),
+      message: 'Shopify order lookup is required for refund ownership and amount verification.',
+    });
+    addCheck('wallet_refund_atomic_support', Boolean(redisWallet), {
+      message: redisWallet ? 'wallet_refund_atomic_ready' : 'Redis wallet service is required for wallet refunds.',
+    });
+    const payPalRefundsEnabled = ['1', 'true', 'yes'].includes(
+      safeString(process.env.PAYPAL_REFUNDS_ENABLED, 'false').toLowerCase()
+    );
+    if (payPalRefundsEnabled) {
+      addCheck('paypal_refund_config', hasPayPalCredentials() && PAYPAL_CURRENCY === 'USD');
+    }
   }
 
   const wiPayEnabled = ['1', 'true', 'yes'].includes(

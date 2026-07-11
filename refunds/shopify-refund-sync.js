@@ -16,6 +16,13 @@ const REFUND_METHOD_TAGS = {
 };
 
 const REFUND_STATUS_TAGS = {
+  requested: 'refund-status-requested',
+  under_review: 'refund-status-under-review',
+  refund_pending: 'refund-status-refund-pending',
+  provider_refunding: 'refund-status-provider-refunding',
+  wallet_crediting: 'refund-status-wallet-crediting',
+  completed: 'refund-status-completed',
+  manual_review: 'refund-status-manual-review',
   pending_review: 'refund-status-pending-review',
   approved: 'refund-status-approved',
   rejected: 'refund-status-rejected',
@@ -54,6 +61,20 @@ function getStatusLabel(status) {
   const normalized = safeString(status, 'pending_review').toLowerCase();
 
   switch (normalized) {
+    case 'requested':
+      return 'Requested';
+    case 'under_review':
+      return 'Under review';
+    case 'refund_pending':
+      return 'Refund pending';
+    case 'provider_refunding':
+      return 'Provider refunding';
+    case 'wallet_crediting':
+      return 'Wallet crediting';
+    case 'completed':
+      return 'Completed';
+    case 'manual_review':
+      return 'Manual review';
     case 'pending_review':
       return 'Pending review';
     case 'approved':
@@ -81,21 +102,21 @@ function getActionNeeded(record) {
   const status = safeString(record.status, 'pending_review').toLowerCase();
   const wallet = isWalletRefundMethod(record.refund_method);
 
-  if (status === 'pending_review') {
+  if (status === 'requested' || status === 'under_review' || status === 'pending_review') {
     return wallet
       ? 'Approve to credit customer NOOD Wallet.'
       : 'Review and refund through WiPay/PayPal/Shopify payment provider if approved.';
   }
 
-  if (status === 'manual_refund_required') {
+  if (status === 'manual_refund_required' || status === 'manual_review') {
     return 'Process refund in WiPay/PayPal/Shopify, then mark_refunded.';
   }
 
-  if (status === 'refunded_to_wallet') {
+  if (status === 'refunded_to_wallet' || (status === 'completed' && wallet)) {
     return 'NOOD Wallet credited.';
   }
 
-  if (status === 'refunded_to_original') {
+  if (status === 'refunded_to_original' || status === 'completed') {
     return 'Original payment refund completed.';
   }
 

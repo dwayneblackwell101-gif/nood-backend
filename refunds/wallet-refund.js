@@ -7,18 +7,32 @@ function createWalletRefundService({
 }) {
   function creditWalletRefund({
     requestId,
+    customerId,
     customerEmail,
     amount,
+    amountCents,
     currency,
     orderId,
     orderNumber,
   }) {
     const normalizedRequestId = safeString(requestId);
+    const normalizedCustomerId = safeString(customerId || customerEmail).toLowerCase();
     const normalizedEmail = safeString(customerEmail).toLowerCase();
     const walletTransactionId = `refund_wallet_${normalizedRequestId}`;
+    const creditAmount = Number.isSafeInteger(Number(amountCents))
+      ? Number(amountCents) / 100
+      : Number(safeMoney(amount));
 
     const existing = walletTransactions.get(walletTransactionId);
     if (existing) {
+      if (
+        safeString(existing.customerId).toLowerCase() !== normalizedCustomerId ||
+        Number(safeMoney(existing.amount)) !== Number(safeMoney(creditAmount))
+      ) {
+        const error = new Error('Wallet refund idempotency conflict.');
+        error.statusCode = 409;
+        throw error;
+      }
       console.log('[WALLET REFUND CREDITED]', {
         requestId: normalizedRequestId,
         duplicate: true,
@@ -32,7 +46,6 @@ function createWalletRefundService({
       };
     }
 
-    const creditAmount = Number(safeMoney(amount));
     if (!Number.isFinite(creditAmount) || creditAmount <= 0) {
       throw new Error('Invalid wallet refund amount.');
     }
@@ -43,7 +56,8 @@ function createWalletRefundService({
       transactionId: normalizedRequestId,
       orderId: safeString(orderId),
       orderNumber: safeString(orderNumber),
-      customerId: normalizedEmail,
+      customerId: normalizedCustomerId,
+      customerEmail: normalizedEmail,
       amount: safeMoney(creditAmount),
       currency: safeString(currency, defaultCurrency).toUpperCase(),
       status: 'confirmed',
