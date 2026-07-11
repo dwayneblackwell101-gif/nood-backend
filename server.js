@@ -48,6 +48,14 @@ const { createRedisLockService } = require('./storage/redis-lock');
 const { createRedisWalletService } = require('./wallet/redis-wallet');
 const { createPaymentStateService } = require('./payments/payment-state');
 const { createPayPalPaymentService } = require('./payments/paypal-service');
+const {
+  assertTrustedPricingSelfTest,
+  hashSnapshot,
+  priceCart,
+  revalidateSnapshot,
+  snapshotToCartItems,
+  verifySnapshotHash,
+} = require('./checkout/cart-pricing');
 const { createReturnRequestHandlers } = require('./refunds/return-requests');
 const shopifyRefundSync = require('./refunds/shopify-refund-sync');
 const { createWalletRefundService } = require('./refunds/wallet-refund');
@@ -1274,6 +1282,7 @@ function saveWalletTransaction({ provider, transactionId, pending, rawReturn }) 
     currency: pending?.currency || 'TTD',
     status: 'confirmed',
     rawReturn: rawReturn || null,
+    trustedCartSnapshot: pending?.trustedCartSnapshot || null,
     createdAt: new Date().toISOString(),
   };
 
@@ -1422,8 +1431,13 @@ async function handleWalletCheckout(req, res) {
   try {
     const authenticatedCustomer = req.customer || {};
     const checkoutSessionId = resolveCheckoutSessionId(req.body);
-    const cartItems = getCartItemsFromBody(req.body);
-    const total = assertCheckoutTotalMatches(req.body);
+    const trustedSnapshot = await priceCart({
+      cache: await getCatalogCache(),
+      body: req.body,
+      customerId: authenticatedCustomer.id,
+    });
+    const cartItems = snapshotToCartItems(trustedSnapshot);
+    const total = trustedSnapshot.total;
     const shippingAddress = req.body?.shippingAddress || {};
     const customerName = safeString(
       req.body?.name || shippingAddress?.fullName || shippingAddress?.name
@@ -1492,7 +1506,7 @@ async function handleWalletCheckout(req, res) {
         currency: SHOPIFY_CURRENCY,
         paymentCurrency: SHOPIFY_CURRENCY,
         paymentAmount: total,
-        pending: { currency: SHOPIFY_CURRENCY, cartItems },
+        pending: { currency: trustedSnapshot.currency, cartItems, trustedCartSnapshot: trustedSnapshot },
       });
 
       savePaymentRecord({
@@ -1503,7 +1517,8 @@ async function handleWalletCheckout(req, res) {
         status: 'shopify_created',
         shopifyOrder,
         amount: total,
-        currency: SHOPIFY_CURRENCY,
+        currency: trustedSnapshot.currency,
+        trustedCartSnapshot: trustedSnapshot,
       });
 
       return res.json({
@@ -1928,27 +1943,38 @@ async function createShopifyOrderFromPaidPayment(paymentData) {
   }
 
   try {
+    const trustedSnapshot = pending?.trustedCartSnapshot || null;
+    if (trustedSnapshot) {
+      await revalidateSnapshot({
+        cache: await getCatalogCache(),
+        snapshot: trustedSnapshot,
+      });
+    }
+    const trustedCartItems = trustedSnapshot ? snapshotToCartItems(trustedSnapshot) : pending.cartItems;
+    const trustedTotal = trustedSnapshot ? trustedSnapshot.total : pending.total;
+    const trustedCurrency = trustedSnapshot ? trustedSnapshot.currency : null;
+
     console.log('[ORDER CREATE START]', {
       method: normalizedMethod,
       orderId,
       transactionId,
-      lineItemCount: Array.isArray(pending?.cartItems) ? pending.cartItems.length : 0,
-      total: pending?.total || pending?.amount || null,
+      lineItemCount: Array.isArray(trustedCartItems) ? trustedCartItems.length : 0,
+      total: trustedTotal || pending?.amount || null,
       tokenSource: shopifyOrderAccessState.tokenSource,
     });
 
     const paymentCurrency = resolveShopifyOrderCurrency({
-      pending,
-      cartItems: pending?.cartItems,
+      pending: trustedSnapshot ? { ...pending, currency: trustedCurrency } : pending,
+      cartItems: trustedCartItems,
     });
-    const paymentAmount = safeMoney(pending?.total || pending?.amount);
+    const paymentAmount = safeMoney(trustedTotal || pending?.amount);
 
     const shopifyOrder = await createShopifyOrder({
       email: pending.email,
       phone: pending.phone,
       name: pending.name,
-      total: pending.total,
-      cartItems: pending.cartItems,
+      total: trustedTotal,
+      cartItems: trustedCartItems,
       shippingAddress: pending.shippingAddress,
       paymentTransactionId: transactionId,
       paymentMethod: normalizedMethod === 'paypal' ? 'PayPal' : 'WiPay',
@@ -1956,7 +1982,7 @@ async function createShopifyOrderFromPaidPayment(paymentData) {
       currency: paymentCurrency,
       paymentCurrency,
       paymentAmount,
-      pending,
+      pending: trustedSnapshot ? { ...pending, cartItems: trustedCartItems, total: trustedTotal, currency: trustedCurrency } : pending,
     });
 
     console.log('[ORDER CREATE SUCCESS]', {
@@ -1973,8 +1999,9 @@ async function createShopifyOrderFromPaidPayment(paymentData) {
       orderId,
       status: 'shopify_created',
       shopifyOrder,
-      amount: pending?.total || pending?.amount || '',
-      currency: pending?.currency || SHOPIFY_CURRENCY,
+      amount: trustedTotal || pending?.amount || '',
+      currency: trustedCurrency || pending?.currency || SHOPIFY_CURRENCY,
+      trustedCartSnapshot: trustedSnapshot || undefined,
       paypalOrderId: pending?.paypalOrderId || '',
       rawPayment: rawReturn || null,
     });
@@ -2011,8 +2038,9 @@ async function createShopifyOrderFromPaidPayment(paymentData) {
       orderId,
       status: 'payment_received_order_review',
       recoveryId: recovery.recoveryId,
-      amount: pending?.total || pending?.amount || '',
-      currency: pending?.currency || SHOPIFY_CURRENCY,
+      amount: trustedTotal || pending?.amount || '',
+      currency: trustedCurrency || pending?.currency || SHOPIFY_CURRENCY,
+      trustedCartSnapshot: trustedSnapshot || undefined,
       shopifyError: shopifyErrorDetails,
       rawPayment: rawReturn || null,
     });
@@ -2267,6 +2295,20 @@ async function getBackendReadiness() {
   }
 
   try {
+    assertTrustedPricingSelfTest();
+    addCheck('trusted_cart_pricing', true, {
+      source: 'active_catalog',
+      shippingMode: safeString(process.env.CHECKOUT_SHIPPING_MODE, 'fixed'),
+      taxPolicy: 'no_additional_tax',
+    });
+  } catch (error) {
+    addCheck('trusted_cart_pricing', false, { message: error.message });
+  }
+  addCheck('checkout_snapshot_storage', Boolean(paymentState), {
+    message: paymentState ? 'payment_state_metadata_ready' : 'Payment state is required for immutable cart snapshots.',
+  });
+
+  try {
     const catalog = await getCatalogReadiness();
     addCheck('catalog', catalog.ready, catalog);
   } catch (error) {
@@ -2291,21 +2333,19 @@ app.post('/api/orders', requireCustomerAuth, async (req, res) => {
     }
 
     const checkoutSessionId = resolveCheckoutSessionId(req.body);
-    const payPalAmounts = getPayPalCheckoutAmounts(req.body);
-    const total = payPalAmounts.shopifyTotal;
-    const cartItems = getCartItemsFromBody(req.body);
     const customer = req.customer || {};
+    const catalogCache = await getCatalogCache();
+    const baseSnapshot = await priceCart({
+      cache: catalogCache,
+      body: req.body,
+      customerId: customer.id,
+    });
+    const total = baseSnapshot.total;
+    const cartItems = snapshotToCartItems(baseSnapshot);
     const operationKey = getRequestIdempotencyKey(
       req,
-      checkoutSessionId || getCartFingerprint(cartItems)
+      checkoutSessionId || baseSnapshot.cartFingerprint
     );
-
-    if (!cartItems.length) {
-      return res.status(400).json({
-        error: true,
-        message: 'Missing cart items for Shopify order creation.',
-      });
-    }
 
     if (checkoutSessionId) {
       const existingPending = findPendingByCheckoutSessionId(checkoutSessionId);
@@ -2329,6 +2369,11 @@ app.post('/api/orders', requireCustomerAuth, async (req, res) => {
       req.body?.order_id || req.body?.reference_id || checkoutSessionId,
       `paypal_${Date.now()}`
     );
+    const trustedSnapshot = {
+      ...baseSnapshot,
+      checkoutSessionId: checkoutSessionId || orderId,
+    };
+    trustedSnapshot.snapshotHash = hashSnapshot(trustedSnapshot);
     const shippingAddress = req.body?.shippingAddress || {};
     const customerName = safeString(
       req.body?.name || shippingAddress?.fullName || shippingAddress?.name,
@@ -2358,22 +2403,16 @@ app.post('/api/orders', requireCustomerAuth, async (req, res) => {
 
     console.log('[NOOD backend] PayPal create order request', {
       total,
-      cartItems,
+      lineCount: trustedSnapshot.lines.length,
       shippingAddress,
     });
 
     const paymentCreate = await paypalPaymentService.createOrder({
       purpose: 'checkout',
       customerId: customer.id,
-      expectedAmountCents: usdToCents(payPalAmounts.paypalTotalUsd),
-      expectedCurrency: payPalAmounts.paypalCurrency,
-      trustedSnapshot: {
-        checkoutSessionId: checkoutSessionId || orderId,
-        cartFingerprint: getCartFingerprint(cartItems),
-        cartItems,
-        total,
-        currency: payPalAmounts.shopifyCurrency,
-      },
+      expectedAmountCents: trustedSnapshot.totalCents,
+      expectedCurrency: trustedSnapshot.currency,
+      trustedSnapshot,
       idempotencyKey: `paypal:create:${operationKey}`,
       referenceId: orderId,
       description: safeString(req.body?.description, 'NOOD order'),
@@ -2397,11 +2436,12 @@ app.post('/api/orders', requireCustomerAuth, async (req, res) => {
       paypalOrderId: order.id,
       customerId: customer.id,
       total,
-      currency: payPalAmounts.shopifyCurrency,
-      paypalTotalUsd: payPalAmounts.paypalTotalUsd,
-      paypalCurrency: payPalAmounts.paypalCurrency,
-      exchangeRate: payPalAmounts.exchangeRate,
+      currency: trustedSnapshot.currency,
+      paypalTotalUsd: trustedSnapshot.total,
+      paypalCurrency: trustedSnapshot.currency,
+      exchangeRate: 1,
       cartItems,
+      trustedCartSnapshot: trustedSnapshot,
       shippingAddress,
       name: customerName,
       email: customerEmail,
@@ -2414,6 +2454,15 @@ app.post('/api/orders', requireCustomerAuth, async (req, res) => {
       status: order.status,
       links: order.links || [],
       paypal: order,
+      trustedCart: {
+        total,
+        currency: trustedSnapshot.currency,
+        subtotal: trustedSnapshot.subtotal,
+        shipping: trustedSnapshot.shipping,
+        tax: trustedSnapshot.tax,
+        discounts: trustedSnapshot.discounts,
+        lines: trustedSnapshot.lines,
+      },
       payment: paymentState.publicPayment(paymentCreate.record),
     });
   } catch (error) {
@@ -2602,14 +2651,18 @@ app.post('/api/shopify/orders', requireAdminApiKey, async (req, res) => {
     : findFailedPaidOrderByPayment(provider, transactionId);
 
   try {
-    const total = getRequestTotal(req.body) || recoveryRecord?.amount;
-    const cartItems = Array.isArray(req.body?.cartItems)
-      ? req.body.cartItems
-      : Array.isArray(req.body?.cart)
-        ? req.body.cart
-        : Array.isArray(req.body?.items)
-          ? req.body.items
-          : recoveryRecord?.cartItems || [];
+    let trustedSnapshot = recoveryRecord?.trustedCartSnapshot || null;
+    if (trustedSnapshot) {
+      verifySnapshotHash(trustedSnapshot);
+    } else {
+      trustedSnapshot = await priceCart({
+        cache: await getCatalogCache(),
+        body: req.body,
+        customerId: safeString(req.body?.customerId || req.body?.customer_id || 'admin_recovery'),
+      });
+    }
+    const total = trustedSnapshot.total;
+    const cartItems = snapshotToCartItems(trustedSnapshot);
 
     const shippingAddress = req.body?.shippingAddress || recoveryRecord?.shippingAddress || {};
     const customerName = safeString(
@@ -2648,7 +2701,7 @@ app.post('/api/shopify/orders', requireAdminApiKey, async (req, res) => {
     });
 
     const retryCurrency = safeString(
-      req.body?.currency || recoveryRecord?.currency,
+      trustedSnapshot.currency || recoveryRecord?.currency,
       SHOPIFY_CURRENCY
     ).toUpperCase();
 
@@ -2678,7 +2731,8 @@ app.post('/api/shopify/orders', requireAdminApiKey, async (req, res) => {
       status: 'shopify_created',
       shopifyOrder,
       amount: total,
-      currency: safeString(req.body?.currency || recoveryRecord?.currency, SHOPIFY_CURRENCY),
+      currency: trustedSnapshot.currency,
+      trustedCartSnapshot: trustedSnapshot,
       recoveryId: recoveryRecord?.recoveryId || recoveryId || '',
     });
 
@@ -2829,22 +2883,31 @@ app.post('/api/failed-paid-orders/:recoveryId/retry', requireAdminApiKey, async 
   }
 
   try {
-    const recoveryCurrency = safeString(record?.currency, SHOPIFY_CURRENCY).toUpperCase();
+    const trustedSnapshot = record?.trustedCartSnapshot || null;
+    if (trustedSnapshot) {
+      await revalidateSnapshot({
+        cache: await getCatalogCache(),
+        snapshot: trustedSnapshot,
+      });
+    }
+    const recoveryCurrency = safeString(trustedSnapshot?.currency || record?.currency, SHOPIFY_CURRENCY).toUpperCase();
+    const recoveryCartItems = trustedSnapshot ? snapshotToCartItems(trustedSnapshot) : record.cartItems;
+    const recoveryAmount = trustedSnapshot ? trustedSnapshot.total : record.amount;
 
     const shopifyOrder = await createShopifyOrder({
       email: record.customer?.email,
       phone: record.customer?.phone,
       name: record.customer?.name,
-      total: record.amount,
-      cartItems: record.cartItems,
+      total: recoveryAmount,
+      cartItems: recoveryCartItems,
       shippingAddress: record.shippingAddress,
       paymentTransactionId: record.transactionId,
       paymentMethod: record.provider === 'paypal' ? 'PayPal' : 'WiPay',
       clientOrderId: record.orderId,
       currency: recoveryCurrency,
       paymentCurrency: recoveryCurrency,
-      paymentAmount: record.amount,
-      pending: { currency: recoveryCurrency, cartItems: record.cartItems },
+      paymentAmount: recoveryAmount,
+      pending: { currency: recoveryCurrency, cartItems: recoveryCartItems, trustedCartSnapshot: trustedSnapshot },
     });
 
     const updated = {
@@ -2864,8 +2927,9 @@ app.post('/api/failed-paid-orders/:recoveryId/retry', requireAdminApiKey, async 
       orderId: record.orderId,
       status: 'shopify_created',
       shopifyOrder,
-      amount: record.amount,
+      amount: recoveryAmount,
       currency: record.currency || SHOPIFY_CURRENCY,
+      trustedCartSnapshot: trustedSnapshot || undefined,
       recoveryId,
     });
 
@@ -3090,6 +3154,12 @@ app.post('/create-wipay-payment', requireCustomerAuth, async (req, res) => {
 });
 
 app.post('/create-paypal-payment', requireCustomerAuth, async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    error: true,
+    message: 'Legacy PayPal checkout creation is retired. Use POST /api/orders.',
+  });
+
   try {
     const { shippingAddress = {} } = req.body;
     const customer = req.customer || {};
@@ -3201,6 +3271,8 @@ app.post('/create-paypal-payment', requireCustomerAuth, async (req, res) => {
 });
 
 app.get('/paypal-checkout', (req, res) => {
+  return res.status(410).send('Legacy PayPal checkout page is retired. Use hosted PayPal SDK checkout.');
+
   const orderId = getReturnOrderId(req.query);
   const returnToken = getReturnToken(req.query);
   const pending = pendingOrders.get(orderId);
@@ -3329,6 +3401,12 @@ app.get('/paypal-checkout', (req, res) => {
 });
 
 app.post('/paypal-sdk/orders', async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    error: true,
+    message: 'Legacy PayPal SDK order route is retired. Use POST /api/orders.',
+  });
+
   try {
     const orderId = safeString(req.body?.orderId || req.body?.order_id);
     const returnToken = safeString(req.body?.returnToken || req.body?.return_token);
@@ -3383,6 +3461,12 @@ app.post('/paypal-sdk/orders', async (req, res) => {
 });
 
 app.post('/paypal-sdk/orders/:paypalOrderId/capture', async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    error: true,
+    message: 'Legacy PayPal SDK capture route is retired. Use POST /api/orders/:orderID/capture.',
+  });
+
   const paypalOrderId = safeString(req.params.paypalOrderId);
   const orderId = safeString(req.body?.orderId || req.body?.order_id);
   const returnToken = safeString(req.body?.returnToken || req.body?.return_token);

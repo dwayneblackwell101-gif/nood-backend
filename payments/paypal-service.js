@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { centsToUsd, requirePositiveCents } = require('../lib/money');
+const { centsToUsd, requirePositiveCents, usdToCents } = require('../lib/money');
 
 const PAYPAL_PROVIDER = 'paypal';
 const TERMINAL_DUPLICATE_STATES = new Set(['completed', 'recovery_required']);
@@ -83,7 +83,7 @@ function verifyCapture({ captureData, expectedAmountCents, expectedCurrency = 'U
     throw errorWithStatus('PayPal capture currency mismatch.', 400, 'paypal_currency_mismatch');
   }
 
-  const capturedCents = Math.round(Number(details.amount) * 100);
+  const capturedCents = usdToCents(details.amount);
   if (!Number.isSafeInteger(capturedCents) || capturedCents !== Number(expectedAmountCents)) {
     throw errorWithStatus('PayPal capture amount mismatch.', 400, 'paypal_amount_mismatch');
   }
