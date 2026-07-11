@@ -88,6 +88,7 @@ function createStorage() {
     redisConfigured: false,
     failedPaidOrdersDriver: 'json',
     paymentRecordsDriver: 'json',
+    reconciliationRecordsDriver: 'json',
   };
 
   if (process.env.NODE_ENV === 'production' && STORAGE_DRIVER !== 'redis') {
@@ -122,6 +123,7 @@ function createStorage() {
     storageState.redisConfigured = true;
     storageState.failedPaidOrdersDriver = 'redis';
     storageState.paymentRecordsDriver = 'redis';
+    storageState.reconciliationRecordsDriver = 'redis';
   }
 
   const pendingOrders = redis
@@ -208,6 +210,19 @@ function createStorage() {
         keyField: 'token',
       });
 
+  const reconciliationRecords = redis
+    ? new RedisCollection({
+        name: 'reconciliation records',
+        keyPrefix: 'nood:storage:reconciliationRecords:',
+        keyField: 'reconciliationId',
+        redis,
+      })
+    : new JsonCollection({
+        name: 'reconciliation records',
+        fileName: 'reconciliation-records.json',
+        keyField: 'reconciliationId',
+      });
+
   const ready = (async () => {
     if (redis) {
       await redis.connect();
@@ -216,6 +231,7 @@ function createStorage() {
       await walletTransactions.init();
       await failedPaidOrders.init();
       await paymentRecords.init();
+      await reconciliationRecords.init();
       await refundRequests.init();
       await pushTokens.init();
       storageState.paymentStorageRedisReady = true;
@@ -232,6 +248,7 @@ function createStorage() {
       walletTransactions.ready,
       failedPaidOrders.ready,
       paymentRecords.ready,
+      reconciliationRecords.ready,
       refundRequests.ready,
       pushTokens.ready,
     ]);
@@ -244,6 +261,7 @@ function createStorage() {
     pendingOrders,
     failedPaidOrders,
     paymentRecords,
+    reconciliationRecords,
     refundRequests,
     walletTransactions,
     pushTokens,
@@ -264,6 +282,9 @@ function createStorage() {
     },
     get paymentRecordsDriver() {
       return storageState.paymentRecordsDriver;
+    },
+    get reconciliationRecordsDriver() {
+      return storageState.reconciliationRecordsDriver;
     },
   };
 }

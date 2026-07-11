@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 
-const TERMINAL_STATES = new Set(['completed', 'failed', 'recovery_required', 'refunded']);
+const TERMINAL_STATES = new Set(['completed', 'failed', 'refunded']);
 const VALID_TRANSITIONS = new Map([
   ['created', new Set(['provider_pending', 'provider_approved', 'provider_verified', 'failed', 'recovery_required'])],
   ['provider_pending', new Set(['provider_approved', 'provider_verified', 'failed', 'recovery_required'])],

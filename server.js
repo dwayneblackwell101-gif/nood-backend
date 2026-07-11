@@ -48,6 +48,8 @@ const { createRedisLockService } = require('./storage/redis-lock');
 const { createRedisWalletService } = require('./wallet/redis-wallet');
 const { createPaymentStateService } = require('./payments/payment-state');
 const { createPayPalPaymentService } = require('./payments/paypal-service');
+const { verifyPayPalPayment } = require('./payments/paypal-verification');
+const { createPayPalReconciliationService } = require('./payments/reconciliation-service');
 const {
   assertTrustedPricingSelfTest,
   hashSnapshot,
@@ -74,6 +76,7 @@ const storage = createStorage();
 const pendingOrders = storage.pendingOrders.items;
 const failedPaidOrders = storage.failedPaidOrders.items;
 const paymentRecords = storage.paymentRecords.items;
+const reconciliationRecords = storage.reconciliationRecords;
 const walletTransactions = storage.walletTransactions.items;
 const redisNamespace = safeString(process.env.REDIS_NAMESPACE, 'nood');
 const lockService = createRedisLockService({ redis: storage.redis, namespace: redisNamespace });
@@ -89,6 +92,23 @@ const paypalPaymentService = createPayPalPaymentService({
   },
   expectedMerchantId: safeString(process.env.PAYPAL_MERCHANT_ID),
   lockTtlSeconds: Number(process.env.PAYMENT_LOCK_TTL_SECONDS || 60),
+});
+const payPalReconciliationService = createPayPalReconciliationService({
+  paymentState,
+  lockService,
+  reconciliationRecords,
+  failedPaidOrders,
+  paypalVerifier: {
+    verify: (input) => verifyPayPalPayment({
+      ...input,
+      paypalClient: { getOrder: getPayPalOrder },
+    }),
+  },
+  shopifyLookup: findExistingShopifyOrderForRecovery,
+  createShopifyOrder,
+  getCatalogCache,
+  expectedMerchantId: safeString(process.env.PAYPAL_MERCHANT_ID),
+  lockTtlSeconds: Number(process.env.RECONCILIATION_LOCK_TTL_SECONDS || 120),
 });
 const requireCustomerAuth = createCustomerAuthMiddleware();
 const walletRefundService = createWalletRefundService({
@@ -2257,6 +2277,22 @@ async function getBackendReadiness() {
     addCheck('paypal_hosted_sdk_state_machine', Boolean(paymentState && lockService), {
       message: 'Hosted PayPal SDK routes require persistent payment state and locks.',
     });
+    const reconciliationEnabled = ['1', 'true', 'yes'].includes(
+      safeString(process.env.PAYPAL_RECONCILIATION_ENABLED, 'true').toLowerCase()
+    );
+    if (reconciliationEnabled) {
+      addCheck('paypal_reconciliation_adapter', typeof verifyPayPalPayment === 'function');
+      addCheck('paypal_reconciliation_state', Boolean(storage.redis && reconciliationRecords), {
+        message: storage.redis ? 'redis_reconciliation_state_ready' : 'Redis is required for PayPal reconciliation.',
+      });
+      addCheck('paypal_reconciliation_locks', Boolean(lockService), {
+        message: lockService ? 'reconciliation_locks_ready' : 'Redis locks are required for reconciliation.',
+      });
+      addCheck('paypal_reconciliation_shopify_access', Boolean(shopifyOrderAccessState.ok), {
+        message: shopifyOrderAccessState.message,
+      });
+      addCheck('paypal_reconciliation_service', Boolean(payPalReconciliationService));
+    }
   }
 
   const refundsEnabled = ['1', 'true', 'yes'].includes(
@@ -2616,6 +2652,14 @@ app.post('/api/orders/:orderID/capture', requireCustomerAuth, async (req, res) =
 });
 
 app.post('/api/shopify/orders', requireAdminApiKey, async (req, res) => {
+  const recoveryId = safeString(req.body?.recoveryId || req.body?.recovery_id);
+  if (!recoveryId) {
+    return res.status(410).json({
+      success: false,
+      error: true,
+      message: 'Direct Shopify order creation is retired. Use a verified failed-paid-order recovery ID.',
+    });
+  }
   const paymentMethod = safeString(req.body?.paymentMethod, 'NOOD Wallet');
   const provider = paymentMethod.toLowerCase().includes('paypal')
     ? 'paypal'
@@ -2626,7 +2670,6 @@ app.post('/api/shopify/orders', requireAdminApiKey, async (req, res) => {
     req.body?.transactionId || req.body?.paymentTransactionId || req.body?.payment_transaction_id,
     `${provider}_${Date.now()}`
   );
-  const recoveryId = safeString(req.body?.recoveryId || req.body?.recovery_id);
   const existingPaymentRecord = getPaymentRecord(provider, transactionId);
 
   if (existingPaymentRecord?.status === 'shopify_created' && existingPaymentRecord.shopifyOrder) {
@@ -2651,6 +2694,30 @@ app.post('/api/shopify/orders', requireAdminApiKey, async (req, res) => {
     : findFailedPaidOrderByPayment(provider, transactionId);
 
   try {
+    if (!recoveryRecord) {
+      return res.status(404).json({
+        success: false,
+        error: true,
+        message: 'Recovery record not found.',
+      });
+    }
+    if (provider !== 'paypal') {
+      return res.status(409).json({
+        success: false,
+        error: true,
+        message: 'Only PayPal recovery can be reconciled automatically. WiPay remains disabled for launch.',
+      });
+    }
+    const result = await payPalReconciliationService.reconcileRecovery({
+      recoveryRecord,
+      apply: true,
+      actor: 'admin_shopify_order_route',
+    });
+    return res.status(result.status === 'recovered' || result.status === 'already_completed' ? 200 : 202).json({
+      success: result.status === 'recovered' || result.status === 'already_completed',
+      ...result,
+    });
+
     let trustedSnapshot = recoveryRecord?.trustedCartSnapshot || null;
     if (trustedSnapshot) {
       verifySnapshotHash(trustedSnapshot);
@@ -2883,6 +2950,25 @@ app.post('/api/failed-paid-orders/:recoveryId/retry', requireAdminApiKey, async 
   }
 
   try {
+    if (safeString(record.provider).toLowerCase() !== 'paypal') {
+      return res.status(409).json({
+        success: false,
+        error: true,
+        recoveryId,
+        message: 'Only PayPal recovery can be reconciled automatically. WiPay remains disabled for launch.',
+      });
+    }
+    const result = await payPalReconciliationService.reconcileRecovery({
+      recoveryRecord: record,
+      apply: true,
+      actor: 'admin_failed_paid_order_retry',
+    });
+    return res.status(result.status === 'recovered' || result.status === 'already_completed' ? 200 : 202).json({
+      success: result.status === 'recovered' || result.status === 'already_completed',
+      recoveryId,
+      ...result,
+    });
+
     const trustedSnapshot = record?.trustedCartSnapshot || null;
     if (trustedSnapshot) {
       await revalidateSnapshot({
@@ -4132,6 +4218,62 @@ function logShopifyOrderCurrencyDiagnostics({
   });
 }
 
+async function findExistingShopifyOrderForRecovery({
+  payment = {},
+  recoveryId = '',
+  paypalOrderId = '',
+  paypalCaptureId = '',
+} = {}) {
+  const terms = [
+    safeString(payment.paymentId),
+    safeString(recoveryId),
+    safeString(paypalOrderId || payment.providerOrderId),
+    safeString(paypalCaptureId || payment.providerTransactionId),
+  ].filter(Boolean);
+
+  if (!terms.length || !hasShopifyOrderAdminAccessToken()) {
+    return { found: false, searched: terms.length };
+  }
+
+  const query = `
+    query findRecoveryOrder($query: String!) {
+      orders(first: 5, query: $query, sortKey: CREATED_AT, reverse: true) {
+        edges {
+          node {
+            id
+            name
+            tags
+            note
+          }
+        }
+      }
+    }
+  `;
+  const accessToken = getShopifyOrderAccessToken();
+
+  for (const term of terms) {
+    try {
+      const payload = await adminGraphql(query, { query: term }, {
+        accessToken,
+        requestedQueryCost: 20,
+      });
+      const order = payload?.data?.orders?.edges?.[0]?.node;
+      if (order?.id) {
+        return {
+          found: true,
+          shopifyOrderId: order.id,
+          shopifyOrderName: order.name || '',
+          matchedTerm: term === paypalCaptureId ? 'paypal_capture_id' : 'stable_identifier',
+        };
+      }
+    } catch (error) {
+      return { found: false, error: 'shopify_lookup_unavailable', message: error.message };
+    }
+  }
+
+  return { found: false, searched: terms.length };
+}
+
 async function createShopifyOrder({
   email,
   phone,
@@ -4239,8 +4381,8 @@ async function createShopifyOrder({
       currency: orderCurrency,
       email: email || undefined,
       phone: normalizedCustomerPhone || undefined,
-      tags: ['NOOD App', paymentMethod],
-      note: `${paymentMethod} transaction: ${paymentTransactionId} | Client order: ${clientOrderId}`,
+      tags: ['NOOD App', paymentMethod, pending?.paymentId, pending?.paypalOrderId, pending?.recoveryId].filter(Boolean),
+      note: `${paymentMethod} transaction: ${paymentTransactionId} | Client order: ${clientOrderId} | Payment ID: ${safeString(pending?.paymentId)} | PayPal order: ${safeString(pending?.paypalOrderId)} | Recovery ID: ${safeString(pending?.recoveryId)}`,
       billingAddress: {
         firstName: firstName || 'NOOD',
         lastName: lastName || 'Customer',
