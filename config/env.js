@@ -32,6 +32,29 @@ function parsePositiveInteger(name, fallback) {
   return value;
 }
 
+function parseNonNegativeInteger(name, fallback) {
+  const raw = safeString(process.env[name]);
+  if (!raw) return fallback;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be a non-negative integer.`);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer.`);
+  }
+  return value;
+}
+
+function parsePercent(name, fallback) {
+  const raw = safeString(process.env[name]);
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value > 100) {
+    throw new Error(`${name} must be a percentage between 0 and 100.`);
+  }
+  return value;
+}
+
 function parseCurrency(name, fallback = 'USD') {
   const value = safeString(process.env[name], fallback).toUpperCase();
   if (!SUPPORTED_CURRENCIES.has(value)) {
@@ -83,6 +106,13 @@ function validateEnv() {
     LOCAL_STATE_FALLBACK_ENABLED: parseBoolean('LOCAL_STATE_FALLBACK_ENABLED', nodeEnv !== 'production'),
     PAYMENT_LOCK_TTL_SECONDS: parsePositiveInteger('PAYMENT_LOCK_TTL_SECONDS', 60),
     CATALOG_SYNC_LOCK_TTL_SECONDS: parsePositiveInteger('CATALOG_SYNC_LOCK_TTL_SECONDS', 900),
+    CATALOG_SYNC_LOCK_RENEW_SECONDS: parsePositiveInteger('CATALOG_SYNC_LOCK_RENEW_SECONDS', 300),
+    CATALOG_MAX_COUNT_DROP_PERCENT: parsePercent('CATALOG_MAX_COUNT_DROP_PERCENT', 50),
+    CATALOG_MIN_PRODUCT_COUNT: parseNonNegativeInteger('CATALOG_MIN_PRODUCT_COUNT', 0),
+    CATALOG_VERSION_RETENTION_COUNT: parsePositiveInteger('CATALOG_VERSION_RETENTION_COUNT', 5),
+    CATALOG_FAILED_VERSION_RETENTION_DAYS: parsePositiveInteger('CATALOG_FAILED_VERSION_RETENTION_DAYS', 14),
+    CATALOG_SCHEMA_VERSION: parsePositiveInteger('CATALOG_SCHEMA_VERSION', 1),
+    CATALOG_LEGACY_FALLBACK_ENABLED: parseBoolean('CATALOG_LEGACY_FALLBACK_ENABLED', nodeEnv !== 'production'),
     WEBHOOK_JOB_LEASE_SECONDS: parsePositiveInteger('WEBHOOK_JOB_LEASE_SECONDS', 60),
     WEBHOOK_RETRY_BASE_SECONDS: parsePositiveInteger('WEBHOOK_RETRY_BASE_SECONDS', 5),
     WEBHOOK_RETRY_MAX_SECONDS: parsePositiveInteger('WEBHOOK_RETRY_MAX_SECONDS', 900),
@@ -98,6 +128,10 @@ function validateEnv() {
     WALLET_CURRENCY: parseCurrency('WALLET_CURRENCY', 'USD'),
     WIPAY_ENVIRONMENT: parseAllowedValue('WIPAY_ENVIRONMENT', SUPPORTED_WIPAY_ENVS, 'sandbox'),
   };
+
+  if (env.CATALOG_SYNC_LOCK_RENEW_SECONDS >= env.CATALOG_SYNC_LOCK_TTL_SECONDS) {
+    throw new Error('CATALOG_SYNC_LOCK_RENEW_SECONDS must be lower than CATALOG_SYNC_LOCK_TTL_SECONDS.');
+  }
 
   if (env.PAYPAL_ENABLED && nodeEnv === 'production') {
     if (!safeString(process.env.PAYPAL_CLIENT_ID) || !safeString(process.env.PAYPAL_CLIENT_SECRET)) {
@@ -142,6 +176,8 @@ module.exports = {
   loadEnv,
   parseBoolean,
   parseCurrency,
+  parseNonNegativeInteger,
+  parsePercent,
   parsePositiveInteger,
   resetEnvForTests,
   validateEnv,

@@ -2,6 +2,7 @@ const { createCatalogCache } = require('./cache/redis-cache');
 const { createCatalogRouter, mountCatalogSyncRoutes } = require('./routes');
 const { createWebhookRouter } = require('./webhooks');
 const { ensureCatalogWarm, startBackgroundCatalogSync } = require('./sync');
+const { SUPPORTED_SCHEMA_VERSION } = require('./catalog-validator');
 
 function isProductionEnv() {
   return String(process.env.NODE_ENV || '').trim() === 'production';
@@ -66,6 +67,53 @@ async function getCatalogReadiness() {
         redisPing: null,
         reason: 'cache_ping_failed',
         message: error.message,
+      };
+    }
+  }
+
+  if (typeof mountedCache.getActiveVersionId === 'function') {
+    const activeVersionId = await mountedCache.getActiveVersionId();
+    const activeMeta =
+      activeVersionId && typeof mountedCache.getCatalogVersionMeta === 'function'
+        ? await mountedCache.getCatalogVersionMeta(activeVersionId)
+        : null;
+    if (!activeVersionId) {
+      return {
+        ready: false,
+        cacheDriver,
+        productCount,
+        collectionCount,
+        lastSyncAt: meta.lastSyncAt || null,
+        redisConfigured: Boolean(String(process.env.REDIS_URL || '').trim()),
+        redisPing,
+        reason: 'catalog_active_version_missing',
+      };
+    }
+    if (!activeMeta) {
+      return {
+        ready: false,
+        cacheDriver,
+        productCount,
+        collectionCount,
+        lastSyncAt: meta.lastSyncAt || null,
+        redisConfigured: Boolean(String(process.env.REDIS_URL || '').trim()),
+        redisPing,
+        reason: 'catalog_active_metadata_missing',
+      };
+    }
+    if (
+      activeMeta.status !== 'active' ||
+      String(activeMeta.schemaVersion || SUPPORTED_SCHEMA_VERSION) !== SUPPORTED_SCHEMA_VERSION
+    ) {
+      return {
+        ready: false,
+        cacheDriver,
+        productCount,
+        collectionCount,
+        lastSyncAt: meta.lastSyncAt || null,
+        redisConfigured: Boolean(String(process.env.REDIS_URL || '').trim()),
+        redisPing,
+        reason: 'catalog_active_version_invalid',
       };
     }
   }

@@ -1,4 +1,3 @@
-const crypto = require('crypto');
 const shopify = require('./shopify');
 
 const MISSING_SHOPIFY_PRODUCTS_PAGE_FETCHER =
@@ -64,6 +63,8 @@ const {
 const { transformAdminProduct, compactProductForCache, safeString } = require('./transform');
 const { clearMixedFeedCache } = require('./feed-mix');
 const { applyCollectionHandleAliases } = require('./collection-aliases');
+const { createCatalogSyncLock } = require('./catalog-lock');
+const { validateCatalogVersion } = require('./catalog-validator');
 
 const DEFAULT_MENU_HANDLES = [
   'main-menu',
@@ -79,15 +80,6 @@ const AUTO_RESUME_DELAY_MS = 750;
 const MAX_CHUNK_PAGES = 50;
 const MAX_PAGE_SIZE = 50;
 const CHUNK_COMPLETE_MESSAGE = 'chunk complete, resume required';
-const CATALOG_SYNC_LOCK_KEY = `${String(process.env.REDIS_NAMESPACE || 'nood').trim() || 'nood'}:catalog:sync:lock`;
-const CATALOG_SYNC_LOCK_TTL_SECONDS = Number(process.env.CATALOG_SYNC_LOCK_TTL_SECONDS || 900);
-const RELEASE_LOCK_SCRIPT = `
-  if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("DEL", KEYS[1])
-  end
-  return 0
-`;
-
 let activeSyncPromise = null;
 
 function isProductionEnv() {
@@ -617,39 +609,25 @@ function syncStateProductCount(state = {}) {
 }
 
 async function getLiveProductCount(cache) {
+  if (typeof cache.getWorkingProductCount === 'function') {
+    return Number(await cache.getWorkingProductCount()) || 0;
+  }
   return typeof cache.getProductCount === 'function'
     ? Number(await cache.getProductCount()) || 0
     : 0;
 }
 
 async function acquireCatalogSyncLock(cache) {
-  if (!cache?.client) {
-    return null;
-  }
-
-  const token = crypto.randomBytes(18).toString('hex');
-  const result = await cache.client.set(
-    CATALOG_SYNC_LOCK_KEY,
-    token,
-    'NX',
-    'EX',
-    Math.max(60, CATALOG_SYNC_LOCK_TTL_SECONDS)
-  );
-
-  if (result !== 'OK') {
-    return { acquired: false };
-  }
-
-  return {
-    acquired: true,
-    token,
-    async release() {
-      await cache.client.eval(RELEASE_LOCK_SCRIPT, 1, CATALOG_SYNC_LOCK_KEY, token);
-    },
-  };
+  return createCatalogSyncLock({
+    redis: cache?.client || null,
+    namespace: String(process.env.REDIS_NAMESPACE || 'nood').trim() || 'nood',
+  }).acquire(`sync_${process.pid}_${Date.now()}`);
 }
 
 async function getLiveCollectionCount(cache) {
+  if (typeof cache.getWorkingCollectionCount === 'function') {
+    return Number(await cache.getWorkingCollectionCount()) || 0;
+  }
   return typeof cache.getCollectionCount === 'function'
     ? Number(await cache.getCollectionCount()) || 0
     : 0;
@@ -762,6 +740,9 @@ async function prepareFreshSync(cache, options = {}) {
 
   await setSyncState(cache, {
     ...defaultSyncState(),
+    syncId: state.syncId || null,
+    versionId: state.versionId || null,
+    previousActiveVersion: state.previousActiveVersion || null,
     status: 'idle',
   }, { allowRunningIdle: options.allowRunningReset });
   await checkpointCache(cache);
@@ -1834,6 +1815,62 @@ async function runResumableCatalogSync(cache, options = {}) {
   }
 }
 
+async function activateCompletedCatalogVersion(cache, options = {}) {
+  if (
+    typeof cache.finalizeCatalogStaging !== 'function' ||
+    typeof cache.activateCatalogVersion !== 'function'
+  ) {
+    return null;
+  }
+
+  const state = await getSyncState(cache);
+  const versionId = safeString(state.versionId);
+  if (!versionId) {
+    return null;
+  }
+
+  if (typeof options.verifyLock === 'function') {
+    const lockStillOwned = await options.verifyLock();
+    if (!lockStillOwned) {
+      const message = 'Catalog sync lock ownership was lost before activation.';
+      await setSyncState(cache, { status: 'failed', lastError: message, message });
+      if (typeof cache.setCatalogVersionMeta === 'function') {
+        await cache.setCatalogVersionMeta(versionId, { status: 'failed', lastSafeError: message });
+      }
+      throw new Error(message);
+    }
+  }
+
+  await setSyncState(cache, { status: 'validating', phase: 'validating' });
+  await cache.finalizeCatalogStaging({ versionId, hasNextPage: false, status: 'validating' });
+  const validation = await validateCatalogVersion(cache, versionId);
+  await cache.finalizeCatalogStaging({ versionId, hasNextPage: false, status: 'validated', validation });
+
+  if (typeof options.verifyLock === 'function' && !(await options.verifyLock())) {
+    const message = 'Catalog sync lock ownership was lost during validation.';
+    await setSyncState(cache, { status: 'failed', lastError: message, message });
+    await cache.setCatalogVersionMeta(versionId, { status: 'failed', lastSafeError: message });
+    throw new Error(message);
+  }
+
+  await setSyncState(cache, { status: 'activating', phase: 'activating' });
+  const activeMeta = await cache.activateCatalogVersion(versionId, {
+    lockOwner: safeString(options.lockOwner),
+    actor: safeString(options.actor, 'catalog-sync'),
+    reason: 'full-sync',
+    validation,
+  });
+  await setSyncState(cache, {
+    status: 'completed',
+    phase: 'completed',
+    activeVersionId: versionId,
+    completedAt: activeMeta.activatedAt || new Date().toISOString(),
+    lastError: null,
+    message: null,
+  });
+  return activeMeta;
+}
+
 async function runCatalogSyncUntilComplete(cache, options = {}) {
   const chunk = resolveSyncChunkOptions(options);
   let resume = Boolean(options.resume);
@@ -1843,15 +1880,24 @@ async function runCatalogSyncUntilComplete(cache, options = {}) {
     const stateBefore = await getSyncState(cache);
     console.log(`[NOOD sync] chunk started cursor=${formatSyncCursor(stateBefore)}`);
 
-    lastResult = await runResumableCatalogSync(cache, {
+    const runChunk = () => runResumableCatalogSync(cache, {
       syncMenus: options.syncMenus !== false,
       resume,
       pages: chunk.pages,
       pageSize: chunk.pageSize,
       shopifyProductsCount: options.shopifyProductsCount,
     });
+    lastResult =
+      typeof cache.withCatalogStagingWrites === 'function'
+        ? await cache.withCatalogStagingWrites(runChunk)
+        : await runChunk();
 
     if (lastResult?.status === 'completed') {
+      await activateCompletedCatalogVersion(cache, {
+        verifyLock: options.verifyLock,
+        lockOwner: options.lockOwner,
+        actor: options.actor,
+      });
       return lastResult;
     }
 
@@ -1943,6 +1989,27 @@ async function startBackgroundCatalogSync(cache, options = {}) {
       shopifyProductsCount,
     };
   }
+  let renewTimer = null;
+  let lockLostError = null;
+  const renewLock = async () => {
+    if (!redisSyncLock?.acquired || typeof redisSyncLock.renew !== 'function') {
+      return true;
+    }
+    try {
+      await redisSyncLock.renew();
+      return true;
+    } catch (error) {
+      lockLostError = error;
+      return false;
+    }
+  };
+  if (redisSyncLock?.acquired && typeof redisSyncLock.renew === 'function') {
+    const renewMs = Math.max(1, Number(process.env.CATALOG_SYNC_LOCK_RENEW_SECONDS || 300)) * 1000;
+    renewTimer = setInterval(() => {
+      void renewLock().catch(() => {});
+    }, renewMs);
+    if (typeof renewTimer.unref === 'function') renewTimer.unref();
+  }
 
   const shouldResume =
     !restart &&
@@ -1952,8 +2019,19 @@ async function startBackgroundCatalogSync(cache, options = {}) {
       (state.status === 'running' && stale)) &&
     state.status !== 'completed';
 
+  if (typeof cache.beginCatalogStaging === 'function') {
+    await cache.beginCatalogStaging({
+      resume: shouldResume,
+      previousActiveVersion: state.previousActiveVersion || '',
+    });
+  }
+
   if (restart || !shouldResume) {
-    const resetResult = await prepareFreshSync(cache, { allowRunningReset: stale });
+    const prepare = () => prepareFreshSync(cache, { allowRunningReset: true });
+    const resetResult =
+      typeof cache.withCatalogStagingWrites === 'function'
+        ? await cache.withCatalogStagingWrites(prepare)
+        : await prepare();
     if (resetResult.blocked) {
       return {
         status: 'already_running',
@@ -1975,6 +2053,12 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     pages: chunk.pages,
     pageSize: chunk.pageSize,
     shopifyProductsCount,
+    lockOwner: redisSyncLock?.ownerToken || '',
+    verifyLock: async () => {
+      if (lockLostError) return false;
+      return renewLock();
+    },
+    actor: 'background-catalog-sync',
   })
     .catch(async (error) => {
       const message = safeString(error?.message || error, 'Catalog sync failed.');
@@ -1993,6 +2077,9 @@ async function startBackgroundCatalogSync(cache, options = {}) {
     })
     .finally(() => {
       activeSyncPromise = null;
+      if (renewTimer) {
+        clearInterval(renewTimer);
+      }
       if (redisSyncLock?.acquired) {
         void redisSyncLock.release().catch((error) => {
           console.warn('[NOOD sync] failed to release Redis sync lock', {
@@ -2023,12 +2110,38 @@ async function startBackgroundCatalogSync(cache, options = {}) {
 }
 
 async function syncAllProducts(cache, options = {}) {
-  return runCatalogSyncUntilComplete(cache, {
-    syncMenus: options.syncMenus !== false,
-    resume: Boolean(options.resume),
-    pages: options.pages,
-    pageSize: options.pageSize,
-  });
+  const redisSyncLock = await acquireCatalogSyncLock(cache);
+  if (redisSyncLock && !redisSyncLock.acquired) {
+    return {
+      status: 'already_running',
+      message: 'Catalog sync is already running on another backend instance.',
+    };
+  }
+
+  try {
+    if (typeof cache.beginCatalogStaging === 'function') {
+      await cache.beginCatalogStaging({ resume: Boolean(options.resume) });
+    }
+    return await runCatalogSyncUntilComplete(cache, {
+      syncMenus: options.syncMenus !== false,
+      resume: Boolean(options.resume),
+      pages: options.pages,
+      pageSize: options.pageSize,
+      lockOwner: redisSyncLock?.ownerToken || '',
+      verifyLock: async () => {
+        if (!redisSyncLock?.acquired || typeof redisSyncLock.renew !== 'function') return true;
+        await redisSyncLock.renew();
+        return true;
+      },
+      actor: 'manual-catalog-sync',
+    });
+  } finally {
+    if (redisSyncLock?.acquired) {
+      await redisSyncLock.release().catch((error) => {
+        console.warn('[NOOD sync] failed to release Redis sync lock', { message: error.message });
+      });
+    }
+  }
 }
 
 async function ensureCatalogWarm(cache) {
