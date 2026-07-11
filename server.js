@@ -34,7 +34,7 @@ const {
   getPayPalOrder,
 } = require('./paypal');
 const { mountCatalog, getCatalogReadiness, getCatalogCache } = require('./catalog');
-const { mountShopifyWebhookBodyParser } = require('./catalog/webhooks');
+const { getWebhookReadiness, mountShopifyWebhookBodyParser } = require('./catalog/webhooks');
 const { adminGraphql } = require('./catalog/shopify');
 const { createDiscountsHandler } = require('./catalog/discounts');
 const {
@@ -2178,7 +2178,6 @@ async function getBackendReadiness() {
   });
 
   addCheck('customer_auth_config', Boolean(safeString(process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN)));
-  addCheck('shopify_webhook_secret', Boolean(safeString(process.env.SHOPIFY_WEBHOOK_SECRET)));
   addCheck('shopify_order_access', Boolean(shopifyOrderAccessState.ok), {
     missingOrderScopes: shopifyOrderAccessState.missingOrderScopes || [],
     message: shopifyOrderAccessState.message,
@@ -2201,9 +2200,20 @@ async function getBackendReadiness() {
   addCheck('critical_storage_redis', storage.storageDriver === 'redis' && Boolean(storage.redis));
   addCheck('wallet_atomic_support', Boolean(redisWallet));
   addCheck('payment_state_storage', Boolean(paymentState));
-  addCheck('webhook_queue_storage', Boolean(storage.redis), {
-    message: storage.redis ? 'redis_configured' : 'Redis is required for persistent webhook jobs.',
-  });
+  try {
+    const webhookReadiness = await getWebhookReadiness();
+    addCheck('shopify_webhook_secret', Boolean(webhookReadiness.webhookSecretConfigured));
+    addCheck('webhook_queue_storage', Boolean(webhookReadiness.redisConfigured), {
+      message: webhookReadiness.redisConfigured ? 'redis_configured' : 'Redis is required for persistent webhook jobs.',
+    });
+    if (IS_PRODUCTION && webhookReadiness.required) {
+      addCheck('webhook_worker', Boolean(webhookReadiness.worker?.running && !webhookReadiness.worker?.stale), {
+        message: webhookReadiness.worker?.stale ? 'worker_heartbeat_stale' : 'worker_required',
+      });
+    }
+  } catch (error) {
+    addCheck('webhook_readiness', false, { message: error.message });
+  }
 
   const payPalEnabled = ['1', 'true', 'yes'].includes(
     safeString(process.env.PAYPAL_ENABLED, 'true').toLowerCase()
