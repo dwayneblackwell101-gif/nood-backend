@@ -31,6 +31,7 @@ const {
   hasPayPalCredentials,
   createPayPalOrder,
   capturePayPalOrder,
+  getPayPalOrder,
 } = require('./paypal');
 const { mountCatalog, getCatalogReadiness, getCatalogCache } = require('./catalog');
 const { mountShopifyWebhookBodyParser } = require('./catalog/webhooks');
@@ -46,6 +47,7 @@ const { createCustomerAuthMiddleware } = require('./auth/customer-auth');
 const { createRedisLockService } = require('./storage/redis-lock');
 const { createRedisWalletService } = require('./wallet/redis-wallet');
 const { createPaymentStateService } = require('./payments/payment-state');
+const { createPayPalPaymentService } = require('./payments/paypal-service');
 const {
   getShopifyOrderAccessToken,
   hasShopifyOrderAdminAccessToken,
@@ -64,6 +66,17 @@ const redisNamespace = safeString(process.env.REDIS_NAMESPACE, 'nood');
 const lockService = createRedisLockService({ redis: storage.redis, namespace: redisNamespace });
 const redisWallet = createRedisWalletService({ redis: storage.redis, namespace: redisNamespace });
 const paymentState = createPaymentStateService({ redis: storage.redis, namespace: redisNamespace });
+const paypalPaymentService = createPayPalPaymentService({
+  paymentState,
+  lockService,
+  paypalClient: {
+    createOrder: createPayPalOrder,
+    captureOrder: capturePayPalOrder,
+    getOrder: getPayPalOrder,
+  },
+  expectedMerchantId: safeString(process.env.PAYPAL_MERCHANT_ID),
+  lockTtlSeconds: Number(process.env.PAYMENT_LOCK_TTL_SECONDS || 60),
+});
 const requireCustomerAuth = createCustomerAuthMiddleware();
 
 const { createReturnRequestHandlers } = require('./refunds/return-requests');
@@ -101,6 +114,8 @@ const SHOPIFY_CURRENCY = safeString(process.env.SHOPIFY_CURRENCY, 'USD').toUpper
 const WALLET_CURRENCY = safeString(process.env.WALLET_CURRENCY, 'USD').toUpperCase();
 const PAYMENT_CURRENCY = safeString(process.env.PAYMENT_CURRENCY, 'USD').toUpperCase();
 const PAYPAL_USD_TO_TTD_RATE = Number(process.env.PAYPAL_USD_TO_TTD_RATE || 6.8);
+const PAYPAL_WALLET_MIN_CENTS = Number(process.env.PAYPAL_WALLET_MIN_CENTS || 100);
+const PAYPAL_WALLET_MAX_CENTS = Number(process.env.PAYPAL_WALLET_MAX_CENTS || 100000);
 const BACKEND_BASE_URL = getBackendBaseUrl();
 
 function normalizeWiPayAccountNumber(rawValue) {
@@ -1565,6 +1580,13 @@ async function createPayPalWalletTopup(req, res) {
       });
     }
 
+    if (walletAmountCents < PAYPAL_WALLET_MIN_CENTS || walletAmountCents > PAYPAL_WALLET_MAX_CENTS) {
+      return res.status(400).json({
+        error: true,
+        message: 'PayPal wallet top-up amount is outside the allowed range.',
+      });
+    }
+
     const walletCustomer = validateWalletCustomer({ name, email, phone, customerId });
 
     if (walletCustomer.errors.length) {
@@ -1576,13 +1598,25 @@ async function createPayPalWalletTopup(req, res) {
       });
     }
 
+    const operationKey = getRequestIdempotencyKey(
+      req,
+      `paypal:wallet:${walletCustomer.customerId}:${walletAmountCents}`
+    );
     const localOrderId = `wallet_paypal_${Date.now()}`;
-    const paypalOrder = await createPayPalOrder({
-      total: payPalAmounts.paypalTotalUsd,
-      currency: payPalAmounts.paypalCurrency,
+    const paymentCreate = await paypalPaymentService.createOrder({
+      purpose: 'wallet_topup',
+      customerId: walletCustomer.customerId,
+      expectedAmountCents: usdToCents(payPalAmounts.paypalTotalUsd),
+      expectedCurrency: payPalAmounts.paypalCurrency,
+      trustedSnapshot: {
+        walletAmountCents,
+        walletCurrency: payPalAmounts.shopifyCurrency,
+      },
+      idempotencyKey: `paypal:wallet:create:${operationKey}`,
       referenceId: localOrderId,
       description: 'NOOD wallet top-up',
     });
+    const paypalOrder = paymentCreate.order;
     const approvalUrl = getPayPalApprovalUrl(paypalOrder);
 
     setPendingOrder(paypalOrder.id, {
@@ -1616,6 +1650,7 @@ async function createPayPalWalletTopup(req, res) {
       paypal_amount: payPalAmounts.paypalTotalUsd,
       paypal_currency: payPalAmounts.paypalCurrency,
       paypal: paypalOrder,
+      payment: paymentState.publicPayment(paymentCreate.record),
     });
   } catch (error) {
     const errorData = error.response?.data || error.message;
@@ -1686,66 +1721,80 @@ async function capturePayPalWalletTopup(req, res) {
       });
     }
 
-    const captureData = await capturePayPalOrder(paypalOrderId);
-    const captureId =
-      captureData?.purchase_units?.[0]?.payments?.captures?.[0]?.id ||
-      captureData?.id ||
-      paypalOrderId;
+    const result = await paypalPaymentService.captureOrder({
+      paypalOrderId,
+      customerId: pending.customerId,
+      purpose: 'wallet_topup',
+      onWalletTopupPaid: async ({ captureData, captureId }) =>
+        redisWallet
+          ? redisWallet.credit({
+              customerId: pending.customerId,
+              amountCents: pending.amountCents || usdToCents(pending.amount),
+              idempotencyKey: `paypal_wallet:${captureId}`,
+              source: 'paypal_wallet_topup',
+              providerTransactionId: captureId,
+              metadata: {
+                paypalOrderId,
+              },
+            })
+          : saveWalletTransaction({
+              provider: 'paypal',
+              transactionId: captureId,
+              pending,
+              rawReturn: captureData,
+            }),
+    });
 
-    if (captureData?.status !== 'COMPLETED') {
-      return res.status(400).json({
+    if (result.recoveryRequired) {
+      return res.status(202).json({
         success: false,
-        error: true,
-        status: captureData?.status || 'UNKNOWN',
-        message: `PayPal wallet payment was ${captureData?.status || 'not completed'}.`,
-        paypal: captureData,
+        payment_received: true,
+        status: 'payment_received_wallet_review',
+        message: 'Payment was received but the wallet credit needs review.',
+        transaction_id: result.captureId,
+        paypal_order_id: paypalOrderId,
+        payment: paymentState.publicPayment(result.record),
       });
     }
 
-    const walletRecord = redisWallet
-      ? await redisWallet.credit({
-          customerId: pending.customerId,
-          amountCents: pending.amountCents || usdToCents(pending.amount),
-          idempotencyKey: `paypal_wallet:${captureId}`,
-          source: 'paypal_wallet_topup',
-          providerTransactionId: captureId,
-          metadata: {
-            paypalOrderId,
-          },
-        })
-      : saveWalletTransaction({
-          provider: 'paypal',
-          transactionId: captureId,
-          pending,
-          rawReturn: captureData,
-        });
-    const confirmedBalance = await getConfirmedWalletBalanceUsd(walletRecord.customerId);
+    const captureId = result.captureId;
+    const walletRecord =
+      result.walletResult ||
+      (result.record?.walletTransactionId
+        ? walletTransactions.get(result.record.walletTransactionId)
+        : null) ||
+      findWalletTransactionByProviderOrderId('paypal', paypalOrderId);
+    const walletTransactionId = walletRecord?.walletTransactionId || result.record?.walletTransactionId || '';
+    const walletAmount = walletRecord?.amount || pending.amount;
+    const walletCurrency = walletRecord?.currency || pending.currency;
+    const confirmedBalance = await getConfirmedWalletBalanceUsd(walletRecord?.customerId || pending.customerId);
 
     savePaymentRecord({
       provider: 'paypal_wallet',
       transactionId: captureId,
       orderId: paypalOrderId,
       status: 'wallet_credited',
-      amount: walletRecord.amount,
-      currency: walletRecord.currency,
+      amount: walletAmount,
+      currency: walletCurrency,
       paypalOrderId,
-      walletTransactionId: walletRecord.walletTransactionId,
-      rawPayment: captureData,
+      walletTransactionId,
+      rawPayment: result.captureData || null,
     });
 
     removePendingOrder(paypalOrderId);
 
     return res.json({
       success: true,
-      status: captureData?.status || 'COMPLETED',
+      status: result.captureData?.status || 'COMPLETED',
       transaction_id: captureId,
       paypal_order_id: paypalOrderId,
-      wallet_transaction_id: walletRecord.walletTransactionId,
-      amount: walletRecord.amount,
-      currency: walletRecord.currency,
+      wallet_transaction_id: walletTransactionId,
+      amount: walletAmount,
+      currency: walletCurrency,
       confirmed_balance: confirmedBalance,
-      wallet: walletRecord,
-      paypal: captureData,
+      wallet: walletRecord || null,
+      paypal: result.captureData,
+      payment: paymentState.publicPayment(result.record),
     });
   } catch (error) {
     const errorData = error.response?.data || error.message;
@@ -2149,6 +2198,15 @@ async function getBackendReadiness() {
   );
   if (payPalEnabled) {
     addCheck('paypal_config', hasPayPalCredentials() && PAYPAL_CURRENCY === 'USD');
+    addCheck('paypal_payment_state', Boolean(paymentState), {
+      message: paymentState ? 'persistent_payment_state_ready' : 'Redis payment state is required for PayPal.',
+    });
+    addCheck('paypal_payment_locking', Boolean(lockService), {
+      message: lockService ? 'payment_locks_ready' : 'Redis payment locking is required for PayPal.',
+    });
+    addCheck('paypal_hosted_sdk_state_machine', Boolean(paymentState && lockService), {
+      message: 'Hosted PayPal SDK routes require persistent payment state and locks.',
+    });
   }
 
   const wiPayEnabled = ['1', 'true', 'yes'].includes(
@@ -2257,34 +2315,29 @@ app.post('/api/orders', requireCustomerAuth, async (req, res) => {
       shippingAddress,
     });
 
-    const order = await createPayPalOrder({
-      total: payPalAmounts.paypalTotalUsd,
-      currency: payPalAmounts.paypalCurrency,
+    const paymentCreate = await paypalPaymentService.createOrder({
+      purpose: 'checkout',
+      customerId: customer.id,
+      expectedAmountCents: usdToCents(payPalAmounts.paypalTotalUsd),
+      expectedCurrency: payPalAmounts.paypalCurrency,
+      trustedSnapshot: {
+        checkoutSessionId: checkoutSessionId || orderId,
+        cartFingerprint: getCartFingerprint(cartItems),
+        cartItems,
+        total,
+        currency: payPalAmounts.shopifyCurrency,
+      },
+      idempotencyKey: `paypal:create:${operationKey}`,
       referenceId: orderId,
       description: safeString(req.body?.description, 'NOOD order'),
     });
+    const order = paymentCreate.order;
 
     console.log('[NOOD backend] PayPal create order response', {
       id: order?.id,
       status: order?.status,
       links: order?.links?.map((link) => ({ rel: link?.rel, href: link?.href })),
     });
-
-    if (paymentState) {
-      await paymentState.createPayment({
-        provider: 'paypal',
-        providerOrderId: order.id,
-        expectedAmountCents: usdToCents(payPalAmounts.paypalTotalUsd),
-        expectedCurrency: 'USD',
-        providerAmountCents: usdToCents(payPalAmounts.paypalTotalUsd),
-        providerCurrency: 'USD',
-        customerId: customer.id,
-        state: 'provider_pending',
-        idempotencyKey: `paypal:create:${operationKey}`,
-        cartFingerprint: getCartFingerprint(cartItems),
-        metadata: { checkoutSessionId: checkoutSessionId || orderId, orderId },
-      });
-    }
 
     setPendingOrder(order.id, {
       type: 'checkout',
@@ -2314,6 +2367,7 @@ app.post('/api/orders', requireCustomerAuth, async (req, res) => {
       status: order.status,
       links: order.links || [],
       paypal: order,
+      payment: paymentState.publicPayment(paymentCreate.record),
     });
   } catch (error) {
     const errorData = error.response?.data || error.message;
@@ -2350,8 +2404,35 @@ app.post('/api/orders/:orderID/capture', requireCustomerAuth, async (req, res) =
     }
 
     const pending = pendingOrders.get(orderId);
+    const replayPayment = paymentState
+      ? await paymentState.getByProviderTransaction('paypal', orderId)
+      : null;
 
     if (!pending) {
+      if (replayPayment && safeString(replayPayment.customerId) === safeString(customer.id)) {
+        if (replayPayment.state === 'completed') {
+          return res.json({
+            success: true,
+            idempotent: true,
+            status: 'COMPLETED',
+            transaction_id: replayPayment.providerTransactionId,
+            shopify_order_id: replayPayment.shopifyOrderId || '',
+            shopify_order_name: replayPayment.shopifyOrderName || '',
+            payment: paymentState.publicPayment(replayPayment),
+          });
+        }
+        if (replayPayment.state === 'recovery_required') {
+          return res.status(202).json({
+            success: false,
+            idempotent: true,
+            payment_received: true,
+            status: 'payment_received_order_review',
+            transaction_id: replayPayment.providerTransactionId || orderId,
+            reason: replayPayment.lastSafeErrorCode || 'recovery_required',
+            payment: paymentState.publicPayment(replayPayment),
+          });
+        }
+      }
       return res.status(404).json({
         success: false,
         error: true,
@@ -2367,101 +2448,61 @@ app.post('/api/orders/:orderID/capture', requireCustomerAuth, async (req, res) =
       });
     }
 
-    const existingPayment = paymentState
-      ? await paymentState.getByProviderTransaction('paypal', orderId)
-      : null;
+    const result = await paypalPaymentService.captureOrder({
+      paypalOrderId: orderId,
+      customerId: customer.id,
+      purpose: 'checkout',
+      onCheckoutPaid: ({ captureData, captureId }) =>
+        createShopifyOrderFromPaidPayment({
+          method: 'paypal',
+          transactionId: captureId,
+          orderId,
+          pending,
+          rawReturn: captureData,
+        }),
+    });
 
-    if (existingPayment?.state === 'completed') {
+    if (result.duplicate && result.record?.state === 'completed') {
       return res.json({
         success: true,
         idempotent: true,
         status: 'COMPLETED',
-        transaction_id: existingPayment.providerTransactionId,
-        shopify_order_id: existingPayment.shopifyOrderId || '',
-        shopify_order_name: existingPayment.shopifyOrderName || '',
-        payment: paymentState.publicPayment(existingPayment),
+        transaction_id: result.record.providerTransactionId,
+        shopify_order_id: result.record.shopifyOrderId || '',
+        shopify_order_name: result.record.shopifyOrderName || '',
+        payment: paymentState.publicPayment(result.record),
       });
     }
 
-    const runCapture = async () => {
-      const captureResponse = await capturePayPalOrder(orderId);
-    console.log('[NOOD backend] PayPal capture response', {
-      id: captureResponse?.id,
-      status: captureResponse?.status,
-      captures: captureResponse?.purchase_units?.[0]?.payments?.captures || [],
-    });
-      const verifiedCapture = verifyPayPalCaptureAmount({
-        captureData: captureResponse,
-        expectedAmountCents: usdToCents(pending.paypalTotalUsd || pending.total),
-        expectedCurrency: 'USD',
-      });
-      const captureId = verifiedCapture.id;
-
-      let nextPayment = existingPayment;
-      if (paymentState && existingPayment) {
-        nextPayment = await paymentState.transitionPayment(existingPayment.paymentId, 'provider_verified', {
-          providerTransactionId: captureId,
-          providerAmountCents: verifiedCapture.amountCents,
-          providerCurrency: verifiedCapture.currency,
-        });
-        nextPayment = await paymentState.transitionPayment(nextPayment.paymentId, 'order_creating');
-      }
-
-    const shopifyResult = await createShopifyOrderFromPaidPayment({
-      method: 'paypal',
-      transactionId: captureId,
-      orderId,
-      pending,
-      rawReturn: captureResponse,
-    });
-
-    if (!shopifyResult.success) {
-        if (paymentState && nextPayment) {
-          await paymentState.transitionPayment(nextPayment.paymentId, 'recovery_required', {
-            lastSafeErrorCode: 'shopify_order_create_failed',
-          });
-        }
-        return res.status(202).json({
+    if (result.recoveryRequired) {
+      return res.status(202).json({
         success: false,
         payment_received: true,
         status: 'payment_received_order_review',
         message:
           'Payment Received - Order Processing Issue. Your payment was successful, but your order needs review.',
-        reason: 'shopify_order_create_failed',
-        transaction_id: captureId,
-        recovery_id: shopifyResult.recovery?.recoveryId || '',
-        paypal: captureResponse,
-        shopifyError: shopifyResult.shopifyError,
+        reason: result.record?.lastSafeErrorCode || 'shopify_order_create_failed',
+        transaction_id: result.captureId,
+        recovery_id: result.shopifyResult?.recovery?.recoveryId || '',
+        paypal: result.captureData || null,
+        shopifyError: result.shopifyResult?.shopifyError || null,
+        payment: paymentState.publicPayment(result.record),
       });
     }
 
-    const shopifyOrder = shopifyResult.shopifyOrder;
-
-      if (paymentState && nextPayment) {
-        await paymentState.transitionPayment(nextPayment.paymentId, 'completed', {
-          shopifyOrderId: safeString(shopifyOrder?.id),
-          shopifyOrderName: safeString(shopifyOrder?.name),
-        });
-      }
-
+    const shopifyOrder = result.shopifyResult?.shopifyOrder;
     removePendingOrder(orderId);
 
     return res.json({
       success: true,
-      status: captureResponse?.status || 'COMPLETED',
-      transaction_id: captureId,
-      shopify_order_id: shopifyOrder?.id || '',
-      shopify_order_name: shopifyOrder?.name || '',
+      status: result.captureData?.status || 'COMPLETED',
+      transaction_id: result.captureId,
+      shopify_order_id: shopifyOrder?.id || result.record?.shopifyOrderId || '',
+      shopify_order_name: shopifyOrder?.name || result.record?.shopifyOrderName || '',
       shopifyOrder,
-      paypal: captureResponse,
+      paypal: result.captureData,
+      payment: paymentState.publicPayment(result.record),
     });
-    };
-
-    if (lockService) {
-      return await lockService.withLock(`paypal:capture:${orderId}`, Number(process.env.PAYMENT_LOCK_TTL_SECONDS || 60), runCapture);
-    }
-
-    return await runCapture();
   } catch (error) {
     const errorData = error.response?.data || error.message;
     console.error('PAYPAL CAPTURE ORDER ERROR:', errorData);
@@ -2990,7 +3031,7 @@ app.post('/create-wipay-payment', requireCustomerAuth, async (req, res) => {
     const errorData = error.response?.data || error.message;
     console.error('WiPay CHECKOUT ERROR:', errorData);
 
-    return res.status(500).json({
+    return res.status(error.statusCode || error.response?.status || 500).json({
       error: true,
       message:
         typeof errorData === 'string'
@@ -3100,7 +3141,7 @@ app.post('/create-paypal-payment', requireCustomerAuth, async (req, res) => {
     const errorData = error.response?.data || error.message;
     console.error('PAYPAL CHECKOUT ERROR:', errorData);
 
-    return res.status(500).json({
+    return res.status(error.statusCode || error.response?.status || 500).json({
       success: false,
       error: true,
       message:
@@ -3253,22 +3294,37 @@ app.post('/paypal-sdk/orders', async (req, res) => {
       });
     }
 
-    const paypalOrder = await createPayPalOrder({
-      total: safeMoney(pending.paypalTotalUsd),
-      currency: pending.paypalCurrency || PAYPAL_CURRENCY,
+    const paymentCreate = await paypalPaymentService.createOrder({
+      purpose: 'checkout',
+      customerId: pending.customerId,
+      expectedAmountCents: usdToCents(safeMoney(pending.paypalTotalUsd)),
+      expectedCurrency: pending.paypalCurrency || PAYPAL_CURRENCY,
+      trustedSnapshot: {
+        checkoutSessionId: pending.checkoutSessionId || orderId,
+        cartFingerprint: getCartFingerprint(pending.cartItems),
+        cartItems: pending.cartItems || [],
+        total: pending.total,
+        currency: pending.currency,
+      },
+      idempotencyKey: `paypal:hosted:create:${orderId}`,
       referenceId: orderId,
       description: 'NOOD order',
     });
+    const paypalOrder = paymentCreate.order;
 
     pending.paypalOrderId = paypalOrder?.id;
+    pending.paymentId = paymentCreate.record?.paymentId;
     setPendingOrder(orderId, pending);
 
-    return res.json(paypalOrder);
+    return res.json({
+      ...paypalOrder,
+      payment: paymentState.publicPayment(paymentCreate.record),
+    });
   } catch (error) {
     const errorData = error.response?.data || error.message;
     console.error('PAYPAL SDK CREATE ORDER ERROR:', errorData);
 
-    return res.status(500).json({
+    return res.status(error.statusCode || error.response?.status || 500).json({
       error: true,
       message:
         typeof errorData === 'string'
@@ -3300,38 +3356,22 @@ app.post('/paypal-sdk/orders/:paypalOrderId/capture', async (req, res) => {
       });
     }
 
-    const captureData = await capturePayPalOrder(paypalOrderId);
-    const captureId =
-      captureData?.purchase_units?.[0]?.payments?.captures?.[0]?.id ||
-      paypalOrderId;
-
-    if (captureData?.status !== 'COMPLETED') {
-      removePendingOrder(orderId);
-
-      return res.status(400).json({
-        error: true,
-        message: `PayPal payment was ${captureData?.status || 'not completed'}.`,
-        redirect_url: buildAppRedirect('payment-result', {
-          status: 'failed',
-          type: 'checkout',
-          order_id: orderId,
-          transaction_id: captureId,
-          reason: `paypal_${String(captureData?.status || 'not_completed').toLowerCase()}`,
+    const result = await paypalPaymentService.captureOrder({
+      paypalOrderId,
+      customerId: pending.customerId,
+      purpose: 'checkout',
+      onCheckoutPaid: ({ captureData, captureId }) =>
+        createShopifyOrderFromPaidPayment({
           method: 'paypal',
+          transactionId: captureId,
+          orderId,
+          pending,
+          rawReturn: captureData,
         }),
-        raw: captureData,
-      });
-    }
-
-    const shopifyResult = await createShopifyOrderFromPaidPayment({
-      method: 'paypal',
-      transactionId: captureId,
-      orderId,
-      pending,
-      rawReturn: captureData,
     });
+    const captureId = result.captureId || paypalOrderId;
 
-    if (!shopifyResult.success) {
+    if (result.recoveryRequired) {
       return res.status(202).json({
         success: false,
         payment_received: true,
@@ -3343,17 +3383,18 @@ app.post('/paypal-sdk/orders/:paypalOrderId/capture', async (req, res) => {
           type: 'checkout',
           order_id: orderId,
           transaction_id: captureId,
-          reason: 'shopify_order_create_failed',
-          recovery_id: shopifyResult.recovery?.recoveryId || '',
+          reason: result.record?.lastSafeErrorCode || 'shopify_order_create_failed',
+          recovery_id: result.shopifyResult?.recovery?.recoveryId || '',
           amount: pending.total,
           method: 'paypal',
         }),
-        recovery_id: shopifyResult.recovery?.recoveryId || '',
-        shopifyError: shopifyResult.shopifyError,
+        recovery_id: result.shopifyResult?.recovery?.recoveryId || '',
+        shopifyError: result.shopifyResult?.shopifyError || null,
+        payment: paymentState.publicPayment(result.record),
       });
     }
 
-    const shopifyOrder = shopifyResult.shopifyOrder;
+    const shopifyOrder = result.shopifyResult?.shopifyOrder;
 
     removePendingOrder(orderId);
 
@@ -3369,7 +3410,8 @@ app.post('/paypal-sdk/orders/:paypalOrderId/capture', async (req, res) => {
         amount: pending.total,
         method: 'paypal',
       }),
-      capture: captureData,
+      capture: result.captureData,
+      payment: paymentState.publicPayment(result.record),
     });
   } catch (error) {
     const errorData = error.response?.data || error.message;
@@ -3582,6 +3624,12 @@ app.post('/wallet/topup', requireCustomerAuth, (req, res) => {
 });
 
 app.get('/paypal-return', async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    error: true,
+    message: 'Legacy PayPal return capture route is retired. Use hosted PayPal SDK capture.',
+  });
+
   const orderId = getReturnOrderId(req.query);
   const returnToken = getReturnToken(req.query);
   const paypalOrderId = safeString(req.query.token);

@@ -112,10 +112,29 @@ async function capturePayPalOrder(orderId) {
   return response.data;
 }
 
+async function getPayPalOrder(orderId) {
+  const { apiBase } = getPayPalConfig();
+  const accessToken = await getPayPalAccessToken();
+
+  const response = await axios.get(
+    `${apiBase}/v2/checkout/orders/${encodeURIComponent(orderId)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 30000,
+    }
+  );
+
+  return response.data;
+}
+
 module.exports = {
   getPayPalConfig,
   hasPayPalCredentials,
   getPayPalAccessToken,
   createPayPalOrder,
   capturePayPalOrder,
+  getPayPalOrder,
 };

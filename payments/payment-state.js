@@ -2,10 +2,11 @@ const crypto = require('crypto');
 
 const TERMINAL_STATES = new Set(['completed', 'failed', 'recovery_required', 'refunded']);
 const VALID_TRANSITIONS = new Map([
-  ['created', new Set(['provider_pending', 'provider_approved', 'provider_verified', 'failed'])],
-  ['provider_pending', new Set(['provider_approved', 'provider_verified', 'failed'])],
-  ['provider_approved', new Set(['provider_verified', 'failed'])],
-  ['provider_verified', new Set(['order_creating', 'completed', 'failed', 'recovery_required'])],
+  ['created', new Set(['provider_pending', 'provider_approved', 'provider_verified', 'failed', 'recovery_required'])],
+  ['provider_pending', new Set(['provider_approved', 'provider_verified', 'failed', 'recovery_required'])],
+  ['provider_approved', new Set(['provider_verified', 'failed', 'recovery_required'])],
+  ['provider_verified', new Set(['order_creating', 'wallet_crediting', 'completed', 'failed', 'recovery_required'])],
+  ['wallet_crediting', new Set(['completed', 'recovery_required', 'failed'])],
   ['order_creating', new Set(['completed', 'recovery_required', 'failed'])],
   ['recovery_required', new Set(['order_creating', 'completed', 'failed'])],
   ['completed', new Set(['partially_refunded', 'refunded'])],
@@ -80,6 +81,7 @@ function createPaymentStateService({ redis, namespace = 'nood' } = {}) {
       provider: safeString(input.provider),
       providerOrderId: safeString(input.providerOrderId) || null,
       providerTransactionId: safeString(input.providerTransactionId) || null,
+      purpose: safeString(input.purpose || input.paymentPurpose) || null,
       expectedAmountCents: Number(input.expectedAmountCents || 0),
       expectedCurrency: safeString(input.expectedCurrency, 'USD').toUpperCase(),
       providerAmountCents: Number(input.providerAmountCents || input.expectedAmountCents || 0),
@@ -137,6 +139,9 @@ function createPaymentStateService({ redis, namespace = 'nood' } = {}) {
     };
     await redis.set(paymentKey(paymentId), JSON.stringify(record));
 
+    if (record.providerOrderId) {
+      await redis.set(providerKey(record.provider, record.providerOrderId), paymentId, 'NX');
+    }
     if (record.providerTransactionId) {
       await redis.set(providerKey(record.provider, record.providerTransactionId), paymentId, 'NX');
     }
