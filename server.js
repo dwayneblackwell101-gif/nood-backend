@@ -485,12 +485,15 @@ function assertProductionConfig() {
     throw new Error('Production requires STORAGE_DRIVER=redis and REDIS_URL for persistent state.');
   }
 
-  if (!WIPAY_ACCOUNT_NUMBER) {
-    throw new Error('WIPAY_ACCOUNT_NUMBER is required in production.');
+  const wiPayEnabled = ['1', 'true', 'yes'].includes(
+    safeString(process.env.WIPAY_ENABLED, 'false').toLowerCase()
+  );
+  if (wiPayEnabled && !WIPAY_ACCOUNT_NUMBER) {
+    throw new Error('WIPAY_ACCOUNT_NUMBER is required in production when WIPAY_ENABLED=true.');
   }
 
-  if (WIPAY_ENVIRONMENT === 'live' && !WIPAY_API_KEY) {
-    throw new Error('WIPAY_API_KEY is required when WIPAY_ENVIRONMENT=live.');
+  if (wiPayEnabled && WIPAY_ENVIRONMENT === 'live' && !WIPAY_API_KEY) {
+    throw new Error('WIPAY_API_KEY is required when WIPAY_ENABLED=true and WIPAY_ENVIRONMENT=live.');
   }
 }
 

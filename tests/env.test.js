@@ -60,6 +60,18 @@ test('production does not load local environment files', () => {
   assert.equal(process.env.NOOD_ENV_LOCAL_MARKER, undefined);
 });
 
+test('production server config only requires WiPay credentials when WiPay is enabled', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const guard = source.slice(
+    source.indexOf('function assertProductionConfig()'),
+    source.indexOf('function isValidPositiveMoney')
+  );
+
+  assert.match(guard, /const wiPayEnabled =/);
+  assert.match(guard, /if \(wiPayEnabled && !WIPAY_ACCOUNT_NUMBER\)/);
+  assert.match(guard, /if \(wiPayEnabled && WIPAY_ENVIRONMENT === 'live' && !WIPAY_API_KEY\)/);
+});
+
 test('development loads local files without overwriting existing process variables', () => {
   const rootDir = makeTempEnvDir();
   resetProcessEnv({
