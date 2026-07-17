@@ -173,7 +173,7 @@ function transformAdminProduct(adminProduct, currencyCode = 'USD') {
         normalizeMediaEdge(null, `${adminProduct?.id || 'media'}_${index}`, edge.node)
       );
 
-  const featuredImage = adminProduct?.featuredImage?.url
+  const provisionalFeatured = adminProduct?.featuredImage?.url
     ? {
         url: adminProduct.featuredImage.url,
         altText: adminProduct.featuredImage.altText || null,
@@ -184,12 +184,12 @@ function transformAdminProduct(adminProduct, currencyCode = 'USD') {
       ? {
           url: imageEdges[0].node.url,
           altText: imageEdges[0].node.altText || null,
-          width: null,
-          height: null,
+          width: imageEdges[0].node.width ?? null,
+          height: imageEdges[0].node.height ?? null,
         }
       : null;
 
-  return {
+  const productRecord = {
     id: adminProduct.id,
     title: safeString(adminProduct?.title, 'Product'),
     handle: safeString(adminProduct?.handle),
@@ -200,7 +200,7 @@ function transformAdminProduct(adminProduct, currencyCode = 'USD') {
     tags: Array.isArray(adminProduct?.tags) ? adminProduct.tags : [],
     status: safeString(adminProduct?.status, 'ACTIVE').toUpperCase(),
     availableForSale: variants.some((variant) => variant.availableForSale),
-    featuredImage,
+    featuredImage: provisionalFeatured,
     images: { edges: imageEdges },
     media: { edges: mediaEdges },
     priceRange: {
@@ -218,6 +218,14 @@ function transformAdminProduct(adminProduct, currencyCode = 'USD') {
     firstVariantId: firstVariant?.id || null,
     firstVariantTitle: firstVariant?.title || null,
   };
+
+  // Ensure featuredImage is populated from images/media when Admin featuredImage is absent.
+  const resolvedPrimary = resolvePrimaryListImage(productRecord);
+  if (resolvedPrimary) {
+    productRecord.featuredImage = resolvedPrimary;
+  }
+
+  return productRecord;
 }
 
 function transformStorefrontProduct(node, currencyCode = 'USD') {
@@ -259,8 +267,17 @@ function transformStorefrontProduct(node, currencyCode = 'USD') {
   };
 }
 
+/**
+ * RC1 CRITICAL — never set CACHE_MAX_IMAGES to 1.
+ * Production global gallery failure was caused by:
+ *   CACHE_MAX_IMAGES = 1
+ *   CACHE_MAX_DESCRIPTION_HTML_CHARS = 800
+ * which made every Redis product a single-preview row with truncated HTML.
+ * Product detail requires full multi-image galleries + full descriptionHtml.
+ */
 const CACHE_MAX_IMAGES = 30;
 const CACHE_MAX_VARIANTS = 250;
+// Intentionally NO max on descriptionHtml length (was 800 — truncated mid-tag, killed <img>).
 
 function compactVariantForCache(variant) {
   if (!variant) {
@@ -313,12 +330,18 @@ function compactProductForCache(product) {
     })
     .filter(Boolean);
 
+  // RC1: never truncate descriptionHtml — product detail + embedded <img> tags depend on full HTML.
+  const fullDescriptionHtml = typeof product.descriptionHtml === 'string'
+    ? product.descriptionHtml
+    : safeString(product.descriptionHtml);
+
   const compact = {
     id: product.id,
     title: product.title,
     handle: product.handle,
-    descriptionHtml: safeString(product.descriptionHtml),
-    description: stripHtml(product.descriptionHtml || product.description || ''),
+    descriptionHtml: fullDescriptionHtml,
+    // Plain-text companion only — never used as the sole detail description when HTML exists.
+    description: stripHtml(fullDescriptionHtml || product.description || ''),
     vendor: safeString(product.vendor),
     productType: safeString(product.productType),
     tags: Array.isArray(product.tags) ? product.tags.slice(0, 20) : [],
@@ -348,6 +371,12 @@ function compactProductForCache(product) {
 
   if (product.compareAtPriceRange?.maxVariantPrice) {
     compact.compareAtPriceRange = product.compareAtPriceRange;
+  }
+
+  // Persist resolved primary image so list feeds do not re-derive from empty featuredImage.
+  const resolvedPrimary = resolvePrimaryListImage(compact);
+  if (resolvedPrimary) {
+    compact.featuredImage = resolvedPrimary;
   }
 
   return compact;
@@ -380,16 +409,150 @@ function getCollectionEdges(product, maxCollections = 10) {
     }));
 }
 
+/**
+ * Shared image URL extraction (same sources as product detail gallery).
+ * Prefer: node.url / src / image.url / previewImage.url
+ */
+function getImageNodeUrl(node) {
+  return safeString(
+    node?.url ||
+      node?.src ||
+      node?.image?.url ||
+      node?.previewImage?.url ||
+      node?.preview?.image?.url
+  );
+}
+
+function getImageNodeAlt(node) {
+  return safeString(
+    node?.altText || node?.alt || node?.image?.altText || node?.previewImage?.altText
+  );
+}
+
+function addGalleryImage(images, seen, node) {
+  const url = getImageNodeUrl(node);
+  if (!url || seen.has(url)) {
+    return;
+  }
+
+  seen.add(url);
+  images.push({
+    id: safeString(node?.id) || url,
+    url,
+    src: url,
+    altText: getImageNodeAlt(node) || null,
+    width: node?.width ?? node?.image?.width ?? node?.previewImage?.width ?? null,
+    height: node?.height ?? node?.image?.height ?? node?.previewImage?.height ?? null,
+  });
+}
+
+/**
+ * Product detail gallery:
+ * 1) images.edges (order preserved)
+ * 2) media.edges merged in (dedupe by URL — never skip media just because images has items)
+ * 3) thumbnail / featuredImage only if still empty
+ */
+function buildProductGalleryImages(product) {
+  const images = [];
+  const seen = new Set();
+  const handle = safeString(product?.handle) || '(no-handle)';
+  const imagesEdgesIn = (product?.images?.edges || []).length;
+  const mediaEdgesIn = (product?.media?.edges || []).length;
+
+  for (const edge of product?.images?.edges || []) {
+    addGalleryImage(images, seen, edge?.node);
+  }
+  const afterImages = images.length;
+
+  // RC1: always merge media; do not require images to be empty first.
+  for (const edge of product?.media?.edges || []) {
+    const node = edge?.node;
+    // Prefer MediaImage.image / Video preview / generic node URL extractors.
+    addGalleryImage(images, seen, node?.image || node?.previewImage || node);
+  }
+  const afterMedia = images.length;
+
+  if (!images.length) {
+    addGalleryImage(images, seen, product?.thumbnail || product?.featuredImage);
+  }
+
+  console.log('[GALLERY DEBUG] buildProductGalleryImages', {
+    handle,
+    stage: 'buildProductGalleryImages',
+    imagesEdgesIn,
+    mediaEdgesIn,
+    afterImages,
+    afterMediaMerge: afterMedia,
+    galleryOut: images.length,
+  });
+
+  return images;
+}
+
+/**
+ * Primary image for list endpoints (home, categories, search, recommendations).
+ * Preference (investigation Fix 1):
+ * 1) featuredImage when present
+ * 2) first valid product image
+ * 3) first valid media image / preview
+ * 4) thumbnail
+ */
+function resolvePrimaryListImage(product) {
+  if (!product || typeof product !== 'object') {
+    return null;
+  }
+
+  const featuredUrl = safeString(product?.featuredImage?.url || product?.featuredImage?.src);
+  if (featuredUrl) {
+    return {
+      url: featuredUrl,
+      width: product.featuredImage.width ?? null,
+      height: product.featuredImage.height ?? null,
+      altText: product.featuredImage.altText ?? product.featuredImage.alt ?? null,
+    };
+  }
+
+  for (const edge of product?.images?.edges || []) {
+    const url = getImageNodeUrl(edge?.node);
+    if (url) {
+      return {
+        url,
+        width: edge?.node?.width ?? edge?.node?.image?.width ?? null,
+        height: edge?.node?.height ?? edge?.node?.image?.height ?? null,
+        altText: getImageNodeAlt(edge?.node) || null,
+      };
+    }
+  }
+
+  for (const edge of product?.media?.edges || []) {
+    const node = edge?.node;
+    const url = getImageNodeUrl(node);
+    if (url) {
+      return {
+        url,
+        width: node?.width ?? node?.image?.width ?? node?.previewImage?.width ?? null,
+        height: node?.height ?? node?.image?.height ?? node?.previewImage?.height ?? null,
+        altText: getImageNodeAlt(node) || null,
+      };
+    }
+  }
+
+  const thumbUrl = getImageNodeUrl(product?.thumbnail);
+  if (thumbUrl) {
+    return {
+      url: thumbUrl,
+      width: product?.thumbnail?.width ?? null,
+      height: product?.thumbnail?.height ?? null,
+      altText: getImageNodeAlt(product?.thumbnail) || null,
+    };
+  }
+
+  return null;
+}
+
 function toStorefrontListProduct(product) {
   const firstVariant = product?.variants?.edges?.[0]?.node || null;
-  const featuredImage = product?.featuredImage?.url
-    ? {
-        url: product.featuredImage.url,
-        width: product.featuredImage.width ?? null,
-        height: product.featuredImage.height ?? null,
-        altText: product.featuredImage.altText ?? null,
-      }
-    : null;
+  const featuredImage = resolvePrimaryListImage(product);
 
   return {
     id: product.id,
@@ -680,6 +843,10 @@ module.exports = {
   transformStorefrontProduct,
   compactProductForCache,
   toStorefrontListProduct,
+  resolvePrimaryListImage,
+  buildProductGalleryImages,
+  getImageNodeUrl,
+  getImageNodeAlt,
   paginateItems,
   paginateListProducts,
   searchProducts,

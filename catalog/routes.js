@@ -5,6 +5,10 @@ const {
   searchProducts,
   safeString,
   toStorefrontListProduct,
+  buildProductGalleryImages,
+  resolvePrimaryListImage,
+  transformStorefrontProduct,
+  compactProductForCache,
 } = require('./transform');
 const { getOrBuildMixedHandleOrder } = require('./feed-mix');
 const { startBackgroundCatalogSync, getCatalogSyncStatus } = require('./sync');
@@ -34,81 +38,202 @@ function sendCatalogResponse(res, payload, source) {
   });
 }
 
-function getImageNodeUrl(node) {
-  return safeString(node?.url || node?.src || node?.image?.url || node?.previewImage?.url);
+const DETAIL_HYDRATE_COOLDOWN_MS = 1000 * 60 * 60 * 6; // 6h — avoid re-hitting Shopify for true 1-image SKUs
+
+/**
+ * RC1: detect cache rows that were slimmed to a single preview image or
+ * truncated descriptionHtml (production was observed with 1 image + 800-char HTML).
+ */
+function isProductDetailCacheThin(product) {
+  if (!product) return true;
+
+  const hydratedAt = Number(product.__detailHydratedAt || 0);
+  const recentlyHydrated =
+    Number.isFinite(hydratedAt) &&
+    hydratedAt > 0 &&
+    Date.now() - hydratedAt < DETAIL_HYDRATE_COOLDOWN_MS;
+
+  const html = String(product.descriptionHtml || '');
+  // Truncated mid-tag or hard-capped near 800 chars (known bad production cache shape).
+  const looksTruncatedHtml =
+    html.length > 0 &&
+    (html.length === 800 ||
+      html.length === 801 ||
+      /<[a-z][^>]*$/i.test(html.trim()) ||
+      /&[a-zA-Z0-9#]*$/.test(html.trim()));
+
+  // Always repair truncated HTML even if we hydrated recently for images.
+  if (looksTruncatedHtml) return true;
+  if (recentlyHydrated) return false;
+
+  const galleryCount = buildProductGalleryImages(product).length;
+  const mediaCount = Array.isArray(product?.media?.edges) ? product.media.edges.length : 0;
+  const imagesCount = Array.isArray(product?.images?.edges) ? product.images.edges.length : 0;
+
+  // Prefer hydrate when gallery is a single preview and media was dropped (production slim rows).
+  return galleryCount <= 1 && mediaCount === 0 && imagesCount <= 1;
 }
 
-function getImageNodeAlt(node) {
-  return safeString(node?.altText || node?.alt || node?.image?.altText || node?.previewImage?.altText);
-}
+function mergeRicherProductDetail(baseProduct, fillProduct) {
+  if (!fillProduct) return baseProduct || null;
+  if (!baseProduct) return fillProduct;
 
-function addGalleryImage(images, seen, node) {
-  const url = getImageNodeUrl(node);
-  if (!url || seen.has(url)) {
-    return;
-  }
+  const baseGallery = buildProductGalleryImages(baseProduct);
+  const fillGallery = buildProductGalleryImages(fillProduct);
+  const baseHtml = String(baseProduct.descriptionHtml || '');
+  const fillHtml = String(fillProduct.descriptionHtml || '');
+  const baseVariants = (baseProduct?.variants?.edges || []).length;
+  const fillVariants = (fillProduct?.variants?.edges || []).length;
 
-  seen.add(url);
-  images.push({
-    id: safeString(node?.id) || url,
-    url,
-    src: url,
-    altText: getImageNodeAlt(node) || null,
-    width: node?.width ?? node?.image?.width ?? null,
-    height: node?.height ?? node?.image?.height ?? null,
-  });
-}
+  const useFillGallery = fillGallery.length > baseGallery.length;
+  const useFillHtml = fillHtml.length > baseHtml.length;
+  const useFillVariants = fillVariants > baseVariants;
 
-function buildProductGalleryImages(product) {
-  const images = [];
-  const seen = new Set();
-
-  for (const edge of product?.images?.edges || []) {
-    addGalleryImage(images, seen, edge?.node);
-  }
-
-  if (!images.length) {
-    for (const edge of product?.media?.edges || []) {
-      addGalleryImage(images, seen, edge?.node);
-    }
-  }
-
-  if (!images.length) {
-    addGalleryImage(images, seen, product?.thumbnail || product?.featuredImage);
-  }
-
-  return images;
+  return {
+    ...baseProduct,
+    ...fillProduct,
+    title: fillProduct.title || baseProduct.title,
+    handle: fillProduct.handle || baseProduct.handle,
+    descriptionHtml: useFillHtml ? fillHtml : baseHtml || fillHtml,
+    description: fillProduct.description || baseProduct.description || '',
+    images: useFillGallery
+      ? fillProduct.images || baseProduct.images
+      : baseProduct.images || fillProduct.images,
+    media: useFillGallery
+      ? fillProduct.media || baseProduct.media
+      : baseProduct.media || fillProduct.media,
+    featuredImage: fillProduct.featuredImage?.url
+      ? fillProduct.featuredImage
+      : baseProduct.featuredImage || fillProduct.featuredImage,
+    variants: useFillVariants
+      ? fillProduct.variants || baseProduct.variants
+      : baseProduct.variants || fillProduct.variants,
+    collections: fillProduct.collections || baseProduct.collections,
+    priceRange: fillProduct.priceRange || baseProduct.priceRange,
+    compareAtPriceRange: fillProduct.compareAtPriceRange || baseProduct.compareAtPriceRange,
+  };
 }
 
 function formatCachedProductDetail(product) {
   const galleryImages = buildProductGalleryImages(product);
-  const thumbnail = galleryImages[0]?.url || safeString(product?.thumbnail?.url || product?.featuredImage?.url) || null;
-  const imagesConnection = product.images || { edges: [] };
+  const primaryImage = resolvePrimaryListImage(product);
+  const thumbnail =
+    galleryImages[0]?.url ||
+    safeString(primaryImage?.url || product?.thumbnail?.url || product?.featuredImage?.url) ||
+    null;
+  const handle = safeString(product?.handle) || '(no-handle)';
 
-  return {
+  // Always expose GraphQL-style images.edges for clients that read edges.
+  const imagesEdges = galleryImages.map((image, index) => ({
+    node: {
+      id: image.id || `gallery-image-${index}`,
+      url: image.url,
+      altText: image.altText || null,
+      width: image.width ?? null,
+      height: image.height ?? null,
+    },
+  }));
+  const imagesConnection = { edges: imagesEdges };
+  // Keep original media from cache (videos + extra images); do not drop.
+  const media = product.media && Array.isArray(product.media.edges) ? product.media : { edges: [] };
+
+  // descriptionHtml must stay HTML (never strip tags). Only fall back to plain description when HTML is empty.
+  const descriptionHtml = String(product.descriptionHtml || product.description_html || '');
+  const description = String(product.description || '');
+
+  const detail = {
     id: product.id,
     title: product.title,
     handle: product.handle,
-    descriptionHtml: product.descriptionHtml || product.description || '',
-    description: product.description || '',
+    descriptionHtml: descriptionHtml || description,
+    description,
     vendor: product.vendor || '',
     productType: product.productType || '',
     tags: Array.isArray(product.tags) ? product.tags : [],
     status: product.status || 'ACTIVE',
     availableForSale: Boolean(product.availableForSale),
-    featuredImage: product.featuredImage || null,
+    featuredImage: product.featuredImage?.url ? product.featuredImage : primaryImage,
     thumbnail,
+    // Full gallery fields — required by mobile Product Detail pipeline.
     galleryImages,
     imageUrls: galleryImages.map((image) => image.url),
-    images: galleryImages,
+    images: imagesConnection,
     imagesConnection,
     shopifyImages: imagesConnection,
-    media: product.media || { edges: [] },
+    media,
     priceRange: product.priceRange || null,
     compareAtPriceRange: product.compareAtPriceRange || { maxVariantPrice: null },
     variants: product.variants || { edges: [] },
     collections: product.collections || { edges: [] },
   };
+
+  console.log('[GALLERY DEBUG] formatCachedProductDetail / API payload', {
+    handle,
+    stage: 'formatCachedProductDetail',
+    galleryImages: galleryImages.length,
+    imageUrls: detail.imageUrls.length,
+    imagesEdges: imagesEdges.length,
+    mediaEdges: (detail.media?.edges || []).length,
+    descriptionHtmlLength: descriptionHtml.length,
+    cacheImagesEdges: (product?.images?.edges || []).length,
+    cacheMediaEdges: (product?.media?.edges || []).length,
+  });
+
+  return detail;
+}
+
+/**
+ * When Redis/cache only has a preview row, hydrate full images + descriptionHtml from Shopify
+ * and write the richer product back so subsequent hits are full.
+ */
+async function hydrateThinProductDetail(cache, handle, product) {
+  if (!isProductDetailCacheThin(product)) {
+    return { product, source: product ? 'cache' : 'miss', hydrated: false };
+  }
+
+  console.log('[NOOD product] thin product detail cache — hydrating from Shopify', {
+    handle,
+    gallery: buildProductGalleryImages(product || {}).length,
+    descriptionHtmlLength: String(product?.descriptionHtml || '').length,
+    imagesEdges: (product?.images?.edges || []).length,
+    mediaEdges: (product?.media?.edges || []).length,
+  });
+
+  try {
+    const shopifyPayload = await fetchProductDetailFromShopify(handle);
+    const storefrontNode = shopifyPayload?.data?.productByHandle;
+    if (!isVisibleCatalogProduct(storefrontNode) && !storefrontNode?.handle) {
+      return { product, source: product ? 'cache' : 'miss', hydrated: false };
+    }
+
+    const fromShopify = transformStorefrontProduct(storefrontNode);
+    const merged = mergeRicherProductDetail(product, fromShopify);
+    const compact = compactProductForCache(merged) || merged;
+    // Stamp so true 1-image products are not re-fetched every request.
+    compact.__detailHydratedAt = Date.now();
+
+    if (cache && typeof cache.setProduct === 'function' && compact?.handle) {
+      try {
+        await cache.setProduct(compact.handle, compact);
+        console.log('[NOOD product] hydrated product written to cache', {
+          handle: compact.handle,
+          gallery: buildProductGalleryImages(compact).length,
+          descriptionHtmlLength: String(compact.descriptionHtml || '').length,
+        });
+      } catch (writeError) {
+        console.warn('[NOOD product] hydrated cache write failed:', writeError.message);
+      }
+    }
+
+    return {
+      product: compact,
+      source: product ? 'cache+shopify' : 'shopify',
+      hydrated: true,
+    };
+  } catch (error) {
+    console.warn('[NOOD product] Shopify hydrate failed:', error.message);
+    return { product, source: product ? 'cache' : 'miss', hydrated: false };
+  }
 }
 
 function isVisibleCatalogProduct(product) {
@@ -566,6 +691,8 @@ async function loadMixMetaIndex(cache) {
     tags: Array.isArray(product.tags) ? product.tags.slice(0, 12) : [],
     productType: safeString(product.productType),
     vendor: safeString(product.vendor),
+    availableForSale:
+      product.availableForSale === undefined ? undefined : Boolean(product.availableForSale),
   }));
 }
 
@@ -1131,44 +1258,54 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
       }
 
       let product = await safeGetProduct(cache, handle);
+      let responseSource = 'cache';
 
       if (!isVisibleCatalogProduct(product)) {
         console.log(`[NOOD product] cache miss handle=${handle}`);
-        try {
-          const shopifyPayload = await fetchProductDetailFromShopify(handle);
-          if (isVisibleCatalogProduct(shopifyPayload?.data?.productByHandle)) {
-            const detail = formatCachedProductDetail(shopifyPayload.data.productByHandle);
-            if (process.env.NODE_ENV !== 'production') {
-              console.log(`Product gallery images count: ${detail.handle} ${detail.galleryImages.length}`);
-            }
-            console.log(`[NOOD product] shopify fallback handle=${handle} title=${safeString(detail.title)}`);
-            return sendCatalogResponse(
-              res,
-              {
-                data: {
-                  product: detail,
-                  productByHandle: detail,
-                },
-              },
-              'shopify'
-            );
-          }
-        } catch (error) {
-          console.warn('[NOOD catalog] product shopify fallback failed:', error.message);
+        const hydratedMiss = await hydrateThinProductDetail(cache, handle, null);
+        product = hydratedMiss.product;
+        responseSource = hydratedMiss.source || 'shopify';
+
+        if (!isVisibleCatalogProduct(product)) {
+          return res.status(404).json({
+            success: false,
+            error: true,
+            message: 'Product not found',
+          });
         }
-
-        return res.status(404).json({
-          success: false,
-          error: true,
-          message: 'Product not found',
-        });
+      } else if (isProductDetailCacheThin(product)) {
+        // RC1: production Redis often stores 1-image preview rows — repair on read.
+        const hydrated = await hydrateThinProductDetail(cache, handle, product);
+        if (hydrated.product) {
+          product = hydrated.product;
+          responseSource = hydrated.source || 'cache+shopify';
+        }
       }
 
-      console.log(`[NOOD product] cache hit handle=${handle} title=${safeString(product.title)}`);
+      console.log(`[NOOD product] detail handle=${handle} title=${safeString(product.title)} source=${responseSource}`);
+      console.log('[GALLERY DEBUG] GET /products/:handle raw', {
+        handle,
+        stage: 'GET /api/catalog/products/:handle pre-format',
+        imagesEdges: (product?.images?.edges || []).length,
+        mediaEdges: (product?.media?.edges || []).length,
+        descriptionHtmlLength: String(product?.descriptionHtml || '').length,
+      });
+
       const detail = formatCachedProductDetail(product);
-      if (process.env.NODE_ENV !== 'production') {
-        console.log(`Product gallery images count: ${detail.handle} ${detail.galleryImages.length}`);
-      }
+
+      console.log('[GALLERY DEBUG] GET /products/:handle response', {
+        handle,
+        stage: 'GET /api/catalog/products/:handle response',
+        galleryImages: (detail.galleryImages || []).length,
+        imageUrls: (detail.imageUrls || []).length,
+        imagesEdges: detail.images?.edges?.length ?? null,
+        mediaEdges: (detail.media?.edges || []).length,
+        descriptionHtmlLength: String(detail.descriptionHtml || '').length,
+        source: responseSource,
+      });
+      console.log(
+        `Product gallery images count: ${detail.handle} ${(detail.galleryImages || []).length}`
+      );
       console.log(`[NOOD product] detail returned handle=${handle} title=${safeString(detail.title)}`);
 
       return sendCatalogResponse(
@@ -1179,7 +1316,7 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
             productByHandle: detail,
           },
         },
-        'cache'
+        responseSource
       );
     } catch (error) {
       console.error('[NOOD catalog] GET /products/:handle failed:', error.message);
@@ -1285,20 +1422,8 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
   });
 
   function resolveProductImageForCollectionResponse(product) {
-    const featuredImageUrl = safeString(product?.featuredImage?.url);
-    if (featuredImageUrl) {
-      return featuredImageUrl;
-    }
-
-    const imageEdges = product?.images?.edges || [];
-    for (const edge of imageEdges) {
-      const imageUrl = safeString(edge?.node?.url);
-      if (imageUrl) {
-        return imageUrl;
-      }
-    }
-
-    return '';
+    // Shared primary image resolver (featured → images → media).
+    return safeString(resolvePrimaryListImage(product)?.url);
   }
 
   function resolveCollectionImageForResponse(collection, resolvedProducts) {
