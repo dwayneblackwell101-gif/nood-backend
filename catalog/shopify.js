@@ -656,6 +656,7 @@ const STOREFRONT_PRODUCT_DETAIL_QUERY = `
       descriptionHtml
       vendor
       productType
+      availableForSale
       featuredImage {
         url
       }
@@ -703,6 +704,8 @@ const STOREFRONT_PRODUCT_DETAIL_QUERY = `
             id
             title
             availableForSale
+            quantityAvailable
+            currentlyNotInStock
             price {
               amount
               currencyCode

@@ -228,18 +228,52 @@ function transformAdminProduct(adminProduct, currencyCode = 'USD') {
   return productRecord;
 }
 
+function getStorefrontVariantEdges(node) {
+  if (Array.isArray(node?.variants?.edges)) return node.variants.edges;
+  if (Array.isArray(node?.variants?.nodes)) {
+    return node.variants.nodes.map((variantNode) => ({ node: variantNode }));
+  }
+  if (Array.isArray(node?.variants)) {
+    return node.variants.map((entry) => ({ node: entry?.node || entry }));
+  }
+  return [];
+}
+
 function transformStorefrontProduct(node, currencyCode = 'USD') {
   if (!node) return null;
-  const variants = (node?.variants?.edges || []).map((edge) => ({
-    node: {
-      id: edge?.node?.id,
-      title: edge?.node?.title,
-      availableForSale: Boolean(edge?.node?.availableForSale),
-      quantityAvailable: edge?.node?.quantityAvailable ?? null,
-      price: edge?.node?.price || toStorefrontMoney(0, currencyCode),
-      selectedOptions: edge?.node?.selectedOptions || [],
-    },
-  }));
+  const variants = getStorefrontVariantEdges(node).map((edge) => {
+    const v = edge?.node || edge;
+    const afsExplicit = v?.availableForSale;
+    return {
+      node: {
+        id: v?.id,
+        title: v?.title,
+        // Never invent false from missing flag — that sold out the entire catalog after hydrate.
+        availableForSale:
+          afsExplicit === undefined || afsExplicit === null
+            ? v?.currentlyNotInStock === true
+              ? false
+              : true
+            : Boolean(afsExplicit),
+        quantityAvailable:
+          v?.quantityAvailable === undefined || v?.quantityAvailable === null
+            ? null
+            : Number(v.quantityAvailable),
+        currentlyNotInStock:
+          v?.currentlyNotInStock === undefined || v?.currentlyNotInStock === null
+            ? undefined
+            : Boolean(v.currentlyNotInStock),
+        price: v?.price || toStorefrontMoney(0, currencyCode),
+        selectedOptions: v?.selectedOptions || [],
+      },
+    };
+  });
+
+  const anyVariantForSale = variants.some((edge) => edge?.node?.availableForSale === true);
+  const productAvailableForSale =
+    node.availableForSale === undefined || node.availableForSale === null
+      ? anyVariantForSale
+      : Boolean(node.availableForSale) || anyVariantForSale;
 
   return {
     id: node.id,
@@ -251,7 +285,7 @@ function transformStorefrontProduct(node, currencyCode = 'USD') {
     productType: node.productType || '',
     tags: Array.isArray(node.tags) ? node.tags : [],
     status: 'ACTIVE',
-    availableForSale: Boolean(node.availableForSale),
+    availableForSale: productAvailableForSale,
     featuredImage: node.featuredImage || null,
     images: node.images || { edges: [] },
     media: node.media || { edges: [] },
@@ -346,7 +380,10 @@ function compactProductForCache(product) {
     productType: safeString(product.productType),
     tags: Array.isArray(product.tags) ? product.tags.slice(0, 20) : [],
     status: safeString(product.status, 'ACTIVE').toUpperCase(),
-    availableForSale: Boolean(product.availableForSale),
+    // Prefer true if any variant is for sale — never collapse missing/false over real stock.
+    availableForSale:
+      Boolean(product.availableForSale) ||
+      variantEdges.some((edge) => edge?.node?.availableForSale === true),
     featuredImage: product.featuredImage || null,
     images: { edges: imageEdges },
     media: { edges: normalizedMediaEdges },

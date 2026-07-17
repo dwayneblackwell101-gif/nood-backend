@@ -223,11 +223,119 @@ async function createRedisCache(redisUrl) {
       return safeString(await this.client.get(PREVIOUS_VERSION_KEY));
     }
 
+    async countProductsForVersion(versionId) {
+      const version = safeString(versionId);
+      if (!version) {
+        return Number(await this.client.hlen(PRODUCTS_HASH_KEY)) || 0;
+      }
+      return Number(await this.client.hlen(versionKey(version, 'products'))) || 0;
+    }
+
+    /**
+     * P0 recovery: production had active-version missing/empty while products still
+     * lived under a previous/staging version or legacy hash. Reads then hit
+     * nood:catalog:version:__missing_active__:products → 0 products, collections 404,
+     * product detail 404 → mobile preview-only (1 image, 0 variants, sold out).
+     */
+    async recoverReadableCatalogVersionId() {
+      const candidates = [];
+      const previous = await this.getPreviousVersionId();
+      if (previous) candidates.push(previous);
+
+      try {
+        const indexed = await this.client.smembers(VERSION_INDEX_KEY);
+        for (const id of indexed || []) {
+          if (id && !candidates.includes(id)) candidates.push(id);
+        }
+      } catch {
+        // ignore index failures
+      }
+
+      let bestId = '';
+      let bestCount = 0;
+      for (const id of candidates) {
+        const count = await this.countProductsForVersion(id);
+        if (count > bestCount) {
+          bestCount = count;
+          bestId = id;
+        }
+      }
+
+      if (bestId && bestCount > 0) {
+        console.warn('[NOOD cache] recovering catalog active-version', {
+          versionId: bestId,
+          productCount: bestCount,
+          reason: 'active_missing_or_empty',
+        });
+        try {
+          const meta = await this.getCatalogVersionMeta(bestId);
+          const now = new Date().toISOString();
+          await this.client
+            .multi()
+            .set(ACTIVE_VERSION_KEY, bestId)
+            .set(
+              versionKey(bestId, 'metadata'),
+              JSON.stringify({
+                ...(meta || { versionId: bestId }),
+                status: 'active',
+                productCount: bestCount,
+                recoveredAt: now,
+                recoveryReason: 'active_missing_or_empty',
+              })
+            )
+            .lpush(
+              VERSION_AUDIT_KEY,
+              JSON.stringify({
+                action: 'recover_active',
+                versionId: bestId,
+                productCount: bestCount,
+                at: now,
+              })
+            )
+            .exec();
+        } catch (error) {
+          console.warn('[NOOD cache] active-version recovery write failed:', error.message);
+          // Still return the version id so reads work even if meta write fails.
+        }
+        return bestId;
+      }
+
+      const legacyHashCount = Number(await this.client.hlen(PRODUCTS_HASH_KEY)) || 0;
+      if (legacyHashCount > 0) {
+        console.warn('[NOOD cache] using legacy unversioned product hash', {
+          productCount: legacyHashCount,
+        });
+        return '';
+      }
+
+      return null;
+    }
+
     async getReadVersionId() {
       const active = await this.getActiveVersionId();
-      if (active) return active;
-      const legacyAllowed = String(process.env.CATALOG_LEGACY_FALLBACK_ENABLED || '').toLowerCase() === 'true';
-      return legacyAllowed ? '' : '__missing_active__';
+      if (active) {
+        const activeCount = await this.countProductsForVersion(active);
+        if (activeCount > 0) {
+          return active;
+        }
+        console.warn('[NOOD cache] active catalog version has 0 products', { active });
+      } else {
+        console.warn('[NOOD cache] catalog active-version key is empty');
+      }
+
+      const recovered = await this.recoverReadableCatalogVersionId();
+      if (recovered !== null && recovered !== undefined) {
+        return recovered;
+      }
+
+      // Default to legacy unversioned keys — never invent a fake version id that is always empty.
+      // Set CATALOG_LEGACY_FALLBACK_ENABLED=false only if you intentionally want hard-fail.
+      const legacyDenied =
+        String(process.env.CATALOG_LEGACY_FALLBACK_ENABLED || 'true').toLowerCase() === 'false';
+      if (legacyDenied) {
+        return '__missing_active__';
+      }
+      return '';
     }
 
     getWriteVersionId() {

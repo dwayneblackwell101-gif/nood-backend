@@ -64,14 +64,54 @@ function isProductDetailCacheThin(product) {
 
   // Always repair truncated HTML even if we hydrated recently for images.
   if (looksTruncatedHtml) return true;
-  if (recentlyHydrated) return false;
 
   const galleryCount = buildProductGalleryImages(product).length;
   const mediaCount = Array.isArray(product?.media?.edges) ? product.media.edges.length : 0;
   const imagesCount = Array.isArray(product?.images?.edges) ? product.images.edges.length : 0;
+  const variantCount = countVariantEdges(product);
+  const variantsForSale = countVariantsForSale(product);
 
-  // Prefer hydrate when gallery is a single preview and media was dropped (production slim rows).
-  return galleryCount <= 1 && mediaCount === 0 && imagesCount <= 1;
+  // Empty variants or zero for-sale variants = incomplete cache (mobile shows sold out).
+  const stockThin = variantCount === 0 || (product.availableForSale === false && variantsForSale === 0);
+  // Single-preview gallery rows from CACHE_MAX_IMAGES=1 era.
+  const galleryThin = galleryCount <= 1 && mediaCount === 0 && imagesCount <= 1;
+
+  if (stockThin || galleryThin) {
+    // Allow re-hydrate for stock/gallery thin even if recently hydrated for images only,
+    // unless we already stamped a successful hydrate with variants present.
+    if (recentlyHydrated && variantCount > 0 && !galleryThin && !looksTruncatedHtml) {
+      return false;
+    }
+    return true;
+  }
+
+  if (recentlyHydrated) return false;
+  return false;
+}
+
+function countVariantEdges(product) {
+  return Array.isArray(product?.variants?.edges) ? product.variants.edges.length : 0;
+}
+
+function countVariantsForSale(product) {
+  return (product?.variants?.edges || []).filter((edge) => edge?.node?.availableForSale === true)
+    .length;
+}
+
+function logProductPipelineStage(stage, product) {
+  const handle = safeString(product?.handle) || '(no-handle)';
+  const gallery = product ? buildProductGalleryImages(product).length : 0;
+  const variants = countVariantEdges(product);
+  const media = Array.isArray(product?.media?.edges) ? product.media.edges.length : 0;
+  console.log('[NOOD pipeline]', {
+    stage,
+    handle,
+    galleryImageCount: gallery,
+    variantCount: variants,
+    variantsForSale: countVariantsForSale(product),
+    availableForSale: product?.availableForSale,
+    mediaCount: media,
+  });
 }
 
 function mergeRicherProductDetail(baseProduct, fillProduct) {
@@ -82,14 +122,32 @@ function mergeRicherProductDetail(baseProduct, fillProduct) {
   const fillGallery = buildProductGalleryImages(fillProduct);
   const baseHtml = String(baseProduct.descriptionHtml || '');
   const fillHtml = String(fillProduct.descriptionHtml || '');
-  const baseVariants = (baseProduct?.variants?.edges || []).length;
-  const fillVariants = (fillProduct?.variants?.edges || []).length;
+  const baseVariants = countVariantEdges(baseProduct);
+  const fillVariants = countVariantEdges(fillProduct);
+  const baseForSale = countVariantsForSale(baseProduct);
+  const fillForSale = countVariantsForSale(fillProduct);
 
   const useFillGallery = fillGallery.length > baseGallery.length;
   const useFillHtml = fillHtml.length > baseHtml.length;
-  const useFillVariants = fillVariants > baseVariants;
+  // Prefer the side with more purchasable variants; never replace stocked variants with [].
+  const useFillVariants =
+    fillVariants > 0 &&
+    (baseVariants === 0 ||
+      (fillVariants > baseVariants && fillForSale >= baseForSale) ||
+      (fillForSale > baseForSale && fillVariants >= baseVariants));
 
-  return {
+  // Stock: never let a missing/false fill flag wipe a true base flag when base has variants for sale.
+  const availableForSale =
+    baseProduct.availableForSale === true ||
+    fillProduct.availableForSale === true ||
+    baseForSale > 0 ||
+    fillForSale > 0
+      ? true
+      : baseProduct.availableForSale === false && fillProduct.availableForSale === false
+        ? false
+        : Boolean(baseProduct.availableForSale) || Boolean(fillProduct.availableForSale);
+
+  const merged = {
     ...baseProduct,
     ...fillProduct,
     title: fillProduct.title || baseProduct.title,
@@ -105,13 +163,22 @@ function mergeRicherProductDetail(baseProduct, fillProduct) {
     featuredImage: fillProduct.featuredImage?.url
       ? fillProduct.featuredImage
       : baseProduct.featuredImage || fillProduct.featuredImage,
+    availableForSale,
     variants: useFillVariants
       ? fillProduct.variants || baseProduct.variants
-      : baseProduct.variants || fillProduct.variants,
-    collections: fillProduct.collections || baseProduct.collections,
+      : baseProduct.variants?.edges?.length
+        ? baseProduct.variants
+        : fillProduct.variants || baseProduct.variants,
+    collections:
+      (fillProduct.collections?.edges || []).length >= (baseProduct.collections?.edges || []).length
+        ? fillProduct.collections || baseProduct.collections
+        : baseProduct.collections || fillProduct.collections,
     priceRange: fillProduct.priceRange || baseProduct.priceRange,
     compareAtPriceRange: fillProduct.compareAtPriceRange || baseProduct.compareAtPriceRange,
   };
+
+  logProductPipelineStage('mergeRicherProductDetail', merged);
+  return merged;
 }
 
 function formatCachedProductDetail(product) {
@@ -141,6 +208,17 @@ function formatCachedProductDetail(product) {
   const descriptionHtml = String(product.descriptionHtml || product.description_html || '');
   const description = String(product.description || '');
 
+  const variants = product.variants || { edges: [] };
+  const variantEdges = Array.isArray(variants.edges) ? variants.edges : [];
+  const anyVariantForSale = variantEdges.some((edge) => edge?.node?.availableForSale === true);
+  // Boolean(undefined) → false was the global sold-out regression after hydrate.
+  const availableForSale =
+    product.availableForSale === true || anyVariantForSale
+      ? true
+      : product.availableForSale === false && !anyVariantForSale
+        ? false
+        : anyVariantForSale;
+
   const detail = {
     id: product.id,
     title: product.title,
@@ -151,7 +229,7 @@ function formatCachedProductDetail(product) {
     productType: product.productType || '',
     tags: Array.isArray(product.tags) ? product.tags : [],
     status: product.status || 'ACTIVE',
-    availableForSale: Boolean(product.availableForSale),
+    availableForSale,
     featuredImage: product.featuredImage?.url ? product.featuredImage : primaryImage,
     thumbnail,
     // Full gallery fields — required by mobile Product Detail pipeline.
@@ -163,10 +241,11 @@ function formatCachedProductDetail(product) {
     media,
     priceRange: product.priceRange || null,
     compareAtPriceRange: product.compareAtPriceRange || { maxVariantPrice: null },
-    variants: product.variants || { edges: [] },
+    variants,
     collections: product.collections || { edges: [] },
   };
 
+  logProductPipelineStage('formatCachedProductDetail', detail);
   console.log('[GALLERY DEBUG] formatCachedProductDetail / API payload', {
     handle,
     stage: 'formatCachedProductDetail',
@@ -174,6 +253,8 @@ function formatCachedProductDetail(product) {
     imageUrls: detail.imageUrls.length,
     imagesEdges: imagesEdges.length,
     mediaEdges: (detail.media?.edges || []).length,
+    variantCount: variantEdges.length,
+    availableForSale: detail.availableForSale,
     descriptionHtmlLength: descriptionHtml.length,
     cacheImagesEdges: (product?.images?.edges || []).length,
     cacheMediaEdges: (product?.media?.edges || []).length,
@@ -206,11 +287,26 @@ async function hydrateThinProductDetail(cache, handle, product) {
       return { product, source: product ? 'cache' : 'miss', hydrated: false };
     }
 
+    logProductPipelineStage('hydrate storefront raw', storefrontNode);
     const fromShopify = transformStorefrontProduct(storefrontNode);
+    logProductPipelineStage('hydrate after transformStorefrontProduct', fromShopify);
     const merged = mergeRicherProductDetail(product, fromShopify);
     const compact = compactProductForCache(merged) || merged;
     // Stamp so true 1-image products are not re-fetched every request.
     compact.__detailHydratedAt = Date.now();
+    logProductPipelineStage('hydrate after compactProductForCache', compact);
+
+    // Never persist a hydrate result that wipes variants if base had them.
+    const baseVariantCount = countVariantEdges(product);
+    const compactVariantCount = countVariantEdges(compact);
+    if (baseVariantCount > 0 && compactVariantCount === 0) {
+      console.warn('[NOOD product] hydrate refused to wipe variants', {
+        handle,
+        baseVariantCount,
+        compactVariantCount,
+      });
+      return { product, source: 'cache', hydrated: false };
+    }
 
     if (cache && typeof cache.setProduct === 'function' && compact?.handle) {
       try {
@@ -218,6 +314,8 @@ async function hydrateThinProductDetail(cache, handle, product) {
         console.log('[NOOD product] hydrated product written to cache', {
           handle: compact.handle,
           gallery: buildProductGalleryImages(compact).length,
+          variants: countVariantEdges(compact),
+          availableForSale: compact.availableForSale,
           descriptionHtmlLength: String(compact.descriptionHtml || '').length,
         });
       } catch (writeError) {
@@ -1259,6 +1357,7 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
 
       let product = await safeGetProduct(cache, handle);
       let responseSource = 'cache';
+      logProductPipelineStage('GET detail after cache read', product);
 
       if (!isVisibleCatalogProduct(product)) {
         console.log(`[NOOD product] cache miss handle=${handle}`);
@@ -1273,8 +1372,12 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
             message: 'Product not found',
           });
         }
-      } else if (isProductDetailCacheThin(product)) {
-        // RC1: production Redis often stores 1-image preview rows — repair on read.
+      } else if (
+        isProductDetailCacheThin(product) ||
+        countVariantEdges(product) === 0 ||
+        product.availableForSale === false && countVariantsForSale(product) === 0
+      ) {
+        // Repair thin gallery OR empty variants OR all-sold-out cache rows from Storefront.
         const hydrated = await hydrateThinProductDetail(cache, handle, product);
         if (hydrated.product) {
           product = hydrated.product;
@@ -1288,6 +1391,8 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
         stage: 'GET /api/catalog/products/:handle pre-format',
         imagesEdges: (product?.images?.edges || []).length,
         mediaEdges: (product?.media?.edges || []).length,
+        variantCount: countVariantEdges(product),
+        availableForSale: product?.availableForSale,
         descriptionHtmlLength: String(product?.descriptionHtml || '').length,
       });
 
