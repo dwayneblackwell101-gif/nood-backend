@@ -1,0 +1,57 @@
+import { z } from 'zod';
+export declare const CatalogV2ConfigSchema: z.ZodObject<{
+    SHOPIFY_STORE_DOMAIN: z.ZodString;
+    SHOPIFY_ADMIN_ACCESS_TOKEN: z.ZodString;
+    SHOPIFY_ADMIN_API_VERSION: z.ZodDefault<z.ZodString>;
+    SHOPIFY_STOREFRONT_ACCESS_TOKEN: z.ZodString;
+    SHOPIFY_STOREFRONT_API_VERSION: z.ZodDefault<z.ZodString>;
+    REDIS_URL: z.ZodOptional<z.ZodString>;
+    REDIS_NAMESPACE: z.ZodDefault<z.ZodString>;
+    CATALOG_LEGACY_FALLBACK_ENABLED: z.ZodDefault<z.ZodEffects<z.ZodString, boolean, string>>;
+    SYNC_MAX_PRODUCTS: z.ZodOptional<z.ZodEffects<z.ZodString, number, string>>;
+    SYNC_PAGE_SIZE: z.ZodDefault<z.ZodEffects<z.ZodString, number, string>>;
+    SYNC_INTER_PAGE_DELAY_MS: z.ZodDefault<z.ZodEffects<z.ZodString, number, string>>;
+    SYNC_MAX_GRAPHQL_ATTEMPTS: z.ZodDefault<z.ZodEffects<z.ZodString, number, string>>;
+    VALIDATION_ENABLED: z.ZodDefault<z.ZodEffects<z.ZodString, boolean, string>>;
+    VALIDATION_MIN_PRODUCT_COUNT: z.ZodOptional<z.ZodEffects<z.ZodString, number, string>>;
+    VALIDATION_MAX_COUNT_DROP_PERCENT: z.ZodDefault<z.ZodEffects<z.ZodString, number, string>>;
+    NODE_ENV: z.ZodDefault<z.ZodEnum<["development", "test", "production"]>>;
+}, "strip", z.ZodTypeAny, {
+    NODE_ENV: "test" | "production" | "development";
+    SHOPIFY_STORE_DOMAIN: string;
+    SHOPIFY_ADMIN_ACCESS_TOKEN: string;
+    SHOPIFY_ADMIN_API_VERSION: string;
+    SHOPIFY_STOREFRONT_ACCESS_TOKEN: string;
+    SHOPIFY_STOREFRONT_API_VERSION: string;
+    REDIS_NAMESPACE: string;
+    CATALOG_LEGACY_FALLBACK_ENABLED: boolean;
+    SYNC_PAGE_SIZE: number;
+    SYNC_INTER_PAGE_DELAY_MS: number;
+    SYNC_MAX_GRAPHQL_ATTEMPTS: number;
+    VALIDATION_ENABLED: boolean;
+    VALIDATION_MAX_COUNT_DROP_PERCENT: number;
+    REDIS_URL?: string | undefined;
+    SYNC_MAX_PRODUCTS?: number | undefined;
+    VALIDATION_MIN_PRODUCT_COUNT?: number | undefined;
+}, {
+    SHOPIFY_STORE_DOMAIN: string;
+    SHOPIFY_ADMIN_ACCESS_TOKEN: string;
+    SHOPIFY_STOREFRONT_ACCESS_TOKEN: string;
+    NODE_ENV?: "test" | "production" | "development" | undefined;
+    SHOPIFY_ADMIN_API_VERSION?: string | undefined;
+    SHOPIFY_STOREFRONT_API_VERSION?: string | undefined;
+    REDIS_URL?: string | undefined;
+    REDIS_NAMESPACE?: string | undefined;
+    CATALOG_LEGACY_FALLBACK_ENABLED?: string | undefined;
+    SYNC_MAX_PRODUCTS?: string | undefined;
+    SYNC_PAGE_SIZE?: string | undefined;
+    SYNC_INTER_PAGE_DELAY_MS?: string | undefined;
+    SYNC_MAX_GRAPHQL_ATTEMPTS?: string | undefined;
+    VALIDATION_ENABLED?: string | undefined;
+    VALIDATION_MIN_PRODUCT_COUNT?: string | undefined;
+    VALIDATION_MAX_COUNT_DROP_PERCENT?: string | undefined;
+}>;
+export type CatalogV2Config = z.infer<typeof CatalogV2ConfigSchema>;
+export declare function loadConfig(): CatalogV2Config;
+export declare function resetConfig(): void;
+//# sourceMappingURL=schema.d.ts.map

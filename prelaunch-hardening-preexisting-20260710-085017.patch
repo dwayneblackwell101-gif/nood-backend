@@ -1,0 +1,1464 @@
+diff --git a/catalog/cache/json-cache.js b/catalog/cache/json-cache.js
+index 891fd3d..1bfabe0 100644
+--- a/catalog/cache/json-cache.js
++++ b/catalog/cache/json-cache.js
+@@ -13,7 +13,7 @@ function parseJsonProductMixMeta(product) {
+     return null;
+   }
+ 
+-  if (safeString(product.status).toUpperCase() === 'ARCHIVED') {
++  if (safeString(product.status, 'ACTIVE').toUpperCase() !== 'ACTIVE') {
+     return null;
+   }
+ 
+@@ -100,6 +100,7 @@ class JsonCatalogCache {
+   async setMeta(meta) {
+     this.state.meta = { ...this.state.meta, ...meta };
+     await this.persist();
++    return { ...this.state.meta };
+   }
+ 
+   async getProduct(handle) {
+@@ -189,6 +190,42 @@ class JsonCatalogCache {
+     return true;
+   }
+ 
++  async clearProducts() {
++    this.state.products = {};
++    this.state.productsById = {};
++    jsonMixMetaIndexCache.clear();
++    jsonMixedHandleOrderCache.clear();
++    await this.persist();
++  }
++
++  async deleteProducts(handles = []) {
++    const keys = [...new Set(handles.map((handle) => String(handle || '').trim()).filter(Boolean))];
++    if (!keys.length) {
++      return 0;
++    }
++
++    let removed = 0;
++    for (const key of keys) {
++      const product = this.state.products[key];
++      if (!product) {
++        continue;
++      }
++      delete this.state.products[key];
++      if (product.id) {
++        delete this.state.productsById[String(product.id)];
++      }
++      removed += 1;
++    }
++
++    if (removed > 0) {
++      jsonMixMetaIndexCache.clear();
++      jsonMixedHandleOrderCache.clear();
++      await this.persist();
++    }
++
++    return removed;
++  }
++
+   async getProductCount() {
+     return Object.keys(this.state.products || {}).length;
+   }
+@@ -367,4 +404,4 @@ class JsonCatalogCache {
+ module.exports = {
+   JsonCatalogCache,
+   CACHE_FILE,
+-};
+\ No newline at end of file
++};
+diff --git a/catalog/cache/redis-cache.js b/catalog/cache/redis-cache.js
+index eba1e9b..6bbbe0d 100644
+--- a/catalog/cache/redis-cache.js
++++ b/catalog/cache/redis-cache.js
+@@ -94,7 +94,7 @@ function parseProductSummary(handle, raw) {
+     return null;
+   }
+ 
+-  if (safeString(product.status).toUpperCase() === 'ARCHIVED') {
++  if (safeString(product.status, 'ACTIVE').toUpperCase() !== 'ACTIVE') {
+     return null;
+   }
+ 
+@@ -102,6 +102,7 @@ function parseProductSummary(handle, raw) {
+     handle: product.handle,
+     id: product.id,
+     updatedAt: product.updatedAt || '',
++    availableForSale: Boolean(product.availableForSale),
+   };
+ }
+ 
+@@ -162,7 +163,7 @@ function parseProductMixMeta(handle, raw) {
+       return null;
+     }
+ 
+-    if (safeString(parsed.status).toUpperCase() === 'ARCHIVED') {
++    if (safeString(parsed.status, 'ACTIVE').toUpperCase() !== 'ACTIVE') {
+       return null;
+     }
+ 
+@@ -634,12 +635,25 @@ async function createRedisCache(redisUrl) {
+     }
+ 
+     async listProductsPage({ limit = 50, after = null, sortKey = 'updated' } = {}) {
+-      const summaries = await this.listProductSummaries();
++      let summaries = await this.listProductSummaries();
+       const pageLimit = Math.max(1, Math.min(Number(limit) || 50, 250));
+       const start = Number(after) > 0 ? Number(after) : 0;
+ 
++      if (sortKey === 'home' || sortKey === 'updated_in_stock') {
++        summaries = summaries.filter((summary) => Boolean(summary.availableForSale));
++      }
++
+       if (sortKey === 'created') {
+         summaries.sort((left, right) => String(right.id).localeCompare(String(left.id)));
++      } else if (sortKey === 'home' || sortKey === 'updated_in_stock') {
++        summaries.sort((left, right) => {
++          const stockDelta =
++            Number(Boolean(right.availableForSale)) - Number(Boolean(left.availableForSale));
++          if (stockDelta !== 0) {
++            return stockDelta;
++          }
++          return String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''));
++        });
+       } else {
+         summaries.sort((left, right) =>
+           String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''))
+@@ -821,4 +835,4 @@ async function createCatalogCache() {
+ module.exports = {
+   createCatalogCache,
+   createRedisCache,
+-};
+\ No newline at end of file
++};
+diff --git a/catalog/index.js b/catalog/index.js
+index 9a1bdb4..88afb69 100644
+--- a/catalog/index.js
++++ b/catalog/index.js
+@@ -1,7 +1,11 @@
+ const { createCatalogCache } = require('./cache/redis-cache');
+ const { createCatalogRouter, mountCatalogSyncRoutes } = require('./routes');
+ const { createWebhookRouter } = require('./webhooks');
+-const { ensureCatalogWarm } = require('./sync');
++const { ensureCatalogWarm, startBackgroundCatalogSync } = require('./sync');
++
++function isProductionEnv() {
++  return String(process.env.NODE_ENV || '').trim() === 'production';
++}
+ 
+ let catalogCachePromise = null;
+ let mountedCache = null;
+@@ -87,9 +91,16 @@ async function mountCatalog(app, { requireAdminApiKey }) {
+     catalogMounted = true;
+     catalogMountError = null;
+ 
+-    void ensureCatalogWarm(cache).then((result) => {
+-      console.log('[NOOD catalog] startup warm check', result);
+-    });
++    void (async () => {
++      if (isProductionEnv()) {
++        const result = await ensureCatalogWarm(cache);
++        console.log('[NOOD catalog] startup warm check', result);
++        return;
++      }
++
++      const syncResult = await startBackgroundCatalogSync(cache, { syncMenus: true });
++      console.log('[NOOD catalog] startup auto-sync', syncResult);
++    })();
+ 
+     return cache;
+   } catch (error) {
+diff --git a/catalog/recommendations.js b/catalog/recommendations.js
+index 20bab76..bed625c 100644
+--- a/catalog/recommendations.js
++++ b/catalog/recommendations.js
+@@ -2,7 +2,7 @@ const { shuffleProducts, safeString } = require('./transform');
+ const { resolveProductFromReference } = require('./product-lookup');
+ 
+ function getActiveProducts(products) {
+-  return products.filter((product) => safeString(product?.status).toUpperCase() !== 'ARCHIVED');
++  return products.filter((product) => safeString(product?.status, 'ACTIVE').toUpperCase() === 'ACTIVE');
+ }
+ 
+ function toRecommendationItem(product) {
+@@ -98,4 +98,4 @@ async function getProductRecommendations(cache, rawReference) {
+ 
+ module.exports = {
+   getProductRecommendations,
+-};
+\ No newline at end of file
++};
+diff --git a/catalog/routes.js b/catalog/routes.js
+index 1adf794..a508d83 100644
+--- a/catalog/routes.js
++++ b/catalog/routes.js
+@@ -34,7 +34,57 @@ function sendCatalogResponse(res, payload, source) {
+   });
+ }
+ 
++function getImageNodeUrl(node) {
++  return safeString(node?.url || node?.src || node?.image?.url || node?.previewImage?.url);
++}
++
++function getImageNodeAlt(node) {
++  return safeString(node?.altText || node?.alt || node?.image?.altText || node?.previewImage?.altText);
++}
++
++function addGalleryImage(images, seen, node) {
++  const url = getImageNodeUrl(node);
++  if (!url || seen.has(url)) {
++    return;
++  }
++
++  seen.add(url);
++  images.push({
++    id: safeString(node?.id) || url,
++    url,
++    src: url,
++    altText: getImageNodeAlt(node) || null,
++    width: node?.width ?? node?.image?.width ?? null,
++    height: node?.height ?? node?.image?.height ?? null,
++  });
++}
++
++function buildProductGalleryImages(product) {
++  const images = [];
++  const seen = new Set();
++
++  for (const edge of product?.images?.edges || []) {
++    addGalleryImage(images, seen, edge?.node);
++  }
++
++  if (!images.length) {
++    for (const edge of product?.media?.edges || []) {
++      addGalleryImage(images, seen, edge?.node);
++    }
++  }
++
++  if (!images.length) {
++    addGalleryImage(images, seen, product?.thumbnail || product?.featuredImage);
++  }
++
++  return images;
++}
++
+ function formatCachedProductDetail(product) {
++  const galleryImages = buildProductGalleryImages(product);
++  const thumbnail = galleryImages[0]?.url || safeString(product?.thumbnail?.url || product?.featuredImage?.url) || null;
++  const imagesConnection = product.images || { edges: [] };
++
+   return {
+     id: product.id,
+     title: product.title,
+@@ -44,9 +94,15 @@ function formatCachedProductDetail(product) {
+     vendor: product.vendor || '',
+     productType: product.productType || '',
+     tags: Array.isArray(product.tags) ? product.tags : [],
++    status: product.status || 'ACTIVE',
+     availableForSale: Boolean(product.availableForSale),
+     featuredImage: product.featuredImage || null,
+-    images: product.images || { edges: [] },
++    thumbnail,
++    galleryImages,
++    imageUrls: galleryImages.map((image) => image.url),
++    images: galleryImages,
++    imagesConnection,
++    shopifyImages: imagesConnection,
+     media: product.media || { edges: [] },
+     priceRange: product.priceRange || null,
+     compareAtPriceRange: product.compareAtPriceRange || { maxVariantPrice: null },
+@@ -55,13 +111,15 @@ function formatCachedProductDetail(product) {
+   };
+ }
+ 
++function isVisibleCatalogProduct(product) {
++  if (!product || !product.id || !product.handle) {
++    return false;
++  }
++  return safeString(product?.status, 'ACTIVE').toUpperCase() === 'ACTIVE';
++}
++
+ function getActiveProducts(products) {
+-  return (Array.isArray(products) ? products : []).filter((product) => {
+-    if (!product || !product.id || !product.handle) {
+-      return false;
+-    }
+-    return safeString(product?.status).toUpperCase() !== 'ARCHIVED';
+-  });
++  return (Array.isArray(products) ? products : []).filter(isVisibleCatalogProduct);
+ }
+ 
+ let searchableProductsCache = null;
+@@ -536,12 +594,12 @@ async function getOrBuildOrderedMixedHandles(cache, mixMetaRows, mixKey) {
+   return built;
+ }
+ 
+-async function loadMixedCatalogProductsPage(cache, { mixKey, limit, after }) {
++async function loadMixedCatalogProductsPage(cache, { mixKey, limit, after, inStockOnly = false }) {
+   const pageLimit = Math.max(1, Math.min(Number(limit) || 50, 250));
+   const start = Number(after) > 0 ? Number(after) : 0;
+ 
+   console.log(
+-    `[NOOD catalog] mixed feed fast path mixKey=${mixKey} after=${after ?? 'null'} limit=${pageLimit}`
++    `[NOOD catalog] mixed feed fast path mixKey=${mixKey} after=${after ?? 'null'} limit=${pageLimit} inStockOnly=${inStockOnly}`
+   );
+ 
+   const mixMetaRows = await loadMixMetaIndex(cache);
+@@ -550,36 +608,53 @@ async function loadMixedCatalogProductsPage(cache, { mixKey, limit, after }) {
+     mixMetaRows,
+     mixKey
+   );
+-  const pageHandles = orderedHandles.slice(start, start + pageLimit);
+ 
+-  console.log(`[NOOD catalog] mixed handles selected count=${pageHandles.length}`);
++  const pageProducts = [];
++  let scanIndex = start;
++  let skippedMissing = 0;
++  let skippedSoldOut = 0;
++  const batchSize = Math.max(pageLimit, COLLECTION_PRODUCTS_BATCH_SIZE);
+ 
+-  const fetchedProducts = await fetchProductsByHandles(cache, pageHandles);
+-  const productsByHandle = new Map(
+-    fetchedProducts.filter(isActiveCatalogProduct).map((product) => [product.handle, product])
+-  );
++  while (scanIndex < orderedHandles.length && pageProducts.length < pageLimit) {
++    const batchHandles = orderedHandles.slice(scanIndex, scanIndex + batchSize);
++    if (!batchHandles.length) {
++      break;
++    }
+ 
+-  let skippedMissing = 0;
+-  const pageProducts = [];
++    const fetchedProducts = await fetchProductsByHandles(cache, batchHandles);
++    const productsByHandle = new Map(
++      fetchedProducts.filter(isActiveCatalogProduct).map((product) => [product.handle, product])
++    );
+ 
+-  for (const handle of pageHandles) {
+-    const product = productsByHandle.get(safeString(handle));
+-    if (!product) {
+-      skippedMissing += 1;
+-      continue;
++    for (const handle of batchHandles) {
++      scanIndex += 1;
++      const product = productsByHandle.get(safeString(handle));
++      if (!product) {
++        skippedMissing += 1;
++        continue;
++      }
++      if (inStockOnly && !isCatalogProductInStock(product)) {
++        skippedSoldOut += 1;
++        continue;
++      }
++      pageProducts.push(product);
++      if (pageProducts.length >= pageLimit) {
++        break;
++      }
+     }
+-    pageProducts.push(product);
+   }
+ 
+   if (skippedMissing > 0) {
+     console.log(`[NOOD catalog] skipped missing mixed handles count=${skippedMissing}`);
+   }
++  if (skippedSoldOut > 0) {
++    console.log(`[NOOD catalog] skipped sold-out mixed handles count=${skippedSoldOut}`);
++  }
+ 
+-  const nextIndex = start + pageHandles.length;
+-  const hasNextPage = nextIndex < orderedHandles.length;
++  const hasNextPage = scanIndex < orderedHandles.length;
+ 
+   console.log(
+-    `[NOOD catalog] mixed products returned count=${pageProducts.length} nextCursor=${hasNextPage ? String(nextIndex) : 'null'} hasMore=${hasNextPage}`
++    `[NOOD catalog] mixed products returned count=${pageProducts.length} nextCursor=${hasNextPage ? String(scanIndex) : 'null'} hasMore=${hasNextPage}`
+   );
+ 
+   return {
+@@ -588,15 +663,20 @@ async function loadMixedCatalogProductsPage(cache, { mixKey, limit, after }) {
+     cacheHit,
+     paginate: false,
+     hasNextPage,
+-    endCursor: hasNextPage ? String(nextIndex) : null,
++    endCursor: hasNextPage ? String(scanIndex) : null,
+   };
+ }
+ 
++function isHomeInStockFeed(sortKey) {
++  return sortKey === 'home' || sortKey === 'updated_in_stock';
++}
++
+ async function loadCatalogProductsForList(cache, { mixKey, sortKey, limit, after }) {
++  const inStockOnly = isHomeInStockFeed(sortKey);
+   const hasMixKey = mixKey !== undefined && mixKey !== null && String(mixKey).length > 0;
+ 
+   if (hasMixKey) {
+-    return loadMixedCatalogProductsPage(cache, { mixKey, limit, after });
++    return loadMixedCatalogProductsPage(cache, { mixKey, limit, after, inStockOnly });
+   }
+ 
+   if (typeof cache.listProductsPage === 'function') {
+@@ -617,20 +697,44 @@ async function loadCatalogProductsForList(cache, { mixKey, sortKey, limit, after
+   }
+ 
+   const allProducts = getActiveProducts(await cache.getAllProducts());
++  const feedProducts = inStockOnly
++    ? allProducts.filter(isCatalogProductInStock)
++    : allProducts;
++
+   return {
+-    items: sortProducts(allProducts, sortKey),
+-    total: allProducts.length,
++    items: sortProducts(feedProducts, inStockOnly ? 'updated' : sortKey),
++    total: feedProducts.length,
+     cacheHit: false,
+     paginate: true,
+   };
+ }
+ 
++function isCatalogProductInStock(product) {
++  if (!isVisibleCatalogProduct(product)) {
++    return false;
++  }
++  return Boolean(product.availableForSale);
++}
++
++function compareProductsByUpdatedAt(left, right) {
++  return String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''));
++}
++
+ function sortProducts(products, sortKey = 'updated') {
+   const copy = [...products];
+   if (sortKey === 'created') {
+     return copy.sort((a, b) => String(b.id).localeCompare(String(a.id)));
+   }
+-  return copy.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
++  if (sortKey === 'home' || sortKey === 'updated_in_stock') {
++    return copy.sort((a, b) => {
++      const stockDelta = Number(isCatalogProductInStock(b)) - Number(isCatalogProductInStock(a));
++      if (stockDelta !== 0) {
++        return stockDelta;
++      }
++      return compareProductsByUpdatedAt(a, b);
++    });
++  }
++  return copy.sort(compareProductsByUpdatedAt);
+ }
+ 
+ function buildCollectionStorefront(collection, productsByHandle, first, after) {
+@@ -660,10 +764,7 @@ const COLLECTION_SEARCH_TERMS = {
+ };
+ 
+ function isActiveCatalogProduct(product) {
+-  if (!product?.id || !product?.handle) {
+-    return false;
+-  }
+-  return safeString(product?.status).toUpperCase() !== 'ARCHIVED';
++  return isVisibleCatalogProduct(product);
+ }
+ 
+ async function fetchProductsByHandles(cache, handles = []) {
+@@ -1031,12 +1132,15 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
+ 
+       let product = await safeGetProduct(cache, handle);
+ 
+-      if (!product?.handle || !product?.id) {
++      if (!isVisibleCatalogProduct(product)) {
+         console.log(`[NOOD product] cache miss handle=${handle}`);
+         try {
+           const shopifyPayload = await fetchProductDetailFromShopify(handle);
+-          if (shopifyPayload?.data?.productByHandle) {
++          if (isVisibleCatalogProduct(shopifyPayload?.data?.productByHandle)) {
+             const detail = formatCachedProductDetail(shopifyPayload.data.productByHandle);
++            if (process.env.NODE_ENV !== 'production') {
++              console.log(`Product gallery images count: ${detail.handle} ${detail.galleryImages.length}`);
++            }
+             console.log(`[NOOD product] shopify fallback handle=${handle} title=${safeString(detail.title)}`);
+             return sendCatalogResponse(
+               res,
+@@ -1062,6 +1166,9 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
+ 
+       console.log(`[NOOD product] cache hit handle=${handle} title=${safeString(product.title)}`);
+       const detail = formatCachedProductDetail(product);
++      if (process.env.NODE_ENV !== 'production') {
++        console.log(`Product gallery images count: ${detail.handle} ${detail.galleryImages.length}`);
++      }
+       console.log(`[NOOD product] detail returned handle=${handle} title=${safeString(detail.title)}`);
+ 
+       return sendCatalogResponse(
+@@ -1343,18 +1450,23 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
+   router.get('/search', async (req, res) => {
+     const startedAt = Date.now();
+     const query = safeString(req.query.q || req.query.query);
+-    const first = Number(req.query.first || 50);
++    const first = Math.max(1, Math.min(Number(req.query.first || req.query.limit || 48), 250));
++    const after = Number(req.query.after ?? req.query.offset ?? 0) || 0;
+ 
+     try {
+       const allProducts = await warmSearchableProductsCache(cache);
+       const matches = searchProducts(allProducts, query);
+-      const page = paginateListProducts(matches, first, 0);
++      const page = paginateListProducts(matches, first, after);
++      const nextOffset = page.pageInfo?.hasNextPage ? Number(page.pageInfo.endCursor) : null;
+ 
+       console.log('[NOOD catalog] GET /search', {
+         source: 'cache',
+         query,
+         returned: page.edges.length,
+         totalMatches: matches.length,
++        after,
++        nextOffset,
++        hasMore: Boolean(page.pageInfo?.hasNextPage),
+         ms: Date.now() - startedAt,
+       });
+ 
+@@ -1364,6 +1476,10 @@ function createCatalogRouter({ cache, requireAdminApiKey }) {
+           data: {
+             products: page,
+           },
++          totalMatches: matches.length,
++          nextOffset,
++          nextCursor: nextOffset,
++          hasMore: Boolean(page.pageInfo?.hasNextPage),
+         },
+         'cache'
+       );
+diff --git a/catalog/shopify.js b/catalog/shopify.js
+index 177b1ff..d45678a 100644
+--- a/catalog/shopify.js
++++ b/catalog/shopify.js
+@@ -214,14 +214,83 @@ const ADMIN_PRODUCTS_PAGE_QUERY = `
+               node {
+                 url
+                 altText
++                width
++                height
+               }
+             }
+           }
+-          variants(first: 100) {
++          media(first: 30) {
++            edges {
++              node {
++                __typename
++                mediaContentType
++                ... on MediaImage {
++                  id
++                  image {
++                    url
++                    altText
++                    width
++                    height
++                  }
++                }
++                ... on Video {
++                  id
++                  preview {
++                    image {
++                      url
++                      altText
++                      width
++                      height
++                    }
++                  }
++                  sources {
++                    url
++                    mimeType
++                    format
++                    height
++                    width
++                  }
++                }
++                ... on ExternalVideo {
++                  id
++                  embedUrl
++                  originUrl
++                  preview {
++                    image {
++                      url
++                      altText
++                      width
++                      height
++                    }
++                  }
++                }
++                ... on Model3d {
++                  id
++                  preview {
++                    image {
++                      url
++                      altText
++                      width
++                      height
++                    }
++                  }
++                  sources {
++                    url
++                    mimeType
++                    format
++                    filesize
++                  }
++                }
++              }
++            }
++          }
++          variants(first: 250) {
+             edges {
+               node {
+                 id
+                 title
++                sku
++                barcode
+                 price
+                 compareAtPrice
+                 inventoryQuantity
+@@ -271,14 +340,83 @@ const ADMIN_PRODUCT_BY_ID_QUERY = `
+           node {
+             url
+             altText
++            width
++            height
+           }
+         }
+       }
+-      variants(first: 100) {
++      media(first: 30) {
++        edges {
++          node {
++            __typename
++            mediaContentType
++            ... on MediaImage {
++              id
++              image {
++                url
++                altText
++                width
++                height
++              }
++            }
++            ... on Video {
++              id
++              preview {
++                image {
++                  url
++                  altText
++                  width
++                  height
++                }
++              }
++              sources {
++                url
++                mimeType
++                format
++                height
++                width
++              }
++            }
++            ... on ExternalVideo {
++              id
++              embedUrl
++              originUrl
++              preview {
++                image {
++                  url
++                  altText
++                  width
++                  height
++                }
++              }
++            }
++            ... on Model3d {
++              id
++              preview {
++                image {
++                  url
++                  altText
++                  width
++                  height
++                }
++              }
++              sources {
++                url
++                mimeType
++                format
++                filesize
++              }
++            }
++          }
++        }
++      }
++      variants(first: 250) {
+         edges {
+           node {
+             id
+             title
++            sku
++            barcode
+             price
+             compareAtPrice
+             inventoryQuantity
+@@ -755,4 +893,4 @@ module.exports = {
+ };
+ 
+ module.exports.fetchAdminProductsPage = fetchAdminProductsPage;
+-module.exports.fetchAdminCollectionsPage = fetchAdminCollectionsPage;
+\ No newline at end of file
++module.exports.fetchAdminCollectionsPage = fetchAdminCollectionsPage;
+diff --git a/catalog/sync.js b/catalog/sync.js
+index 158bbee..6ba7e45 100644
+--- a/catalog/sync.js
++++ b/catalog/sync.js
+@@ -639,7 +639,22 @@ function isCatalogProductCountSatisfied(productCount, shopifyProductsCount) {
+   if (!targetCount) {
+     return liveCount > 0;
+   }
+-  return liveCount >= targetCount;
++  return liveCount === targetCount;
++}
++
++function needsCatalogProductResync(productCount, shopifyProductsCount) {
++  const liveCount = Number(productCount) || 0;
++  const targetCount = Number(shopifyProductsCount) || 0;
++  if (!targetCount) {
++    return liveCount === 0;
++  }
++  return liveCount !== targetCount;
++}
++
++function hasStaleDeletedProducts(productCount, shopifyProductsCount) {
++  const liveCount = Number(productCount) || 0;
++  const targetCount = Number(shopifyProductsCount) || 0;
++  return targetCount > 0 && liveCount > targetCount;
+ }
+ 
+ async function getCatalogSyncStatus(cache) {
+@@ -865,11 +880,16 @@ async function bumpCatalogVersion(cache, reason = 'catalog-change') {
+   const current = (await cache.getMeta()) || {};
+   const nextVersion = (Number(current.catalogVersion) || 0) + 1;
+   const catalogUpdatedAt = new Date().toISOString();
+-  const meta = await cache.setMeta({
++  const meta = (await cache.setMeta({
+     catalogVersion: nextVersion,
+     catalogUpdatedAt,
+     lastCatalogChangeReason: safeString(reason),
+-  });
++  })) || {
++    ...current,
++    catalogVersion: nextVersion,
++    catalogUpdatedAt,
++    lastCatalogChangeReason: safeString(reason),
++  };
+ 
+   console.log('[NOOD catalog version] bumped', {
+     catalogVersion: meta.catalogVersion ?? nextVersion,
+@@ -1093,6 +1113,91 @@ async function syncProductByAdminId(cache, adminProductId, context = {}) {
+   });
+ }
+ 
++async function pruneProductsNotInHandleSet(cache, activeHandles) {
++  const active =
++    activeHandles instanceof Set
++      ? activeHandles
++      : new Set(
++          (Array.isArray(activeHandles) ? activeHandles : [])
++            .map((handle) => safeString(handle))
++            .filter(Boolean)
++        );
++
++  const allProducts =
++    typeof cache.getAllProducts === 'function' ? await cache.getAllProducts() : [];
++  const staleHandles = [];
++
++  for (const product of allProducts) {
++    const handle = safeString(product?.handle);
++    if (!handle || active.has(handle)) {
++      continue;
++    }
++    staleHandles.push(handle);
++  }
++
++  let removed = 0;
++  if (staleHandles.length && typeof cache.deleteProducts === 'function') {
++    removed = await cache.deleteProducts(staleHandles);
++  } else if (typeof cache.deleteProduct === 'function') {
++    for (const handle of staleHandles) {
++      const deleted = await cache.deleteProduct(handle);
++      if (deleted) {
++        removed += 1;
++      }
++    }
++  }
++
++  if (removed > 0) {
++    await invalidateDerivedCatalogCaches(cache);
++    await reconcileCollectionProductHandlesFromProducts(cache);
++    const liveProductCount = await getLiveProductCount(cache);
++    await cache.setMeta({
++      productCount: liveProductCount,
++      lastSyncAt: new Date().toISOString(),
++      source: 'shopify',
++    });
++    await bumpCatalogVersion(cache, 'prune-deleted-products');
++    console.log('[NOOD sync] pruned deleted products from cache', {
++      removed,
++      remaining: liveProductCount,
++      activeHandleCount: active.size,
++    });
++  }
++
++  return removed;
++}
++
++async function collectShopifyProductHandles() {
++  const handles = new Set();
++  let after = null;
++  let hasMore = true;
++
++  while (hasMore) {
++    const page = await fetchAdminProductsPage(after, { pageSize: 50 });
++    for (const item of page.items || []) {
++      const handle = safeString(item?.handle);
++      if (handle) {
++        handles.add(handle);
++      }
++    }
++
++    hasMore = Boolean(page.pageInfo?.hasNextPage && page.pageInfo?.endCursor);
++    after = hasMore ? safeString(page.pageInfo?.endCursor) : null;
++  }
++
++  return handles;
++}
++
++async function pruneDeletedProductsFromShopify(cache) {
++  const shopifyHandles = await collectShopifyProductHandles();
++  const removed = await pruneProductsNotInHandleSet(cache, shopifyHandles);
++  return {
++    removed,
++    shopifyHandleCount: shopifyHandles.size,
++    productCount: await getLiveProductCount(cache),
++  };
++}
++
+ async function deleteProductFromCache(cache, payload = {}) {
+   const handle = safeString(payload?.handle);
+   if (handle) {
+@@ -1182,11 +1287,16 @@ async function syncCollectionsAndMenusLight(cache) {
+ async function syncProductsPhase(cache, config, state, options = {}) {
+   const maxPages = Math.max(1, Number(options.maxPages) || 10);
+   const pageSize = Math.max(1, Number(options.pageSize) || 25);
+-  let after =
+-    options.resume && state.productCursor ? state.productCursor : null;
++  const resume = Boolean(options.resume);
++  let after = resume && state.productCursor ? state.productCursor : null;
+   let hasNextPage = true;
+   let pagesProcessed = 0;
+   let pageAttempts = 0;
++  const syncedHandles = new Set(
++    Array.isArray(state.syncedProductHandles)
++      ? state.syncedProductHandles.map((handle) => safeString(handle)).filter(Boolean)
++      : []
++  );
+ 
+   while (hasNextPage && pagesProcessed < maxPages) {
+     let pageItems = null;
+@@ -1201,6 +1311,13 @@ async function syncProductsPhase(cache, config, state, options = {}) {
+       pageItems = page.items;
+       pageInfo = page.pageInfo;
+       const savedThisPage = await saveProductPage(cache, pageItems, config);
++      for (const adminProduct of pageItems || []) {
++        const handle = safeString(adminProduct?.handle);
++        const status = safeString(adminProduct?.status, 'ACTIVE').toUpperCase();
++        if (handle && status === 'ACTIVE') {
++          syncedHandles.add(handle);
++        }
++      }
+       hasNextPage = pageInfo?.hasNextPage === true;
+       after = hasNextPage ? safeString(pageInfo?.endCursor) : null;
+       if (hasNextPage && !after) {
+@@ -1226,6 +1343,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
+         productCursor: after,
+         productsCompleted: hasNextPage === false,
+         syncedProductCount: liveProductCount,
++        syncedProductHandles: [...syncedHandles],
+         lastError: null,
+         message: null,
+         chunkPages: maxPages,
+@@ -1278,12 +1396,23 @@ async function syncProductsPhase(cache, config, state, options = {}) {
+     }
+   }
+ 
++  const completed = hasNextPage === false;
++  let prunedCount = 0;
++
++  if (completed) {
++    prunedCount = await pruneProductsNotInHandleSet(cache, syncedHandles);
++    await setSyncState(cache, {
++      syncedProductHandles: null,
++    });
++  }
++
+   return {
+     totalSaved: await getLiveProductCount(cache),
+     nextCursor: after,
+-    completed: hasNextPage === false,
++    completed,
+     paused: hasNextPage === true,
+     pagesProcessed,
++    prunedCount,
+   };
+ }
+ 
+@@ -1465,6 +1594,22 @@ async function runResumableCatalogSync(cache, options = {}) {
+ 
+   if (phase === 'completed') {
+     const counts = await getCatalogCounts(cache, { phase: 'completed' });
++
++    if (hasStaleDeletedProducts(counts.productCount, shopifyProductsCount)) {
++      const pruneResult = await pruneDeletedProductsFromShopify(cache);
++      const refreshedCounts = await getCatalogCounts(cache, { phase: 'completed' });
++      if (!needsCatalogProductResync(refreshedCounts.productCount, shopifyProductsCount)) {
++        return {
++          status: 'pruned',
++          message: `Removed ${pruneResult.removed} deleted products from cache.`,
++          productCount: refreshedCounts.productCount,
++          collectionCount: refreshedCounts.collectionCount,
++          shopifyProductsCount,
++          pruned: pruneResult.removed,
++        };
++      }
++    }
++
+     if (!isCatalogProductCountSatisfied(counts.productCount, shopifyProductsCount)) {
+       return {
+         status: 'restart_required',
+@@ -1688,7 +1833,7 @@ async function runCatalogSyncUntilComplete(cache, options = {}) {
+ 
+ async function startBackgroundCatalogSync(cache, options = {}) {
+   const state = await getSyncState(cache);
+-  const restart = Boolean(options.restart);
++  let restart = Boolean(options.restart);
+   const forceResume = parseForceResumeFlag(options.forceResume);
+   const stale = isSyncStale(state, { forceResume });
+   const chunk = resolveSyncChunkOptions(options);
+@@ -1702,22 +1847,37 @@ async function startBackgroundCatalogSync(cache, options = {}) {
+   const shopifyProductsCount = await fetchShopifyProductsCount();
+ 
+   if (state.status === 'completed' && !restart && !forceResume) {
+-    if (shopifyProductsCount && counts.productCount < shopifyProductsCount) {
++    if (hasStaleDeletedProducts(counts.productCount, shopifyProductsCount)) {
++      console.log(
++        `[NOOD sync] cache has stale deleted products cache=${counts.productCount} shopify=${shopifyProductsCount}; pruning`
++      );
++      const pruneResult = await pruneDeletedProductsFromShopify(cache);
++      counts = await getCatalogCounts(cache, { phase: 'completed' });
++
++      if (!needsCatalogProductResync(counts.productCount, shopifyProductsCount)) {
++        return {
++          status: 'pruned',
++          message: `Removed ${pruneResult.removed} deleted products from cache.`,
++          productCount: counts.productCount,
++          shopifyProductsCount,
++          pruned: pruneResult.removed,
++        };
++      }
++    }
++
++    if (needsCatalogProductResync(counts.productCount, shopifyProductsCount)) {
++      restart = true;
++      console.log(
++        `[NOOD sync] product count mismatch cache=${counts.productCount} shopify=${shopifyProductsCount}; restarting sync`
++      );
++    } else {
+       return {
+-        status: 'restart_required',
+-        message: `Catalog sync is marked completed at ${counts.productCount}/${shopifyProductsCount} Shopify products. Retry with restart=true.`,
++        status: 'already_completed',
++        message: 'Catalog sync already completed.',
+         productCount: counts.productCount,
+         shopifyProductsCount,
+-        restartAllowed: true,
+       };
+     }
+-
+-    return {
+-      status: 'already_completed',
+-      message: 'Catalog sync already completed.',
+-      productCount: counts.productCount,
+-      shopifyProductsCount,
+-    };
+   }
+ 
+   if (alreadyRunning || backgroundSyncActive) {
+@@ -1849,6 +2009,8 @@ module.exports = {
+   syncSingleProduct,
+   syncProductByAdminId,
+   deleteProductFromCache,
++  pruneDeletedProductsFromShopify,
++  pruneProductsNotInHandleSet,
+   syncCollectionByAdminId,
+   refreshAffectedCollections,
+   refreshCollectionsForHandles,
+diff --git a/catalog/transform.js b/catalog/transform.js
+index 5ea736e..6b9f30f 100644
+--- a/catalog/transform.js
++++ b/catalog/transform.js
+@@ -15,6 +15,10 @@ function toStorefrontMoney(amount, currencyCode = 'USD') {
+   return { amount: safeAmount, currencyCode: safeString(currencyCode, 'USD') };
+ }
+ 
++function isActiveProductStatus(status) {
++  return safeString(status, 'ACTIVE').toUpperCase() === 'ACTIVE';
++}
++
+ function variantAvailable(variant) {
+   const quantity = Number(variant?.inventoryQuantity ?? variant?.quantityAvailable ?? 0);
+   const policy = safeString(variant?.inventoryPolicy).toUpperCase();
+@@ -29,6 +33,8 @@ function transformAdminVariant(variant, currencyCode) {
+     title: safeString(variant?.title, 'Default Title'),
+     availableForSale: variantAvailable(variant),
+     quantityAvailable: Number(variant?.inventoryQuantity ?? 0),
++    sku: safeString(variant?.sku),
++    barcode: safeString(variant?.barcode),
+     price,
+     selectedOptions: Array.isArray(variant?.selectedOptions)
+       ? variant.selectedOptions.map((option) => ({
+@@ -39,6 +45,85 @@ function transformAdminVariant(variant, currencyCode) {
+   };
+ }
+ 
++function normalizeMediaEdge(edge, fallbackId, fallbackImageNode = null) {
++  const node = edge?.node || {};
++  const mediaType = safeString(node.__typename) || safeString(node.mediaContentType);
++  const image = node.image || null;
++  const previewImage = node.previewImage || node.preview?.image || null;
++  const sources = Array.isArray(node.sources)
++    ? node.sources.map((source) => ({
++        url: safeString(source?.url),
++        mimeType: safeString(source?.mimeType),
++        format: safeString(source?.format),
++        height: source?.height ?? null,
++        width: source?.width ?? null,
++      })).filter((source) => source.url)
++    : [];
++
++  if (mediaType === 'Video' || mediaType === 'VIDEO') {
++    return {
++      node: {
++        __typename: 'Video',
++        id: safeString(node.id, fallbackId),
++        previewImage: previewImage?.url
++          ? {
++              url: previewImage.url,
++              altText: previewImage.altText || null,
++            }
++          : null,
++        sources,
++      },
++    };
++  }
++
++  if (mediaType === 'ExternalVideo' || mediaType === 'EXTERNAL_VIDEO') {
++    return {
++      node: {
++        __typename: 'ExternalVideo',
++        id: safeString(node.id, fallbackId),
++        embedUrl: safeString(node.embedUrl),
++        originUrl: safeString(node.originUrl),
++        previewImage: previewImage?.url
++          ? {
++              url: previewImage.url,
++              altText: previewImage.altText || null,
++            }
++          : null,
++      },
++    };
++  }
++
++  if (mediaType === 'Model3d' || mediaType === 'MODEL_3D') {
++    return {
++      node: {
++        __typename: 'Model3d',
++        id: safeString(node.id, fallbackId),
++        previewImage: previewImage?.url
++          ? {
++              url: previewImage.url,
++              altText: previewImage.altText || null,
++            }
++          : null,
++        sources,
++      },
++    };
++  }
++
++  const mediaImage = image || fallbackImageNode;
++  return {
++    node: {
++      __typename: 'MediaImage',
++      id: safeString(node.id, fallbackId),
++      image: {
++        url: safeString(mediaImage?.url),
++        altText: mediaImage?.altText || null,
++        width: mediaImage?.width ?? null,
++        height: mediaImage?.height ?? null,
++      },
++    },
++  };
++}
++
+ function transformAdminProduct(adminProduct, currencyCode = 'USD') {
+   const variants = (adminProduct?.variants?.edges || []).map((edge) =>
+     transformAdminVariant(edge?.node, currencyCode)
+@@ -66,19 +151,27 @@ function transformAdminProduct(adminProduct, currencyCode = 'USD') {
+     node: {
+       url: edge?.node?.url || '',
+       altText: edge?.node?.altText || null,
++      width: edge?.node?.width ?? null,
++      height: edge?.node?.height ?? null,
+     },
+   }));
+ 
+-  const mediaEdges = imageEdges.map((edge, index) => ({
+-    node: {
+-      __typename: 'MediaImage',
+-      id: `${adminProduct?.id || 'media'}_${index}`,
+-      image: {
+-        url: edge.node.url,
+-        altText: edge.node.altText,
+-      },
+-    },
+-  }));
++  const adminMediaEdges = (adminProduct?.media?.edges || [])
++    .map((edge, index) => normalizeMediaEdge(edge, `${adminProduct?.id || 'media'}_${index}`))
++    .filter(
++      (edge) =>
++        edge?.node?.image?.url ||
++        edge?.node?.previewImage?.url ||
++        edge?.node?.sources?.length ||
++        edge?.node?.embedUrl ||
++        edge?.node?.originUrl
++    );
++
++  const mediaEdges = adminMediaEdges.length
++    ? adminMediaEdges
++    : imageEdges.map((edge, index) =>
++        normalizeMediaEdge(null, `${adminProduct?.id || 'media'}_${index}`, edge.node)
++      );
+ 
+   const featuredImage = adminProduct?.featuredImage?.url
+     ? {
+@@ -105,7 +198,7 @@ function transformAdminProduct(adminProduct, currencyCode = 'USD') {
+     vendor: safeString(adminProduct?.vendor),
+     productType: safeString(adminProduct?.productType),
+     tags: Array.isArray(adminProduct?.tags) ? adminProduct.tags : [],
+-    status: safeString(adminProduct?.status, 'ACTIVE'),
++    status: safeString(adminProduct?.status, 'ACTIVE').toUpperCase(),
+     availableForSale: variants.some((variant) => variant.availableForSale),
+     featuredImage,
+     images: { edges: imageEdges },
+@@ -166,9 +259,8 @@ function transformStorefrontProduct(node, currencyCode = 'USD') {
+   };
+ }
+ 
+-const CACHE_MAX_IMAGES = 1;
+-const CACHE_MAX_DESCRIPTION_HTML_CHARS = 800;
+-const CACHE_MAX_VARIANTS = 20;
++const CACHE_MAX_IMAGES = 30;
++const CACHE_MAX_VARIANTS = 250;
+ 
+ function compactVariantForCache(variant) {
+   if (!variant) {
+@@ -180,6 +272,8 @@ function compactVariantForCache(variant) {
+     title: safeString(variant.title, 'Default Title'),
+     availableForSale: Boolean(variant.availableForSale),
+     quantityAvailable: Number(variant.quantityAvailable ?? variant.inventoryQuantity ?? 0),
++    sku: safeString(variant.sku),
++    barcode: safeString(variant.barcode),
+     price: variant.price || toStorefrontMoney(0, 'USD'),
+     selectedOptions: Array.isArray(variant.selectedOptions)
+       ? variant.selectedOptions.map((option) => ({
+@@ -194,8 +288,19 @@ function compactProductForCache(product) {
+   if (!product || !product.handle || !product.id) {
+     return null;
+   }
++  if (!isActiveProductStatus(product.status)) {
++    return null;
++  }
+ 
+   const imageEdges = (product?.images?.edges || []).slice(0, CACHE_MAX_IMAGES);
++  const mediaEdges = (product?.media?.edges || []).slice(0, CACHE_MAX_IMAGES).map((edge, index) =>
++    normalizeMediaEdge(edge, `${product.id || 'media'}_${index}`)
++  );
++  const normalizedMediaEdges = mediaEdges.length
++    ? mediaEdges
++    : imageEdges.map((edge, index) =>
++        normalizeMediaEdge(null, `${product.id || 'media'}_${index}`, edge?.node)
++      );
+   const collectionEdges = product?.collections?.edges || [];
+   const collectionHandles = Array.isArray(product.collectionHandles) && product.collectionHandles.length
+     ? product.collectionHandles
+@@ -212,18 +317,16 @@ function compactProductForCache(product) {
+     id: product.id,
+     title: product.title,
+     handle: product.handle,
+-    descriptionHtml: safeString(product.descriptionHtml).slice(0, CACHE_MAX_DESCRIPTION_HTML_CHARS),
+-    description: stripHtml(product.descriptionHtml || product.description || '').slice(
+-      0,
+-      CACHE_MAX_DESCRIPTION_HTML_CHARS
+-    ),
++    descriptionHtml: safeString(product.descriptionHtml),
++    description: stripHtml(product.descriptionHtml || product.description || ''),
+     vendor: safeString(product.vendor),
+     productType: safeString(product.productType),
+     tags: Array.isArray(product.tags) ? product.tags.slice(0, 20) : [],
+-    status: safeString(product.status, 'ACTIVE'),
++    status: safeString(product.status, 'ACTIVE').toUpperCase(),
+     availableForSale: Boolean(product.availableForSale),
+     featuredImage: product.featuredImage || null,
+     images: { edges: imageEdges },
++    media: { edges: normalizedMediaEdges },
+     priceRange: product.priceRange || {
+       minVariantPrice: toStorefrontMoney(0, 'USD'),
+     },
+@@ -354,24 +457,203 @@ function paginateListProducts(items, first, after) {
+   };
+ }
+ 
++function normalizeSearchText(value) {
++  return safeString(value).toLowerCase().replace(/\s+/g, ' ').trim();
++}
++
++function compactSearchToken(value) {
++  return normalizeSearchText(value).replace(/[^a-z0-9]+/g, '');
++}
++
++function getSearchVariantNodes(product) {
++  return (product?.variants?.edges || []).map((edge) => edge?.node).filter(Boolean);
++}
++
++function buildProductSearchIndex(product) {
++  const parts = [
++    product.title,
++    product.handle,
++    product.vendor,
++    product.productType,
++    product.description,
++    ...(Array.isArray(product.tags) ? product.tags : []),
++    ...(Array.isArray(product.collectionHandles) ? product.collectionHandles : []),
++  ];
++
++  for (const collectionEdge of product?.collections?.edges || []) {
++    parts.push(collectionEdge?.node?.title);
++    parts.push(collectionEdge?.node?.handle);
++  }
++
++  for (const variant of getSearchVariantNodes(product)) {
++    parts.push(variant.title);
++    parts.push(variant.sku);
++    parts.push(variant.barcode);
++    for (const option of variant.selectedOptions || []) {
++      parts.push(option?.name);
++      parts.push(option?.value);
++    }
++  }
++
++  const text = parts.map((part) => safeString(part)).filter(Boolean).join(' ');
++  const normalized = normalizeSearchText(text);
++  const compact = compactSearchToken(text);
++
++  return {
++    text: normalized,
++    compact,
++    title: normalizeSearchText(product.title),
++    titleCompact: compactSearchToken(product.title),
++    handle: normalizeSearchText(product.handle),
++    handleCompact: compactSearchToken(product.handle),
++    description: normalizeSearchText(product.description),
++    product,
++  };
++}
++
++function searchTokenMatchesIndex(token, index) {
++  if (!token) {
++    return true;
++  }
++
++  const compactToken = compactSearchToken(token);
++  const words = index.text.split(' ').filter(Boolean);
++
++  if (token.length === 1) {
++    return (
++      index.text.includes(token) ||
++      index.compact.includes(compactToken) ||
++      index.title.startsWith(token) ||
++      index.titleCompact.startsWith(compactToken) ||
++      index.handle.startsWith(token) ||
++      index.handleCompact.startsWith(compactToken) ||
++      words.some((word) => word.startsWith(token))
++    );
++  }
++
++  return (
++    index.text.includes(token) ||
++    index.compact.includes(compactToken) ||
++    words.some((word) => word.startsWith(token) || word.includes(token))
++  );
++}
++
++function scoreSearchMatch(index, query) {
++  const normalizedQuery = normalizeSearchText(query);
++  const queryCompact = compactSearchToken(query);
++  const tokens = normalizedQuery.split(' ').filter(Boolean);
++
++  if (!tokens.length) {
++    return 0;
++  }
++
++  if (!tokens.every((token) => searchTokenMatchesIndex(token, index))) {
++    return 0;
++  }
++
++  let score = 0;
++  const { title, titleCompact, handle, handleCompact, description, text, compact, product } = index;
++
++  if (title === normalizedQuery || titleCompact === queryCompact) {
++    score += 10000;
++  }
++  if (handle === normalizedQuery || handleCompact === queryCompact) {
++    score += 9500;
++  }
++
++  if (title.startsWith(normalizedQuery) || titleCompact.startsWith(queryCompact)) {
++    score += 5000;
++  }
++
++  if (tokens.length === 1) {
++    const token = tokens[0];
++    const tokenCompact = compactSearchToken(token);
++    if (title.startsWith(token) || titleCompact.startsWith(tokenCompact)) {
++      score += 4500;
++    }
++    if (handle.startsWith(token) || handleCompact.startsWith(tokenCompact)) {
++      score += 4200;
++    }
++  }
++
++  if (title.includes(normalizedQuery) || titleCompact.includes(queryCompact)) {
++    score += 3000;
++  }
++
++  if (text.includes(normalizedQuery) || compact.includes(queryCompact)) {
++    score += 1200;
++  }
++
++  if (tokens.every((token) => title.includes(token) || titleCompact.includes(compactSearchToken(token)))) {
++    score += 2000;
++  }
++
++  for (const variant of getSearchVariantNodes(product)) {
++    const variantTitle = normalizeSearchText(variant.title);
++    const variantCompact = compactSearchToken(variant.title);
++    if (tokens.some((token) => variantTitle.includes(token) || variantCompact.includes(compactSearchToken(token)))) {
++      score += 800;
++    }
++
++    for (const option of variant.selectedOptions || []) {
++      const optionName = normalizeSearchText(option?.name);
++      const optionValue = normalizeSearchText(option?.value);
++      if (
++        tokens.some(
++          (token) => optionName.includes(token) || optionValue.includes(token)
++        )
++      ) {
++        score += 600;
++      }
++    }
++
++    const sku = normalizeSearchText(variant.sku);
++    const barcode = normalizeSearchText(variant.barcode);
++    if (tokens.some((token) => (sku && sku.includes(token)) || (barcode && barcode.includes(token)))) {
++      score += 700;
++    }
++  }
++
++  const tags = (Array.isArray(product.tags) ? product.tags : []).map((tag) => normalizeSearchText(tag));
++  const collections = (Array.isArray(product.collectionHandles) ? product.collectionHandles : []).map(
++    (handleValue) => normalizeSearchText(handleValue)
++  );
++
++  if (tokens.some((token) => tags.some((tag) => tag.includes(token)))) {
++    score += 400;
++  }
++  if (tokens.some((token) => collections.some((collection) => collection.includes(token)))) {
++    score += 350;
++  }
++
++  const matchedInTitle = tokens.some((token) => title.includes(token) || titleCompact.includes(compactSearchToken(token)));
++  const matchedInDescriptionOnly =
++    tokens.every((token) => description.includes(token)) && !matchedInTitle;
++
++  if (matchedInDescriptionOnly) {
++    score += 100;
++  } else {
++    score += 50;
++  }
++
++  return score;
++}
++
+ function searchProducts(products, query) {
+-  const needle = safeString(query).toLowerCase();
+-  if (!needle) return products;
+-
+-  return products.filter((product) => {
+-    const haystack = [
+-      product.title,
+-      product.handle,
+-      product.vendor,
+-      product.productType,
+-      product.description,
+-      ...(product.tags || []),
+-      ...(product.collectionHandles || []),
+-    ]
+-      .join(' ')
+-      .toLowerCase();
+-    return haystack.includes(needle);
+-  });
++  const trimmed = safeString(query);
++  if (!trimmed) {
++    return Array.isArray(products) ? products : [];
++  }
++
++  return (Array.isArray(products) ? products : [])
++    .map((product) => {
++      const index = buildProductSearchIndex(product);
++      const score = scoreSearchMatch(index, trimmed);
++      return score > 0 ? { product, score } : null;
++    })
++    .filter(Boolean)
++    .sort((left, right) => right.score - left.score)
++    .map((entry) => entry.product);
+ }
+ 
+ function shuffleProducts(products, seed) {
+@@ -402,4 +684,4 @@ module.exports = {
+   paginateListProducts,
+   searchProducts,
+   shuffleProducts,
+-};
+\ No newline at end of file
++};
+diff --git a/server.js b/server.js
+index c54adac..cf2ebce 100644
+--- a/server.js
++++ b/server.js
+@@ -1,6 +1,7 @@
+ const path = require('path');
+ 
+ require('dotenv').config({ path: path.join(__dirname, '.env') });
++require('dotenv').config({ path: path.join(__dirname, '.env.local'), override: true });
+ 
+ const crypto = require('crypto');
+ const os = require('os');

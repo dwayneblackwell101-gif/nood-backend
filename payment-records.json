@@ -1,0 +1,236 @@
+[
+  {
+    "provider": "wipay",
+    "transactionId": "SB-61-1-order_17819985208-20260620193515",
+    "orderId": "order_1781998520873",
+    "status": "payment_received_order_review",
+    "recoveryId": "wipay_order_1781998520873_1781998568355",
+    "amount": "6.88",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2586:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1062:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2434:27"
+    },
+    "rawPayment": {
+      "order_id": "order_1781998520873",
+      "return_token": "5d201910922c098e49c9ec41535eb0b640715aa760ab282efb595df54d215c6f",
+      "status": "success",
+      "transaction_id": "SB-61-1-order_17819985208-20260620193515",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "paymentKey": "wipay:SB-61-1-order_17819985208-20260620193515",
+    "updatedAt": "2026-06-20T23:36:08.358Z",
+    "createdAt": "2026-06-20T23:36:08.358Z"
+  },
+  {
+    "provider": "wipay",
+    "transactionId": "SB-44-1-order_17819988185-20260620194012",
+    "orderId": "order_1781998818518",
+    "status": "payment_received_order_review",
+    "recoveryId": "wipay_order_1781998818518_1781998853671",
+    "amount": "6.88",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2586:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1062:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2434:27"
+    },
+    "rawPayment": {
+      "order_id": "order_1781998818518",
+      "return_token": "35bc1840faa0f7ad01600c7fe216a4cf9e910bb2411f0562017302b3191f7e31",
+      "status": "success",
+      "transaction_id": "SB-44-1-order_17819988185-20260620194012",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "paymentKey": "wipay:SB-44-1-order_17819988185-20260620194012",
+    "updatedAt": "2026-06-20T23:40:53.674Z",
+    "createdAt": "2026-06-20T23:40:53.674Z"
+  },
+  {
+    "provider": "wipay",
+    "transactionId": "SB-68-1-order_17819995210-20260620195155",
+    "orderId": "order_1781999521029",
+    "status": "payment_received_order_review",
+    "recoveryId": "wipay_order_1781999521029_1781999560066",
+    "amount": "6.88",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2586:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1062:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2434:27"
+    },
+    "rawPayment": {
+      "order_id": "order_1781999521029",
+      "return_token": "703a4bfc87c29d256255b382c5aef088cb3eec31a87fd1e4ed804153646b16a0",
+      "status": "success",
+      "transaction_id": "SB-68-1-order_17819995210-20260620195155",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "paymentKey": "wipay:SB-68-1-order_17819995210-20260620195155",
+    "updatedAt": "2026-06-20T23:52:40.067Z",
+    "createdAt": "2026-06-20T23:52:40.067Z"
+  },
+  {
+    "provider": "wipay",
+    "transactionId": "SB-87-1-order_17819999819-20260620195936",
+    "orderId": "order_1781999981912",
+    "status": "payment_received_order_review",
+    "recoveryId": "wipay_order_1781999981912_1782000023630",
+    "amount": "6.88",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2586:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1062:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2434:27"
+    },
+    "rawPayment": {
+      "order_id": "order_1781999981912",
+      "return_token": "0bd843ad6690508b2c32aa3c9616559436c267558dcf5b9442e1687f4fc47922",
+      "status": "success",
+      "transaction_id": "SB-87-1-order_17819999819-20260620195936",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "paymentKey": "wipay:SB-87-1-order_17819999819-20260620195936",
+    "updatedAt": "2026-06-21T00:00:23.632Z",
+    "createdAt": "2026-06-21T00:00:23.632Z"
+  },
+  {
+    "provider": "wipay",
+    "transactionId": "SB-1-1-order_178200947395-20260620223748",
+    "orderId": "order_1782009473954",
+    "status": "payment_received_order_review",
+    "recoveryId": "wipay_order_1782009473954_1782009519317",
+    "amount": "6.88",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2586:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1062:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2434:27"
+    },
+    "rawPayment": {
+      "order_id": "order_1782009473954",
+      "return_token": "653330c12f61d31d82b3cda2833f9128e8098ffedafa9d7cf11ff1074780ada3",
+      "status": "success",
+      "transaction_id": "SB-1-1-order_178200947395-20260620223748",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "paymentKey": "wipay:SB-1-1-order_178200947395-20260620223748",
+    "updatedAt": "2026-06-21T02:38:39.319Z",
+    "createdAt": "2026-06-21T02:38:39.319Z"
+  },
+  {
+    "provider": "wipay",
+    "transactionId": "SB-63-1-checkout_17823056-20260624085447",
+    "orderId": "checkout_1782305686333_m866q0nj",
+    "status": "payment_received_order_review",
+    "recoveryId": "wipay_checkout_1782305686333_m866q0nj_1782305735790",
+    "amount": "145.00",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Access denied for orderCreate field. Required access: `write_orders` access scope. Also: This mutation is only accessible to apps authenticated using [offline tokens](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/offline-access-tokens).",
+      "statusCode": null,
+      "responseBody": null,
+      "shopifyDetails": {
+        "statusCode": 200,
+        "graphQLErrorCount": 1,
+        "firstGraphQLError": "Access denied for orderCreate field. Required access: `write_orders` access scope. Also: This mutation is only accessible to apps authenticated using [offline tokens](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/offline-access-tokens)."
+      },
+      "stack": "Error: Access denied for orderCreate field. Required access: `write_orders` access scope. Also: This mutation is only accessible to apps authenticated using [offline tokens](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/offline-access-tokens).\n    at createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3279:19)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1474:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3101:27"
+    },
+    "rawPayment": {
+      "order_id": "checkout_1782305686333_m866q0nj",
+      "return_token": "d86ba0d83c53f72f4e7d7c01ba281f3170a2a18f8f5580d7bc5fc9bc73295de6",
+      "status": "success",
+      "transaction_id": "SB-63-1-checkout_17823056-20260624085447",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "paymentKey": "wipay:SB-63-1-checkout_17823056-20260624085447",
+    "updatedAt": "2026-06-24T12:55:35.794Z",
+    "createdAt": "2026-06-24T12:55:35.794Z"
+  },
+  {
+    "provider": "wipay",
+    "transactionId": "SB-69-1-checkout_17823178-20260624121736",
+    "orderId": "checkout_1782317856437_ac4l3pba",
+    "status": "payment_received_order_review",
+    "recoveryId": "wipay_checkout_1782317856437_ac4l3pba_1782317928915",
+    "amount": "95.00",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3253:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1474:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3101:27"
+    },
+    "rawPayment": {
+      "order_id": "checkout_1782317856437_ac4l3pba",
+      "return_token": "02672e35204badfe165ba778efa734ab0364a8e79b5b7c654dc91513c2463971",
+      "status": "success",
+      "transaction_id": "SB-69-1-checkout_17823178-20260624121736",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "paymentKey": "wipay:SB-69-1-checkout_17823178-20260624121736",
+    "updatedAt": "2026-06-24T16:18:49.142Z",
+    "createdAt": "2026-06-24T16:18:49.142Z"
+  },
+  {
+    "provider": "wipay",
+    "transactionId": "SB-12-1-checkout_17823206-20260624130403",
+    "orderId": "checkout_1782320642699_b879bqlj",
+    "status": "payment_received_order_review",
+    "recoveryId": "wipay_checkout_1782320642699_b879bqlj_1782320739276",
+    "amount": "145.00",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3253:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1474:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3101:27"
+    },
+    "rawPayment": {
+      "order_id": "checkout_1782320642699_b879bqlj",
+      "return_token": "b4afcb802e44d47771636a89a6b20d0b270dd259903f690f8352b9f26176ffc5",
+      "status": "success",
+      "transaction_id": "SB-12-1-checkout_17823206-20260624130403",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "paymentKey": "wipay:SB-12-1-checkout_17823206-20260624130403",
+    "updatedAt": "2026-06-24T17:05:39.279Z",
+    "createdAt": "2026-06-24T17:05:39.279Z"
+  }
+]

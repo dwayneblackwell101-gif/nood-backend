@@ -1,0 +1,559 @@
+[
+  {
+    "recoveryId": "wipay_order_1781998520873_1781998568355",
+    "provider": "wipay",
+    "paymentMethod": "wipay",
+    "status": "payment_received_order_review",
+    "orderId": "order_1781998520873",
+    "backendOrderId": "order_1781998520873",
+    "transactionId": "SB-61-1-order_17819985208-20260620193515",
+    "paypalCaptureId": "",
+    "wipayTransactionId": "SB-61-1-order_17819985208-20260620193515",
+    "cartItems": [
+      {
+        "title": "Beats by Kim earbuds",
+        "productId": "gid://shopify/Product/8650396598356",
+        "quantity": 1,
+        "price": 6.88,
+        "currency": "TTD",
+        "variantId": "gid://shopify/ProductVariant/43978031923284",
+        "image": "https://cdn.shopify.com/s/files/1/0663/2099/0292/files/c10f0667a2b2591aa52997341b013e2f.jpg?v=1773502950",
+        "handle": "1-17",
+        "variantTitle": "Default Title"
+      }
+    ],
+    "shopifyVariantIds": [
+      "gid://shopify/ProductVariant/43978031923284"
+    ],
+    "customer": {
+      "name": "dwayne",
+      "email": "guest@nood-testing.local",
+      "phone": "18683936454"
+    },
+    "shippingAddress": {
+      "fullName": "dwayne",
+      "phone": "18683936454",
+      "address1": "rio",
+      "address2": "",
+      "city": "rio",
+      "region": "US",
+      "postalCode": "12123",
+      "notes": "",
+      "isDefault": true,
+      "id": "1781948659719",
+      "createdAt": "2026-06-20T09:44:19.719Z",
+      "updatedAt": "2026-06-20T09:44:19.719Z"
+    },
+    "amount": "6.88",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2586:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1062:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2434:27"
+    },
+    "rawReturn": {
+      "order_id": "order_1781998520873",
+      "return_token": "5d201910922c098e49c9ec41535eb0b640715aa760ab282efb595df54d215c6f",
+      "status": "success",
+      "transaction_id": "SB-61-1-order_17819985208-20260620193515",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "createdAt": "2026-06-20T23:36:08.355Z",
+    "retryCount": 0,
+    "lastRetryAt": null,
+    "shopifyOrder": null
+  },
+  {
+    "recoveryId": "wipay_order_1781998818518_1781998853671",
+    "provider": "wipay",
+    "paymentMethod": "wipay",
+    "status": "payment_received_order_review",
+    "orderId": "order_1781998818518",
+    "backendOrderId": "order_1781998818518",
+    "transactionId": "SB-44-1-order_17819988185-20260620194012",
+    "paypalCaptureId": "",
+    "wipayTransactionId": "SB-44-1-order_17819988185-20260620194012",
+    "cartItems": [
+      {
+        "title": "Beats by Kim earbuds",
+        "productId": "gid://shopify/Product/8650396598356",
+        "quantity": 1,
+        "price": 6.88,
+        "currency": "TTD",
+        "variantId": "gid://shopify/ProductVariant/43978031923284",
+        "image": "https://cdn.shopify.com/s/files/1/0663/2099/0292/files/c10f0667a2b2591aa52997341b013e2f.jpg?v=1773502950",
+        "handle": "1-17",
+        "variantTitle": "Default Title"
+      }
+    ],
+    "shopifyVariantIds": [
+      "gid://shopify/ProductVariant/43978031923284"
+    ],
+    "customer": {
+      "name": "dwayne",
+      "email": "guest@nood-testing.local",
+      "phone": "18683936454"
+    },
+    "shippingAddress": {
+      "fullName": "dwayne",
+      "phone": "18683936454",
+      "address1": "rio",
+      "address2": "",
+      "city": "rio",
+      "region": "US",
+      "postalCode": "12123",
+      "notes": "",
+      "isDefault": true,
+      "id": "1781948659719",
+      "createdAt": "2026-06-20T09:44:19.719Z",
+      "updatedAt": "2026-06-20T09:44:19.719Z"
+    },
+    "amount": "6.88",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2586:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1062:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2434:27"
+    },
+    "rawReturn": {
+      "order_id": "order_1781998818518",
+      "return_token": "35bc1840faa0f7ad01600c7fe216a4cf9e910bb2411f0562017302b3191f7e31",
+      "status": "success",
+      "transaction_id": "SB-44-1-order_17819988185-20260620194012",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "createdAt": "2026-06-20T23:40:53.671Z",
+    "retryCount": 0,
+    "lastRetryAt": null,
+    "shopifyOrder": null
+  },
+  {
+    "recoveryId": "wipay_order_1781999521029_1781999560066",
+    "provider": "wipay",
+    "paymentMethod": "wipay",
+    "status": "payment_received_order_review",
+    "orderId": "order_1781999521029",
+    "backendOrderId": "order_1781999521029",
+    "transactionId": "SB-68-1-order_17819995210-20260620195155",
+    "paypalCaptureId": "",
+    "wipayTransactionId": "SB-68-1-order_17819995210-20260620195155",
+    "cartItems": [
+      {
+        "title": "Beats by Kim earbuds",
+        "productId": "gid://shopify/Product/8650396598356",
+        "quantity": 1,
+        "price": 6.88,
+        "currency": "TTD",
+        "variantId": "gid://shopify/ProductVariant/43978031923284",
+        "image": "https://cdn.shopify.com/s/files/1/0663/2099/0292/files/c10f0667a2b2591aa52997341b013e2f.jpg?v=1773502950",
+        "handle": "1-17",
+        "variantTitle": "Default Title"
+      }
+    ],
+    "shopifyVariantIds": [
+      "gid://shopify/ProductVariant/43978031923284"
+    ],
+    "customer": {
+      "name": "dwayne",
+      "email": "guest@nood-testing.local",
+      "phone": "18683936454"
+    },
+    "shippingAddress": {
+      "fullName": "dwayne",
+      "phone": "18683936454",
+      "address1": "rio",
+      "address2": "",
+      "city": "rio",
+      "region": "US",
+      "postalCode": "12123",
+      "notes": "",
+      "isDefault": true,
+      "id": "1781948659719",
+      "createdAt": "2026-06-20T09:44:19.719Z",
+      "updatedAt": "2026-06-20T09:44:19.719Z"
+    },
+    "amount": "6.88",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2586:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1062:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2434:27"
+    },
+    "rawReturn": {
+      "order_id": "order_1781999521029",
+      "return_token": "703a4bfc87c29d256255b382c5aef088cb3eec31a87fd1e4ed804153646b16a0",
+      "status": "success",
+      "transaction_id": "SB-68-1-order_17819995210-20260620195155",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "createdAt": "2026-06-20T23:52:40.066Z",
+    "retryCount": 0,
+    "lastRetryAt": null,
+    "shopifyOrder": null
+  },
+  {
+    "recoveryId": "wipay_order_1781999981912_1782000023630",
+    "provider": "wipay",
+    "paymentMethod": "wipay",
+    "status": "payment_received_order_review",
+    "orderId": "order_1781999981912",
+    "backendOrderId": "order_1781999981912",
+    "transactionId": "SB-87-1-order_17819999819-20260620195936",
+    "paypalCaptureId": "",
+    "wipayTransactionId": "SB-87-1-order_17819999819-20260620195936",
+    "cartItems": [
+      {
+        "title": "Beats by Kim earbuds",
+        "productId": "gid://shopify/Product/8650396598356",
+        "quantity": 1,
+        "price": 6.88,
+        "currency": "TTD",
+        "variantId": "gid://shopify/ProductVariant/43978031923284",
+        "image": "https://cdn.shopify.com/s/files/1/0663/2099/0292/files/c10f0667a2b2591aa52997341b013e2f.jpg?v=1773502950",
+        "handle": "1-17",
+        "variantTitle": "Default Title"
+      }
+    ],
+    "shopifyVariantIds": [
+      "gid://shopify/ProductVariant/43978031923284"
+    ],
+    "customer": {
+      "name": "dwayne",
+      "email": "guest@nood-testing.local",
+      "phone": "18683936454"
+    },
+    "shippingAddress": {
+      "fullName": "dwayne",
+      "phone": "18683936454",
+      "address1": "rio",
+      "address2": "",
+      "city": "rio",
+      "region": "US",
+      "postalCode": "12123",
+      "notes": "",
+      "isDefault": true,
+      "id": "1781948659719",
+      "createdAt": "2026-06-20T09:44:19.719Z",
+      "updatedAt": "2026-06-20T09:44:19.719Z"
+    },
+    "amount": "6.88",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2586:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1062:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2434:27"
+    },
+    "rawReturn": {
+      "order_id": "order_1781999981912",
+      "return_token": "0bd843ad6690508b2c32aa3c9616559436c267558dcf5b9442e1687f4fc47922",
+      "status": "success",
+      "transaction_id": "SB-87-1-order_17819999819-20260620195936",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "createdAt": "2026-06-21T00:00:23.631Z",
+    "retryCount": 0,
+    "lastRetryAt": null,
+    "shopifyOrder": null
+  },
+  {
+    "recoveryId": "wipay_order_1782009473954_1782009519317",
+    "provider": "wipay",
+    "paymentMethod": "wipay",
+    "status": "payment_received_order_review",
+    "orderId": "order_1782009473954",
+    "backendOrderId": "order_1782009473954",
+    "transactionId": "SB-1-1-order_178200947395-20260620223748",
+    "paypalCaptureId": "",
+    "wipayTransactionId": "SB-1-1-order_178200947395-20260620223748",
+    "cartItems": [
+      {
+        "title": "Beats by Kim earbuds",
+        "productId": "gid://shopify/Product/8650396598356",
+        "quantity": 1,
+        "price": 6.88,
+        "currency": "TTD",
+        "variantId": "gid://shopify/ProductVariant/43978031923284",
+        "image": "https://cdn.shopify.com/s/files/1/0663/2099/0292/files/c10f0667a2b2591aa52997341b013e2f.jpg?v=1773502950",
+        "handle": "1-17",
+        "variantTitle": "Default Title"
+      }
+    ],
+    "shopifyVariantIds": [
+      "gid://shopify/ProductVariant/43978031923284"
+    ],
+    "customer": {
+      "name": "dwayne",
+      "email": "guest@nood-testing.local",
+      "phone": "18683936454"
+    },
+    "shippingAddress": {
+      "fullName": "dwayne",
+      "phone": "18683936454",
+      "address1": "rio",
+      "address2": "",
+      "city": "rio",
+      "region": "US",
+      "postalCode": "12123",
+      "notes": "",
+      "isDefault": true,
+      "id": "1781948659719",
+      "createdAt": "2026-06-20T09:44:19.719Z",
+      "updatedAt": "2026-06-20T09:44:19.719Z"
+    },
+    "amount": "6.88",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2586:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1062:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:2434:27"
+    },
+    "rawReturn": {
+      "order_id": "order_1782009473954",
+      "return_token": "653330c12f61d31d82b3cda2833f9128e8098ffedafa9d7cf11ff1074780ada3",
+      "status": "success",
+      "transaction_id": "SB-1-1-order_178200947395-20260620223748",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "createdAt": "2026-06-21T02:38:39.318Z",
+    "retryCount": 0,
+    "lastRetryAt": null,
+    "shopifyOrder": null
+  },
+  {
+    "recoveryId": "wipay_checkout_1782305686333_m866q0nj_1782305735790",
+    "provider": "wipay",
+    "paymentMethod": "wipay",
+    "status": "payment_received_order_review",
+    "orderId": "checkout_1782305686333_m866q0nj",
+    "backendOrderId": "checkout_1782305686333_m866q0nj",
+    "transactionId": "SB-63-1-checkout_17823056-20260624085447",
+    "paypalCaptureId": "",
+    "wipayTransactionId": "SB-63-1-checkout_17823056-20260624085447",
+    "cartItems": [
+      {
+        "title": "FEAR OF GO ESSENTIALS",
+        "productId": "gid://shopify/Product/10222619361364",
+        "quantity": 1,
+        "price": 145,
+        "currency": "TTD",
+        "variantId": "gid://shopify/ProductVariant/47091570376788",
+        "image": "https://cdn.shopify.com/s/files/1/0663/2099/0292/files/7625003014b17920dd8d9cb03a53389f.jpg?v=1781614996",
+        "handle": "fear-of-go-essentials-167",
+        "variantTitle": "S"
+      }
+    ],
+    "shopifyVariantIds": [
+      "gid://shopify/ProductVariant/47091570376788"
+    ],
+    "customer": {
+      "name": "Dwayne",
+      "email": "guest@nood.test",
+      "phone": "18683936454"
+    },
+    "shippingAddress": {
+      "fullName": "Dwayne",
+      "phone": "18683936454",
+      "address1": "Trinidad",
+      "address2": "",
+      "city": "Rio claro",
+      "region": "Fyzo",
+      "country": "US",
+      "postalCode": "233322",
+      "notes": "",
+      "isDefault": true,
+      "id": "1782305615280",
+      "createdAt": "2026-06-24T12:53:35.280Z",
+      "updatedAt": "2026-06-24T12:53:35.280Z"
+    },
+    "amount": "145.00",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Access denied for orderCreate field. Required access: `write_orders` access scope. Also: This mutation is only accessible to apps authenticated using [offline tokens](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/offline-access-tokens).",
+      "statusCode": null,
+      "responseBody": null,
+      "shopifyDetails": {
+        "statusCode": 200,
+        "graphQLErrorCount": 1,
+        "firstGraphQLError": "Access denied for orderCreate field. Required access: `write_orders` access scope. Also: This mutation is only accessible to apps authenticated using [offline tokens](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/offline-access-tokens)."
+      },
+      "stack": "Error: Access denied for orderCreate field. Required access: `write_orders` access scope. Also: This mutation is only accessible to apps authenticated using [offline tokens](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/offline-access-tokens).\n    at createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3279:19)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1474:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3101:27"
+    },
+    "rawReturn": {
+      "order_id": "checkout_1782305686333_m866q0nj",
+      "return_token": "d86ba0d83c53f72f4e7d7c01ba281f3170a2a18f8f5580d7bc5fc9bc73295de6",
+      "status": "success",
+      "transaction_id": "SB-63-1-checkout_17823056-20260624085447",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "createdAt": "2026-06-24T12:55:35.790Z",
+    "retryCount": 0,
+    "lastRetryAt": null,
+    "shopifyOrder": null
+  },
+  {
+    "recoveryId": "wipay_checkout_1782317856437_ac4l3pba_1782317928915",
+    "provider": "wipay",
+    "paymentMethod": "wipay",
+    "status": "payment_received_order_review",
+    "orderId": "checkout_1782317856437_ac4l3pba",
+    "backendOrderId": "checkout_1782317856437_ac4l3pba",
+    "transactionId": "SB-69-1-checkout_17823178-20260624121736",
+    "paypalCaptureId": "",
+    "wipayTransactionId": "SB-69-1-checkout_17823178-20260624121736",
+    "cartItems": [
+      {
+        "title": "Prada",
+        "productId": "gid://shopify/Product/8298942726228",
+        "quantity": 1,
+        "price": 95,
+        "currency": "TTD",
+        "variantId": "gid://shopify/ProductVariant/43468840337492",
+        "image": "https://cdn.shopify.com/s/files/1/0663/2099/0292/files/97321a8ef5f077ff8c30fa06f399313c.jpg?v=1772806772",
+        "handle": "prada-21",
+        "variantTitle": "Default Title"
+      }
+    ],
+    "shopifyVariantIds": [
+      "gid://shopify/ProductVariant/43468840337492"
+    ],
+    "customer": {
+      "name": "Dwayne",
+      "email": "guest@nood.test",
+      "phone": "18683936454"
+    },
+    "shippingAddress": {
+      "fullName": "Dwayne",
+      "phone": "18683936454",
+      "address1": "Wghesh",
+      "address2": "Dhjddh",
+      "city": "San fernando",
+      "region": "Shshsh",
+      "country": "US",
+      "postalCode": "Ehsheh",
+      "notes": "",
+      "isDefault": true,
+      "id": "1782317850118",
+      "createdAt": "2026-06-24T16:17:30.118Z",
+      "updatedAt": "2026-06-24T16:17:30.118Z"
+    },
+    "amount": "95.00",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3253:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1474:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3101:27"
+    },
+    "rawReturn": {
+      "order_id": "checkout_1782317856437_ac4l3pba",
+      "return_token": "02672e35204badfe165ba778efa734ab0364a8e79b5b7c654dc91513c2463971",
+      "status": "success",
+      "transaction_id": "SB-69-1-checkout_17823178-20260624121736",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "createdAt": "2026-06-24T16:18:48.915Z",
+    "retryCount": 0,
+    "lastRetryAt": null,
+    "shopifyOrder": null
+  },
+  {
+    "recoveryId": "wipay_checkout_1782320642699_b879bqlj_1782320739276",
+    "provider": "wipay",
+    "paymentMethod": "wipay",
+    "status": "payment_received_order_review",
+    "orderId": "checkout_1782320642699_b879bqlj",
+    "backendOrderId": "checkout_1782320642699_b879bqlj",
+    "transactionId": "SB-12-1-checkout_17823206-20260624130403",
+    "paypalCaptureId": "",
+    "wipayTransactionId": "SB-12-1-checkout_17823206-20260624130403",
+    "cartItems": [
+      {
+        "title": "FEAR OF GO ESSENTIALS",
+        "productId": "gid://shopify/Product/10222619361364",
+        "quantity": 1,
+        "price": 145,
+        "currency": "TTD",
+        "variantId": "gid://shopify/ProductVariant/47091570376788",
+        "image": "https://cdn.shopify.com/s/files/1/0663/2099/0292/files/7625003014b17920dd8d9cb03a53389f.jpg?v=1781614996",
+        "handle": "fear-of-go-essentials-167",
+        "variantTitle": "S"
+      }
+    ],
+    "shopifyVariantIds": [
+      "gid://shopify/ProductVariant/47091570376788"
+    ],
+    "customer": {
+      "name": "Dwayne",
+      "email": "guest@nood.test",
+      "phone": "18683936454"
+    },
+    "shippingAddress": {
+      "fullName": "Dwayne",
+      "phone": "18683936454",
+      "address1": "Trinidad",
+      "address2": "",
+      "city": "Rio claro",
+      "region": "Fyzo",
+      "country": "US",
+      "postalCode": "233322",
+      "notes": "",
+      "isDefault": true,
+      "id": "1782305615280",
+      "createdAt": "2026-06-24T12:53:35.280Z",
+      "updatedAt": "2026-06-24T12:53:35.280Z"
+    },
+    "amount": "145.00",
+    "currency": "TTD",
+    "shopifyError": {
+      "message": "Request failed with status code 401",
+      "statusCode": 401,
+      "responseBody": {
+        "errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"
+      },
+      "shopifyDetails": null,
+      "stack": "AxiosError: Request failed with status code 401\n    at settle (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:1956:12)\n    at IncomingMessage.handleStreamEnd (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:3279:11)\n    at IncomingMessage.emit (node:events:521:24)\n    at endReadableNT (node:internal/streams/readable:1729:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)\n    at Axios.request (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\node_modules\\axios\\dist\\node\\axios.cjs:4339:41)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async createShopifyOrder (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3253:20)\n    at async createShopifyOrderFromPaidPayment (C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:1474:26)\n    at async C:\\Users\\Shellson\\Desktop\\nood-backend-20260425T114250Z-3-001\\nood-backend\\server.js:3101:27"
+    },
+    "rawReturn": {
+      "order_id": "checkout_1782320642699_b879bqlj",
+      "return_token": "b4afcb802e44d47771636a89a6b20d0b270dd259903f690f8352b9f26176ffc5",
+      "status": "success",
+      "transaction_id": "SB-12-1-checkout_17823206-20260624130403",
+      "nood_webview_success": "1",
+      "return_json": "1"
+    },
+    "createdAt": "2026-06-24T17:05:39.276Z",
+    "retryCount": 0,
+    "lastRetryAt": null,
+    "shopifyOrder": null
+  }
+]
