@@ -59,6 +59,10 @@ const {
   getShopifyConfig,
   adminGraphql,
   STOREFRONT_MENU_QUERY,
+  fetchRemainingImages,
+  fetchRemainingMedia,
+  fetchRemainingVariants,
+  fetchRemainingVariantMedia,
 } = shopify;
 const { transformAdminProduct, compactProductForCache, safeString } = require('./transform');
 const { clearMixedFeedCache } = require('./feed-mix');
@@ -77,7 +81,7 @@ const DEFAULT_MENU_HANDLES = [
 const SYNC_STALE_MS = 3 * 60 * 1000;
 const INTER_PAGE_DELAY_MS = 400;
 const AUTO_RESUME_DELAY_MS = 750;
-const MAX_CHUNK_PAGES = 50;
+const MAX_CHUNK_PAGES = 250;
 const MAX_PAGE_SIZE = 50;
 const CHUNK_COMPLETE_MESSAGE = 'chunk complete, resume required';
 let activeSyncPromise = null;
@@ -87,8 +91,8 @@ function isProductionEnv() {
 }
 
 function resolveSyncChunkOptions(options = {}) {
-  const defaultPages = isProductionEnv() ? 10 : 10;
-  const defaultPageSize = isProductionEnv() ? 25 : 25;
+  const defaultPages = isProductionEnv() ? 250 : 250;
+  const defaultPageSize = isProductionEnv() ? 50 : 50;
   const pages = Math.min(
     MAX_CHUNK_PAGES,
     Math.max(1, Number(options.pages ?? options.maxPages) || defaultPages)
@@ -168,7 +172,7 @@ async function fetchShopifyProductsCount() {
     const payload = await adminGraphql(
       `
         query NoodProductsCount {
-          productsCount {
+          productsCount(query: "status:active") {
             count
           }
         }
@@ -754,6 +758,64 @@ async function saveProductPage(cache, adminProducts, config) {
   let saved = 0;
 
   for (const adminProduct of adminProducts) {
+    // --- Enrichment: fetch remaining images/media/variants for truncated connections ---
+    try {
+      const productId = adminProduct?.id;
+
+      // Enrich images
+      if (productId && adminProduct.images?.pageInfo?.hasNextPage && adminProduct.images?.pageInfo?.endCursor) {
+        const remaining = await fetchRemainingImages(productId, adminProduct.images.pageInfo.endCursor);
+        if (remaining.length) {
+          adminProduct.images.edges = [...(adminProduct.images.edges || []), ...remaining];
+        }
+      }
+
+      // Enrich media
+      if (productId && adminProduct.media?.pageInfo?.hasNextPage && adminProduct.media?.pageInfo?.endCursor) {
+        const remaining = await fetchRemainingMedia(productId, adminProduct.media.pageInfo.endCursor);
+        if (remaining.length) {
+          adminProduct.media.edges = [...(adminProduct.media.edges || []), ...remaining];
+        }
+      }
+
+      // Enrich variants
+      if (productId && adminProduct.variants?.pageInfo?.hasNextPage && adminProduct.variants?.pageInfo?.endCursor) {
+        const remaining = await fetchRemainingVariants(productId, adminProduct.variants.pageInfo.endCursor);
+        if (remaining.length) {
+          adminProduct.variants.edges = [...(adminProduct.variants.edges || []), ...remaining];
+        }
+      }
+
+      // Enrich variant-level media for variants whose media was truncated
+      if (productId && Array.isArray(adminProduct.variants?.edges)) {
+        const variantsNeedingMedia = adminProduct.variants.edges.filter(
+          (vEdge) => vEdge?.node?.media?.pageInfo?.hasNextPage
+        );
+        if (variantsNeedingMedia.length) {
+          const followUpEdges = await fetchRemainingVariantMedia(productId);
+          // followUpEdges contains variants with their full media; merge by variant id
+          const variantMediaMap = new Map();
+          for (const fEdge of followUpEdges) {
+            const vId = fEdge?.node?.id;
+            if (vId && fEdge?.node?.media?.edges?.length) {
+              variantMediaMap.set(vId, fEdge.node.media.edges);
+            }
+          }
+          for (const vEdge of adminProduct.variants.edges) {
+            const vId = vEdge?.node?.id;
+            const extraMedia = variantMediaMap.get(vId);
+            if (extraMedia && vEdge?.node?.media?.edges) {
+              vEdge.node.media.edges = [...vEdge.node.media.edges, ...extraMedia];
+            }
+          }
+        }
+      }
+    } catch (enrichErr) {
+      console.warn('[NOOD sync] enrichment follow-up failed for product:', adminProduct?.handle, enrichErr.message);
+      // Continue with partial data rather than failing the entire page
+    }
+    // --- End enrichment ---
+
     const product = compactProductForCache(
       transformAdminProduct(adminProduct, config.catalogCurrencyCode || config.currencyCode)
     );

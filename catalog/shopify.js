@@ -209,7 +209,7 @@ const ADMIN_PRODUCTS_PAGE_QUERY = `
             width
             height
           }
-          images(first: 250) {
+          images(first: 10) {
             edges {
               node {
                 url
@@ -218,8 +218,9 @@ const ADMIN_PRODUCTS_PAGE_QUERY = `
                 height
               }
             }
+            pageInfo { hasNextPage endCursor }
           }
-          media(first: 250) {
+          media(first: 5) {
             edges {
               node {
                 __typename
@@ -283,8 +284,9 @@ const ADMIN_PRODUCTS_PAGE_QUERY = `
                 }
               }
             }
+            pageInfo { hasNextPage endCursor }
           }
-          variants(first: 250) {
+          variants(first: 50) {
             edges {
               node {
                 id
@@ -299,7 +301,7 @@ const ADMIN_PRODUCTS_PAGE_QUERY = `
                   name
                   value
                 }
-                media(first: 10) {
+                media(first: 5) {
                   edges {
                     node {
                       __typename
@@ -314,9 +316,11 @@ const ADMIN_PRODUCTS_PAGE_QUERY = `
                       }
                     }
                   }
+                  pageInfo { hasNextPage endCursor }
                 }
               }
             }
+            pageInfo { hasNextPage endCursor }
           }
           collections(first: 20) {
             edges {
@@ -351,7 +355,7 @@ const ADMIN_PRODUCT_BY_ID_QUERY = `
         width
         height
       }
-      images(first: 250) {
+      images(first: 10) {
         edges {
           node {
             url
@@ -360,8 +364,9 @@ const ADMIN_PRODUCT_BY_ID_QUERY = `
             height
           }
         }
+        pageInfo { hasNextPage endCursor }
       }
-      media(first: 250) {
+      media(first: 5) {
         edges {
           node {
             __typename
@@ -425,8 +430,9 @@ const ADMIN_PRODUCT_BY_ID_QUERY = `
             }
           }
         }
+        pageInfo { hasNextPage endCursor }
       }
-      variants(first: 250) {
+      variants(first: 50) {
         edges {
           node {
             id
@@ -441,7 +447,7 @@ const ADMIN_PRODUCT_BY_ID_QUERY = `
               name
               value
             }
-            media(first: 10) {
+            media(first: 5) {
               edges {
                 node {
                   __typename
@@ -456,9 +462,11 @@ const ADMIN_PRODUCT_BY_ID_QUERY = `
                   }
                 }
               }
+              pageInfo { hasNextPage endCursor }
             }
           }
         }
+        pageInfo { hasNextPage endCursor }
       }
       collections(first: 20) {
         edges {
@@ -776,6 +784,126 @@ const STOREFRONT_RECOMMENDATIONS_QUERY = `
   }
 `;
 
+const FOLLOW_UP_PAGE_SIZE = 250;
+
+const PAGINATED_IMAGES_QUERY = `
+  query PaginatedProductImages($id: ID!, $first: Int!, $after: String) {
+    product(id: $id) {
+      id
+      images(first: $first, after: $after) {
+        edges {
+          node {
+            url
+            altText
+            width
+            height
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
+const PAGINATED_MEDIA_QUERY = `
+  query PaginatedProductMedia($id: ID!, $first: Int!, $after: String) {
+    product(id: $id) {
+      id
+      media(first: $first, after: $after) {
+        edges {
+          node {
+            __typename
+            mediaContentType
+            ... on MediaImage {
+              id
+              image { url altText width height }
+            }
+            ... on Video {
+              id
+              preview { image { url altText width height } }
+              sources { url mimeType format height width }
+            }
+            ... on ExternalVideo {
+              id
+              embedUrl
+              originUrl
+              preview { image { url altText width height } }
+            }
+            ... on Model3d {
+              id
+              preview { image { url altText width height } }
+              sources { url mimeType format filesize }
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
+const PAGINATED_VARIANTS_QUERY = `
+  query PaginatedProductVariants($id: ID!, $first: Int!, $after: String) {
+    product(id: $id) {
+      id
+      variants(first: $first, after: $after) {
+        edges {
+          node {
+            id
+            title
+            sku
+            barcode
+            price
+            compareAtPrice
+            inventoryQuantity
+            inventoryPolicy
+            selectedOptions { name value }
+            media(first: 5) {
+              edges {
+                node {
+                  __typename
+                  ... on MediaImage {
+                    id
+                    image { url altText width height }
+                  }
+                }
+              }
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
+const PAGINATED_VARIANT_MEDIA_QUERY = `
+  query PaginatedVariantMedia($id: ID!, $first: Int!, $after: String) {
+    product(id: $id) {
+      id
+      variants(first: 250) {
+        edges {
+          node {
+            id
+            media(first: $first, after: $after) {
+              edges {
+                node {
+                  __typename
+                  ... on MediaImage {
+                    id
+                    image { url altText width height }
+                  }
+                }
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
 function resolvePageSize(pageSize, fallback = 25) {
   const size = Number(pageSize);
   if (!Number.isFinite(size) || size < 1) {
@@ -798,11 +926,22 @@ async function fetchAdminProductsPage(after = null, options = {}) {
     }
   );
   const connection = payload?.data?.products;
-  const edges = connection?.edges || [];
+
+  if (!connection) {
+    // Shopify returned null/undefined products — transient API issue.
+    // Throw instead of silently falling through to hasNextPage: false.
+    const errors = payload?.errors?.map((e) => e.message).join('; ') || 'unknown';
+    throw new Error(
+      `Shopify returned null products connection (errors: ${errors}). ` +
+      `This is likely a transient API issue — retrying may succeed.`
+    );
+  }
+
+  const edges = connection.edges || [];
 
   return {
     items: edges.map((edge) => edge.node).filter(Boolean),
-    pageInfo: connection?.pageInfo || { hasNextPage: false, endCursor: null },
+    pageInfo: connection.pageInfo || { hasNextPage: false, endCursor: null },
   };
 }
 
@@ -913,6 +1052,94 @@ async function fetchAllAdminCollections() {
   return collections;
 }
 
+async function fetchRemainingImages(productId, cursor) {
+  let allEdges = [];
+  let currentCursor = cursor;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const payload = await adminGraphql(PAGINATED_IMAGES_QUERY, {
+      id: productId,
+      first: FOLLOW_UP_PAGE_SIZE,
+      after: currentCursor,
+    });
+    const connection = payload?.data?.product?.images;
+    const edges = connection?.edges || [];
+    allEdges.push(...edges);
+    hasNextPage = connection?.pageInfo?.hasNextPage === true;
+    currentCursor = connection?.pageInfo?.endCursor || null;
+    if (hasNextPage && !currentCursor) break;
+  }
+
+  return allEdges;
+}
+
+async function fetchRemainingMedia(productId, cursor) {
+  let allEdges = [];
+  let currentCursor = cursor;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const payload = await adminGraphql(PAGINATED_MEDIA_QUERY, {
+      id: productId,
+      first: FOLLOW_UP_PAGE_SIZE,
+      after: currentCursor,
+    });
+    const connection = payload?.data?.product?.media;
+    const edges = connection?.edges || [];
+    allEdges.push(...edges);
+    hasNextPage = connection?.pageInfo?.hasNextPage === true;
+    currentCursor = connection?.pageInfo?.endCursor || null;
+    if (hasNextPage && !currentCursor) break;
+  }
+
+  return allEdges;
+}
+
+async function fetchRemainingVariants(productId, cursor) {
+  let allEdges = [];
+  let currentCursor = cursor;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const payload = await adminGraphql(PAGINATED_VARIANTS_QUERY, {
+      id: productId,
+      first: FOLLOW_UP_PAGE_SIZE,
+      after: currentCursor,
+    });
+    const connection = payload?.data?.product?.variants;
+    const edges = connection?.edges || [];
+    allEdges.push(...edges);
+    hasNextPage = connection?.pageInfo?.hasNextPage === true;
+    currentCursor = connection?.pageInfo?.endCursor || null;
+    if (hasNextPage && !currentCursor) break;
+  }
+
+  return allEdges;
+}
+
+async function fetchRemainingVariantMedia(productId, cursor) {
+  let allEdges = [];
+  let currentCursor = cursor;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const payload = await adminGraphql(PAGINATED_VARIANT_MEDIA_QUERY, {
+      id: productId,
+      first: FOLLOW_UP_PAGE_SIZE,
+      after: currentCursor,
+    });
+    const connection = payload?.data?.product?.variants;
+    const edges = connection?.edges || [];
+    allEdges.push(...edges);
+    hasNextPage = connection?.pageInfo?.hasNextPage === true;
+    currentCursor = connection?.pageInfo?.endCursor || null;
+    if (hasNextPage && !currentCursor) break;
+  }
+
+  return allEdges;
+}
+
 module.exports = {
   CATALOG_PRICE_CURRENCY,
   getShopifyConfig,
@@ -929,6 +1156,10 @@ module.exports = {
   STOREFRONT_COLLECTIONS_BROWSER_QUERY,
   STOREFRONT_PRODUCT_DETAIL_QUERY,
   STOREFRONT_RECOMMENDATIONS_QUERY,
+  fetchRemainingImages,
+  fetchRemainingMedia,
+  fetchRemainingVariants,
+  fetchRemainingVariantMedia,
 };
 
 module.exports.fetchAdminProductsPage = fetchAdminProductsPage;

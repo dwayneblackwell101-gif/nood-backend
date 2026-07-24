@@ -84,11 +84,11 @@ async function runSyncStatus() {
 async function runSync() {
   const restart = process.argv.includes('--restart');
   const route = restart
-    ? '/api/sync/shopify/products?restart=1&pages=50&pageSize=50'
-    : '/api/sync/shopify/products?pages=50&pageSize=50';
+    ? '/api/sync/shopify/products?restart=1&pages=250&pageSize=50'
+    : '/api/sync/shopify/products?pages=250&pageSize=50';
   const data = await requestJson('POST', route, {
     headers: getAdminHeaders(),
-    body: restart ? { restart: true, pages: 50, pageSize: 50 } : { pages: 50, pageSize: 50 },
+    body: restart ? { restart: true, pages: 250, pageSize: 50 } : { pages: 250, pageSize: 50 },
   });
   printJson(data);
 }
