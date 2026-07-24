@@ -1399,6 +1399,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
       }
       hasNextPage = pageInfo?.hasNextPage === true;
       after = hasNextPage ? safeString(pageInfo?.endCursor) : null;
+      console.log(`[NOOD sync] DIAG page=${pagesProcessed + 1} items=${pageItems?.length} hasNextPage=${hasNextPage} rawHasNextPage=${pageInfo?.hasNextPage} cursor=${after ? after.substring(0, 15) + '...' : 'null'} liveCount=${await getLiveProductCount(cache)}`);
       if (hasNextPage && !after) {
         throw new Error('Shopify products pageInfo.hasNextPage=true but endCursor is missing.');
       }
@@ -1475,6 +1476,7 @@ async function syncProductsPhase(cache, config, state, options = {}) {
     }
   }
 
+  console.log(`[NOOD sync] DIAG loop-exit hasNextPage=${hasNextPage} pagesProcessed=${pagesProcessed} maxPages=${maxPages} liveCount=${await getLiveProductCount(cache)}`);
   const completed = hasNextPage === false;
   let prunedCount = 0;
 

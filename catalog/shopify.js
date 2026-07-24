@@ -937,6 +937,16 @@ async function fetchAdminProductsPage(after = null, options = {}) {
     );
   }
 
+  if (!connection.pageInfo) {
+    console.error('[NOOD sync] DIAGNOSTIC: connection.pageInfo is falsy', {
+      hasConnection: Boolean(connection),
+      hasEdges: Boolean(connection.edges),
+      edgesLength: connection.edges?.length,
+      connectionKeys: Object.keys(connection),
+      rawPayloadKeys: Object.keys(payload?.data || {}),
+    });
+  }
+
   const edges = connection.edges || [];
 
   return {
