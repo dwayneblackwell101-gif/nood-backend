@@ -124,4 +124,77 @@ router.post('/api/notifications/send', async (req, res) => {
   }
 });
 
+/**
+ * Trigger a campaign now (for testing / manual sends).
+ * POST /api/notifications/campaign { campaign: 'daily-reward' | 'flash-live' | 'cart-nudge' | 'broadcast', title?, body?, data?, targetUserId? }
+ */
+router.post('/api/notifications/campaign', async (req, res) => {
+  const campaign = safeString(req.body?.campaign, 'broadcast');
+  const title = safeString(req.body?.title);
+  const body = safeString(req.body?.body);
+  const data = req.body?.data && typeof req.body?.data === 'object' ? req.body.data : {};
+  const targetUserId = safeString(req.body?.targetUserId);
+
+  const templates = {
+    'daily-reward': {
+      title: title || 'Your daily reward is waiting 🎁',
+      body: body || 'Claim your NOOD reward and keep your streak alive!',
+      data: { ...data, type: 'daily-reward-reminder' },
+    },
+    'flash-live': {
+      title: title || '⚡ Flash Sale LIVE',
+      body: body || 'Up to 70% off — prices go back up when the timer hits zero!',
+      data: { ...data, type: 'flash-sale', screen: 'modal' },
+    },
+    'hot-product': {
+      title: title || '🔥 HOT DROP',
+      body: body || 'A product you will love just landed. Shop it before it sells out!',
+      data: { ...data, type: 'product_promo', screen: 'home' },
+    },
+    'price-drop': {
+      title: title || '📉 Price Drop',
+      body: body || 'An item on your wishlist just dropped in price!',
+      data: { ...data, type: 'price_drop', screen: 'wishlist' },
+    },
+  };
+
+  const template = templates[campaign] || {
+    title: title || 'NOOD',
+    body: body || 'Something great is waiting for you!',
+    data: { ...data, type: 'general' },
+  };
+
+  const tokens = loadTokens();
+  let recipients = Object.values(tokens);
+  if (targetUserId) recipients = recipients.filter((t) => t.userId === targetUserId);
+
+  if (!recipients.length) {
+    return res.json({ success: false, message: 'No registered devices', sent: 0 });
+  }
+
+  const messages = recipients.map((r) => ({
+    to: r.token,
+    sound: 'default',
+    title: template.title,
+    body: template.body,
+    data: template.data,
+  }));
+
+  try {
+    const response = await axios.post(EXPO_PUSH_URL, messages, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 15000,
+    });
+    return res.json({
+      success: true,
+      sent: messages.length,
+      campaign,
+      details: response?.data?.data || [],
+    });
+  } catch (error) {
+    console.error('[PUSH] campaign send failed:', error.message);
+    return res.status(500).json({ success: false, message: 'Failed to send campaign' });
+  }
+});
+
 module.exports = { router };

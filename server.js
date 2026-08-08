@@ -1002,4 +1002,11 @@ app.listen(PORT, '0.0.0.0', () => {
   } catch (error) {
     console.error('[JOBS] notifications routes failed to mount:', error.message);
   }
+
+  // Start automated notification campaigns (Temu-style pushes)
+  try {
+    require('./jobs/notification-campaigns');
+  } catch (error) {
+    console.error('[JOBS] notification-campaigns failed to start:', error.message);
+  }
 });
