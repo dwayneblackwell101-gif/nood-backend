@@ -1009,4 +1009,27 @@ app.listen(PORT, '0.0.0.0', () => {
   } catch (error) {
     console.error('[JOBS] notification-campaigns failed to start:', error.message);
   }
+
+  // Start new-product auto-campaign ("Just dropped" pushes)
+  try {
+    require('./jobs/new-product-campaign');
+  } catch (error) {
+    console.error('[JOBS] new-product-campaign failed to start:', error.message);
+  }
+
+  // Serve the push-sender admin page at /push (self-contained copy)
+  const fs2 = require('fs');
+  const pushPagePath = path.join(__dirname, 'public-push-sender.html');
+  app.get('/push', (req, res) => {
+    try {
+      if (fs2.existsSync(pushPagePath)) {
+        res.set('Content-Type', 'text/html');
+        res.send(fs2.readFileSync(pushPagePath, 'utf8'));
+        return;
+      }
+    } catch (error) {
+      console.error('[PUSH] failed to serve page:', error.message);
+    }
+    res.status(404).send('Push sender page not found');
+  });
 });

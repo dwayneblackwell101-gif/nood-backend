@@ -7,5 +7,14 @@
     "appVersion": "",
     "createdAt": "2026-08-08T22:16:48.529Z",
     "updatedAt": "2026-08-08T22:16:48.656Z"
+  },
+  "ExponentPushToken[test-a1]": {
+    "token": "ExponentPushToken[test-a1]",
+    "platform": "android",
+    "deviceId": "",
+    "userId": "u1",
+    "appVersion": "",
+    "createdAt": "2026-08-08T23:26:44.997Z",
+    "updatedAt": "2026-08-08T23:26:44.997Z"
   }
 }

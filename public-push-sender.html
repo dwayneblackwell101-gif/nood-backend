@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NOOD — Push Notification Sender</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #1a1a2e 0%, #2b1b3a 100%);
+    min-height: 100vh;
+    padding: 24px;
+    display: flex;
+    justify-content: center;
+  }
+  .card {
+    width: 100%;
+    max-width: 480px;
+    background: #fff;
+    border-radius: 20px;
+    padding: 28px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+    height: fit-content;
+  }
+  h1 {
+    font-size: 24px;
+    font-weight: 900;
+    color: #111;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  h1 span { font-size: 26px; }
+  .subtitle {
+    color: #8a7a6f;
+    font-size: 13px;
+    margin-bottom: 20px;
+  }
+  label {
+    display: block;
+    font-size: 13px;
+    font-weight: 800;
+    color: #333;
+    margin-bottom: 6px;
+  }
+  input, textarea, select {
+    width: 100%;
+    padding: 12px 14px;
+    border: 1.5px solid #e5d9ce;
+    border-radius: 12px;
+    font-size: 15px;
+    color: #111;
+    margin-bottom: 16px;
+    background: #fbf7f2;
+    font-family: inherit;
+  }
+  input:focus, textarea:focus, select:focus {
+    outline: none;
+    border-color: #ff6a00;
+    background: #fff;
+  }
+  textarea { min-height: 80px; resize: vertical; }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 1; }
+  .send-btn {
+    width: 100%;
+    background: linear-gradient(135deg, #ff6a00, #ff8a3d);
+    border: none;
+    color: #fff;
+    font-size: 17px;
+    font-weight: 900;
+    padding: 16px;
+    border-radius: 14px;
+    cursor: pointer;
+    margin-top: 8px;
+    transition: transform 0.15s, opacity 0.15s;
+  }
+  .send-btn:hover { transform: translateY(-1px); opacity: 0.95; }
+  .send-btn:active { transform: translateY(1px); }
+  .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .result {
+    margin-top: 16px;
+    border-radius: 12px;
+    padding: 14px;
+    font-size: 13px;
+    font-weight: 600;
+    display: none;
+    line-height: 1.5;
+    word-break: break-word;
+  }
+  .result.success { display: block; background: #e0f5e8; color: #1a7a3d; border: 1px solid #b7e6c8; }
+  .result.error { display: block; background: #fdecea; color: #c0392b; border: 1px solid #f5c6c0; }
+  .note {
+    margin-top: 16px;
+    background: #fff7e6;
+    border-radius: 10px;
+    padding: 12px;
+    font-size: 12px;
+    color: #8a6a1a;
+    line-height: 1.5;
+    border: 1px solid #ffe3a8;
+  }
+  .preset {
+    display: inline-block;
+    background: #fff0e0;
+    border: 1px solid #ffd6b8;
+    color: #ff6a00;
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    margin: 0 6px 10px 0;
+    cursor: pointer;
+  }
+  .preset:hover { background: #ffe0c0; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🔔 <span>NOOD Push Sender</span></h1>
+  <div class="subtitle">Send a notification to your app right now</div>
+
+  <label>Title</label>
+  <input id="title" type="text" placeholder="e.g. 🔥 HOT DROP" />
+
+  <label>Message</label>
+  <textarea id="body" placeholder="e.g. The lace front wig everyone wants just restocked!"></textarea>
+
+  <label>Campaign type (Temu-style)</label>
+  <select id="campaign">
+    <option value="custom">✍️ Custom (type your own)</option>
+    <option value="hot-product">🔥 Hot product drop</option>
+    <option value="flash-live">⚡ Flash sale live</option>
+    <option value="price-drop">📉 Price drop</option>
+    <option value="daily-reward">🎁 Daily reward</option>
+    <option value="cart-nudge">🛒 Cart reminder</option>
+  </select>
+
+  <label>Title</label>
+  <input id="title" type="text" placeholder="e.g. 🔥 HOT DROP" />
+
+  <label>Message</label>
+  <textarea id="body" placeholder="e.g. The lace front wig everyone wants just restocked!"></textarea>
+
+  <label>Product link (optional — opens product when tapped)</label>
+  <input id="productHandle" type="text" placeholder="e.g. premium-lace-front-wig" />
+
+  <div class="row">
+    <div>
+      <label>Send to</label>
+      <select id="target">
+        <option value="all">All users</option>
+        <option value="user">One user (ID below)</option>
+      </select>
+    </div>
+    <div>
+      <label>User ID (if one user)</label>
+      <input id="userId" type="text" placeholder="profileId" />
+    </div>
+  </div>
+
+  <button class="send-btn" id="sendBtn" onclick="send()">📨 Send Notification</button>
+
+  <div class="result" id="result"></div>
+
+  <div class="note">
+    <b>How it works:</b> Your app auto-registers its push token with the backend when opened.
+    This page calls the backend's <code>/api/notifications/send</code> endpoint to push to all (or one) registered devices.
+    Make sure your phone has the Nood app open and notifications allowed.
+  </div>
+</div>
+
+<script>
+const CAMPAIGN_PRESETS = {
+  'hot-product': { title: '🔥 HOT DROP', body: 'A product you will love just landed. Shop it before it sells out!' },
+  'flash-live': { title: '⚡ Flash Sale LIVE', body: 'Up to 70% off — prices go back up when the timer hits zero!' },
+  'price-drop': { title: '📉 Price Drop', body: 'An item on your wishlist just dropped in price!' },
+  'daily-reward': { title: 'Your daily reward is waiting 🎁', body: 'Claim your NOOD reward and keep your streak alive!' },
+  'cart-nudge': { title: '🛒 Still thinking about it?', body: 'You left items in your cart — complete your order before they sell out!' },
+  'custom': { title: '', body: '' },
+};
+
+document.getElementById('campaign').addEventListener('change', function() {
+  const preset = CAMPAIGN_PRESETS[this.value];
+  if (preset) {
+    document.getElementById('title').value = preset.title;
+    document.getElementById('body').value = preset.body;
+  }
+});
+
+function fillPreset(title, body, handle) {
+  document.getElementById('title').value = title;
+  document.getElementById('body').value = body;
+  document.getElementById('productHandle').value = handle;
+}
+
+async function send() {
+  const btn = document.getElementById('sendBtn');
+  const result = document.getElementById('result');
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+
+  const campaign = document.getElementById('campaign').value;
+  const title = document.getElementById('title').value.trim() || 'NOOD';
+  const body = document.getElementById('body').value.trim();
+  const productHandle = document.getElementById('productHandle').value.trim();
+  const target = document.getElementById('target').value;
+  const userId = document.getElementById('userId').value.trim();
+
+  if (!body) {
+    showResult('Please enter a message.', false);
+    btn.disabled = false;
+    btn.textContent = '📨 Send Notification';
+    return;
+  }
+
+  const payload = {
+    campaign: campaign === 'custom' ? 'broadcast' : campaign,
+    title,
+    body,
+  };
+  if (productHandle) payload.data = { productHandle };
+  if (target === 'user' && userId) payload.targetUserId = userId;
+
+  try {
+    const res = await fetch('https://nood-backend.onrender.com/api/notifications/campaign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (data.success) {
+      showResult('✅ Sent to ' + data.sent + ' device(s). Check your phone!', true);
+    } else {
+      showResult('⚠️ ' + (data.message || 'Not sent'), false);
+    }
+  } catch (e) {
+    showResult('❌ Error: ' + e.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '📨 Send Notification';
+  }
+}
+
+function showResult(msg, ok) {
+  const r = document.getElementById('result');
+  r.textContent = msg;
+  r.className = 'result ' + (ok ? 'success' : 'error');
+}
+</script>
+</body>
+</html>
