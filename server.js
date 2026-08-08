@@ -902,6 +902,9 @@ async function createShopifyOrder({
   return result.order;
 }
 
+// Expose helpers for payment router modules (wallet + PayPal order creation).
+module.exports = { createShopifyOrder, safeString, safeMoney };
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log('============================================================');
   console.log(`  NOOD Backend running on ${BACKEND_BASE_URL}`);
@@ -976,11 +979,27 @@ app.listen(PORT, '0.0.0.0', () => {
     console.error('[JOBS] cart routes failed to mount:', error.message);
   }
 
+  // Mount payment routes (PayPal order create/capture + wallet checkout)
+  try {
+    const { router: paymentsRouter } = require('./routes/payments');
+    app.use('/', paymentsRouter);
+  } catch (error) {
+    console.error('[JOBS] payment routes failed to mount:', error.message);
+  }
+
   // Mount catalog routes (menus, etc.)
   try {
     const { router: catalogRouter } = require('./routes/catalog');
     app.use('/', catalogRouter);
   } catch (error) {
     console.error('[JOBS] catalog routes failed to mount:', error.message);
+  }
+
+  // Mount push notification routes
+  try {
+    const { router: notificationsRouter } = require('./routes/notifications');
+    app.use('/', notificationsRouter);
+  } catch (error) {
+    console.error('[JOBS] notifications routes failed to mount:', error.message);
   }
 });
