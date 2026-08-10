@@ -42,6 +42,11 @@ function safeString(value, fallback = '') {
   return String(value ?? fallback).trim();
 }
 
+/** Is this a valid Expo push token (vs a fake/test token)? */
+function isLikelyRealToken(token) {
+  return /^ExponentPushToken\[[A-Za-z0-9_-]+\]$/.test(token);
+}
+
 /** Register (or upsert) a device push token. */
 router.post('/api/notifications/register-token', (req, res) => {
   const token = safeString(req.body?.token);
@@ -50,14 +55,17 @@ router.post('/api/notifications/register-token', (req, res) => {
   }
 
   const tokens = loadTokens();
+
+  // Upsert by token — prevents duplicate records.
   tokens[token] = {
     token,
     platform: safeString(req.body?.platform, 'android'),
     deviceId: safeString(req.body?.deviceId),
     userId: safeString(req.body?.userId),
     appVersion: safeString(req.body?.appVersion),
-    createdAt: req.body?.createdAt || new Date().toISOString(),
+    createdAt: tokens[token]?.createdAt || req.body?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    test: !isLikelyRealToken(token),
   };
   saveTokens(tokens);
 
@@ -91,6 +99,9 @@ router.post('/api/notifications/send', async (req, res) => {
     recipients = recipients.filter((t) => t.userId === targetUserId);
   }
 
+  // Never send to tokens explicitly flagged as test/fake.
+  recipients = recipients.filter((t) => !t.test && isLikelyRealToken(t.token));
+
   if (!recipients.length) {
     return res.json({ success: false, message: 'No registered devices to notify', sent: 0 });
   }
@@ -111,6 +122,23 @@ router.post('/api/notifications/send', async (req, res) => {
 
     const result = response?.data;
     const status = Array.isArray(result?.data) ? result.data : [];
+
+    // Auto-remove invalid (DeviceNotRegistered) tokens so they don't accumulate.
+    if (status.length) {
+      const tokens = loadTokens();
+      let removed = 0;
+      status.forEach((entry, i) => {
+        const err = entry?.details?.error;
+        if (err === 'DeviceNotRegistered' && messages[i]?.to && tokens[messages[i].to]) {
+          delete tokens[messages[i].to];
+          removed += 1;
+        }
+      });
+      if (removed) {
+        saveTokens(tokens);
+        console.log(`[PUSH] removed ${removed} invalid token(s)`);
+      }
+    }
 
     return res.json({
       success: true,
