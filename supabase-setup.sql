@@ -9,6 +9,18 @@
 -- 1. Video feed engagement (likes, comments, shares)
 -- ─────────────────────────────────────────────
 
+-- Push notification tokens (persistent — survives Render restarts)
+create table if not exists push_tokens (
+  token text primary key,
+  platform text default 'android',
+  device_id text,
+  user_id text,
+  app_version text,
+  is_test boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 -- Per-video engagement counters
 create table if not exists video_engagement (
   video_id text primary key,

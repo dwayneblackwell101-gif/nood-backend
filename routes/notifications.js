@@ -16,59 +16,30 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const TOKENS_FILE = path.join(__dirname, '..', 'push-tokens.json');
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
-
-function loadTokens() {
-  try {
-    if (!fs.existsSync(TOKENS_FILE)) return {};
-    const raw = fs.readFileSync(TOKENS_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveTokens(tokens) {
-  try {
-    fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
-  } catch (error) {
-    console.error('[PUSH] failed to save tokens:', error.message);
-  }
-}
+const { loadTokens, upsertToken, removeToken, isLikelyRealToken } = require('../utils/push-tokens-db');
 
 function safeString(value, fallback = '') {
   return String(value ?? fallback).trim();
 }
 
-/** Is this a valid Expo push token (vs a fake/test token)? */
-function isLikelyRealToken(token) {
-  return /^ExponentPushToken\[[A-Za-z0-9_-]+\]$/.test(token);
-}
-
 /** Register (or upsert) a device push token. */
-router.post('/api/notifications/register-token', (req, res) => {
+router.post('/api/notifications/register-token', async (req, res) => {
   const token = safeString(req.body?.token);
   if (!token) {
     return res.status(400).json({ success: false, message: 'token is required' });
   }
 
-  const tokens = loadTokens();
-
-  // Upsert by token — prevents duplicate records.
-  tokens[token] = {
+  await upsertToken({
     token,
     platform: safeString(req.body?.platform, 'android'),
     deviceId: safeString(req.body?.deviceId),
     userId: safeString(req.body?.userId),
     appVersion: safeString(req.body?.appVersion),
-    createdAt: tokens[token]?.createdAt || req.body?.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    test: !isLikelyRealToken(token),
-  };
-  saveTokens(tokens);
+    createdAt: req.body?.createdAt || new Date().toISOString(),
+  });
 
+  const tokens = await loadTokens();
   return res.json({ success: true, message: 'Token registered', tokenCount: Object.keys(tokens).length });
 });
 
@@ -125,17 +96,15 @@ router.post('/api/notifications/send', async (req, res) => {
 
     // Auto-remove invalid (DeviceNotRegistered) tokens so they don't accumulate.
     if (status.length) {
-      const tokens = loadTokens();
       let removed = 0;
-      status.forEach((entry, i) => {
-        const err = entry?.details?.error;
-        if (err === 'DeviceNotRegistered' && messages[i]?.to && tokens[messages[i].to]) {
-          delete tokens[messages[i].to];
+      for (let i = 0; i < status.length; i += 1) {
+        const err = status[i]?.details?.error;
+        if (err === 'DeviceNotRegistered' && messages[i]?.to) {
+          await removeToken(messages[i].to);
           removed += 1;
         }
-      });
+      }
       if (removed) {
-        saveTokens(tokens);
         console.log(`[PUSH] removed ${removed} invalid token(s)`);
       }
     }
