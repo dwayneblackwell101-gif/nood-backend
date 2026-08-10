@@ -122,11 +122,11 @@
   <h1>🔔 <span>NOOD Push Sender</span></h1>
   <div class="subtitle">Send a notification to your app right now</div>
 
-  <label>Title</label>
-  <input id="title" type="text" placeholder="e.g. 🔥 HOT DROP" />
-
-  <label>Message</label>
-  <textarea id="body" placeholder="e.g. The lace front wig everyone wants just restocked!"></textarea>
+  <!-- Device status -->
+  <div id="deviceStatus" style="margin-bottom:16px; padding:12px; border-radius:12px; background:#f0f8ff; border:1px solid #b8d4e8; display:none;">
+    <b>Registered devices:</b> <span id="deviceCount">0</span>
+    <div id="deviceList" style="font-size:11px; color:#555; margin-top:6px; max-height:80px; overflow-y:auto;"></div>
+  </div>
 
   <label>Campaign type (Temu-style)</label>
   <select id="campaign">
@@ -196,6 +196,27 @@ function fillPreset(title, body, handle) {
   document.getElementById('productHandle').value = handle;
 }
 
+async function loadDevices() {
+  try {
+    const res = await fetch('https://nood-backend.onrender.com/api/notifications/devices');
+    const data = await res.json();
+    const countEl = document.getElementById('deviceCount');
+    const listEl = document.getElementById('deviceList');
+    const statusEl = document.getElementById('deviceStatus');
+    if (data.success) {
+      countEl.textContent = data.total;
+      listEl.innerHTML = (data.devices || []).map(d =>
+        '• ' + d.platform + (d.userId && d.userId !== 'guest' ? ' (' + d.userId + ')' : '') +
+        (d.test ? ' [test]' : '') +
+        (d.updatedAt ? ' — ' + new Date(d.updatedAt).toLocaleString() : '')
+      ).join('<br>') || 'No devices registered yet';
+      statusEl.style.display = 'block';
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
 async function send() {
   const btn = document.getElementById('sendBtn');
   const result = document.getElementById('result');
@@ -232,7 +253,13 @@ async function send() {
     });
     const data = await res.json();
     if (data.success) {
-      showResult('✅ Sent to ' + data.sent + ' device(s). Check your phone!', true);
+      let msg = '✅ Sent to ' + data.sent + ' device(s).';
+      const okCount = (data.details || []).filter(x => x.status === 'ok').length;
+      const errCount = (data.details || []).filter(x => x.status !== 'ok').length;
+      if (okCount) msg += ' ✅ ' + okCount + ' delivered';
+      if (errCount) msg += ' ⚠️ ' + errCount + ' failed';
+      showResult(msg, okCount > 0);
+      loadDevices();
     } else {
       showResult('⚠️ ' + (data.message || 'Not sent'), false);
     }
@@ -243,6 +270,9 @@ async function send() {
     btn.textContent = '📨 Send Notification';
   }
 }
+
+// Load device count on page open.
+loadDevices();
 
 function showResult(msg, ok) {
   const r = document.getElementById('result');

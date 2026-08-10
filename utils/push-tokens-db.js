@@ -66,27 +66,27 @@ async function upsertToken(entry) {
   const token = entry.token;
 
   if (supabase) {
-    try {
-      const { error } = await supabase.from('push_tokens').upsert(
-        {
-          token,
-          platform: entry.platform || 'android',
-          device_id: entry.deviceId || null,
-          user_id: entry.userId || null,
-          app_version: entry.appVersion || null,
-          is_test: !isLikelyRealToken(token),
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'token' }
-      );
-      if (error) throw error;
-      return;
-    } catch (error) {
-      console.error('[PUSH-DB] upsert failed, using JSON fallback:', error.message);
+    const { error } = await supabase.from('push_tokens').upsert(
+      {
+        token,
+        platform: entry.platform || 'android',
+        device_id: entry.deviceId || null,
+        user_id: entry.userId || null,
+        app_version: entry.appVersion || null,
+        is_test: !isLikelyRealToken(token),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'token' }
+    );
+    if (error) {
+      // Supabase is configured but the write failed — do NOT silently fall
+      // back to JSON. Let the caller know the DB write failed.
+      throw new Error(`Supabase upsert failed: ${error.message}`);
     }
+    return;
   }
 
-  // JSON fallback
+  // Supabase not configured — JSON fallback for local/dev.
   const map = loadJsonFallback();
   map[token] = {
     token,

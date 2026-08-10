@@ -30,17 +30,57 @@ router.post('/api/notifications/register-token', async (req, res) => {
     return res.status(400).json({ success: false, message: 'token is required' });
   }
 
-  await upsertToken({
-    token,
-    platform: safeString(req.body?.platform, 'android'),
-    deviceId: safeString(req.body?.deviceId),
-    userId: safeString(req.body?.userId),
-    appVersion: safeString(req.body?.appVersion),
-    createdAt: req.body?.createdAt || new Date().toISOString(),
-  });
+  const suffix = token.slice(-12);
+  console.log(`[PUSH] registration request received | suffix: ...${suffix} | platform: ${safeString(req.body?.platform, 'android')} | profileId: ${safeString(req.body?.userId, '(none)')}`);
+  console.log(`[PUSH] Supabase table: push_tokens`);
+
+  try {
+    console.log('[PUSH] database upsert started');
+    await upsertToken({
+      token,
+      platform: safeString(req.body?.platform, 'android'),
+      deviceId: safeString(req.body?.deviceId),
+      userId: safeString(req.body?.userId),
+      appVersion: safeString(req.body?.appVersion),
+      createdAt: req.body?.createdAt || new Date().toISOString(),
+    });
+    console.log('[PUSH] database upsert SUCCESS');
+  } catch (error) {
+    console.error(`[PUSH] database upsert FAILED: ${error.message}`);
+    // Do NOT report success if the DB write failed.
+    return res.status(500).json({ success: false, message: 'Database write failed', tokenSuffix: suffix });
+  }
 
   const tokens = await loadTokens();
-  return res.json({ success: true, message: 'Token registered', tokenCount: Object.keys(tokens).length });
+  console.log(`[PUSH] token registered | tokenCount: ${Object.keys(tokens).length} | suffix: ...${suffix}`);
+  return res.json({ success: true, message: 'Token registered', tokenCount: Object.keys(tokens).length, tokenSuffix: suffix });
+});
+
+/**
+ * GET /api/notifications/devices — list registered devices for the admin page.
+ * Returns a SAFE summary: no full tokens, no secrets. Includes platform,
+ * user id, timestamps, and whether the token is flagged test.
+ */
+router.get('/api/notifications/devices', async (req, res) => {
+  console.log('[PUSH ADMIN] querying registered devices');
+  console.log('[PUSH ADMIN] table: push_tokens');
+  const tokens = await loadTokens();
+  const devices = Object.values(tokens).map((t) => ({
+    id: String(t.token).slice(-8), // last 8 chars only (not the full token)
+    platform: t.platform || 'unknown',
+    userId: t.userId || 'guest',
+    appVersion: t.appVersion || '',
+    test: Boolean(t.test),
+    createdAt: t.createdAt || null,
+    updatedAt: t.updatedAt || null,
+  }));
+
+  console.log(`[PUSH ADMIN] device count: ${devices.length}`);
+  return res.json({
+    success: true,
+    total: devices.length,
+    devices,
+  });
 });
 
 /**
@@ -61,7 +101,7 @@ router.post('/api/notifications/send', async (req, res) => {
     return res.status(400).json({ success: false, message: 'body is required' });
   }
 
-  const tokens = loadTokens();
+  const tokens = await loadTokens();
   let recipients = Object.values(tokens);
 
   if (targetToken) {
@@ -161,7 +201,7 @@ router.post('/api/notifications/campaign', async (req, res) => {
     data: { ...data, type: 'general' },
   };
 
-  const tokens = loadTokens();
+  const tokens = await loadTokens();
   let recipients = Object.values(tokens);
   if (targetUserId) recipients = recipients.filter((t) => t.userId === targetUserId);
 
