@@ -1,13 +1,18 @@
 /**
  * Push token persistence — Supabase-backed (survives Render restarts).
  * Falls back to the local JSON file only when Supabase is not configured.
+ *
+ * Each installation/token stores:
+ *   token, platform, device_id, user_id, email, app_version,
+ *   is_test, is_active, last_seen_at, created_at, updated_at
  */
 
 const fs = require('fs');
 const path = require('path');
-const { supabase } = require('./supabase');
+const { supabaseAdmin } = require('./supabase-admin');
 
-const TOKENS_FILE = path.join(__dirname, '..', 'push-tokens.json');
+const TOKENS_FILE =
+  process.env.PUSH_TOKENS_FILE || path.join(__dirname, '..', 'push-tokens.json');
 
 function loadJsonFallback() {
   try {
@@ -30,15 +35,28 @@ function isLikelyRealToken(token) {
   return /^ExponentPushToken\[[A-Za-z0-9_-]+\]$/.test(token);
 }
 
-/** Load all tokens as a map keyed by token. */
-async function loadTokens() {
-  if (!supabase) return loadJsonFallback();
+/** Load all tokens as a map keyed by token (only active tokens by default). */
+async function loadTokens({ includeInactive = false } = {}) {
+  if (!supabaseAdmin) {
+    const map = loadJsonFallback();
+    if (includeInactive) return map;
+    const filtered = {};
+    for (const [key, value] of Object.entries(map)) {
+      if (value?.active !== false) filtered[key] = value;
+    }
+    return filtered;
+  }
 
   try {
-    const { data, error } = await supabase
+    let query = supabaseAdmin
       .from('push_tokens')
-      .select('token, platform, device_id, user_id, app_version, created_at, updated_at, is_test');
+      .select('token, platform, device_id, user_id, email, app_version, created_at, updated_at, last_seen_at, is_test, is_active');
 
+    if (!includeInactive) {
+      query = query.eq('is_active', true);
+    }
+
+    const { data, error } = await query;
     if (error) throw error;
 
     const map = {};
@@ -48,10 +66,13 @@ async function loadTokens() {
         platform: row.platform,
         deviceId: row.device_id,
         userId: row.user_id,
+        email: row.email,
         appVersion: row.app_version,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
+        lastSeenAt: row.last_seen_at,
         test: row.is_test,
+        active: row.is_active !== false,
       };
     }
     return map;
@@ -61,20 +82,26 @@ async function loadTokens() {
   }
 }
 
-/** Upsert a token. Returns the updated map. */
+/** Upsert a token. Idempotent — repeated registration never duplicates. */
 async function upsertToken(entry) {
   const token = entry.token;
+  if (!token) return;
 
-  if (supabase) {
-    const { error } = await supabase.from('push_tokens').upsert(
+  const now = new Date().toISOString();
+
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from('push_tokens').upsert(
       {
         token,
         platform: entry.platform || 'android',
         device_id: entry.deviceId || null,
         user_id: entry.userId || null,
+        email: entry.email || null,
         app_version: entry.appVersion || null,
         is_test: !isLikelyRealToken(token),
-        updated_at: new Date().toISOString(),
+        is_active: true,
+        last_seen_at: now,
+        updated_at: now,
       },
       { onConflict: 'token' }
     );
@@ -93,22 +120,51 @@ async function upsertToken(entry) {
     platform: entry.platform || 'android',
     deviceId: entry.deviceId || '',
     userId: entry.userId || '',
+    email: entry.email || '',
     appVersion: entry.appVersion || '',
-    createdAt: map[token]?.createdAt || entry.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    createdAt: map[token]?.createdAt || entry.createdAt || now,
+    updatedAt: now,
+    lastSeenAt: now,
     test: !isLikelyRealToken(token),
+    active: true,
   };
   saveJsonFallback(map);
 }
 
-/** Remove a token (e.g. DeviceNotRegistered cleanup). */
-async function removeToken(token) {
-  if (supabase) {
+/**
+ * Deactivate a token (e.g. DeviceNotRegistered). Keeps the row for audit,
+ * but stops it from being targeted.
+ */
+async function deactivateToken(token) {
+  if (!token) return;
+  if (supabaseAdmin) {
     try {
-      await supabase.from('push_tokens').delete().eq('token', token);
+      await supabaseAdmin
+        .from('push_tokens')
+        .update({ is_active: false, updated_at: new Date().toISOString() })
+        .eq('token', token);
       return;
     } catch (error) {
-      console.error('[PUSH-DB] remove failed, using JSON fallback:', error.message);
+      console.error('[PUSH-DB] deactivate failed:', error.message);
+    }
+  }
+  const map = loadJsonFallback();
+  if (map[token]) {
+    map[token].active = false;
+    map[token].updatedAt = new Date().toISOString();
+    saveJsonFallback(map);
+  }
+}
+
+/** Remove a token completely. */
+async function removeToken(token) {
+  if (!token) return;
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from('push_tokens').delete().eq('token', token);
+      return;
+    } catch (error) {
+      console.error('[PUSH-DB] remove failed:', error.message);
     }
   }
   const map = loadJsonFallback();
@@ -116,4 +172,4 @@ async function removeToken(token) {
   saveJsonFallback(map);
 }
 
-module.exports = { loadTokens, upsertToken, removeToken, isLikelyRealToken };
+module.exports = { loadTokens, upsertToken, removeToken, deactivateToken, isLikelyRealToken };

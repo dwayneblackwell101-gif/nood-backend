@@ -1003,18 +1003,26 @@ app.listen(PORT, '0.0.0.0', () => {
     console.error('[JOBS] notifications routes failed to mount:', error.message);
   }
 
-  // Start automated notification campaigns (Temu-style pushes)
+  // Start automated notification campaigns (Temu-style pushes with
+  // frequency control + dedupe). Replaces the old new-product-campaign job,
+  // which directly hit Expo's API — new-product pushes now fire from
+  // inventory-sync via the centralized delivery service.
   try {
-    require('./jobs/notification-campaigns');
+    const { runCampaigns } = require('./jobs/notification-campaigns');
+    const intervalMs = Number(process.env.PUSH_CAMPAIGN_INTERVAL_MINUTES || 15) * 60 * 1000;
+    setInterval(() => {
+      runCampaigns().catch((error) =>
+        console.error('[JOBS] notification-campaigns interval error:', error.message)
+      );
+    }, intervalMs);
+    setTimeout(() => {
+      runCampaigns().catch((error) =>
+        console.error('[JOBS] notification-campaigns startup error:', error.message)
+      );
+    }, 30000);
+    console.log('[JOBS] notification-campaigns engine started');
   } catch (error) {
     console.error('[JOBS] notification-campaigns failed to start:', error.message);
-  }
-
-  // Start new-product auto-campaign ("Just dropped" pushes)
-  try {
-    require('./jobs/new-product-campaign');
-  } catch (error) {
-    console.error('[JOBS] new-product-campaign failed to start:', error.message);
   }
 
   // Serve the push-sender admin page at /push (self-contained copy)

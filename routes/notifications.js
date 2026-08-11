@@ -2,28 +2,35 @@
  * Push notifications API.
  *
  * - POST /api/notifications/register-token — app registers its Expo push token
- * - POST /api/notifications/send — send a push to all (or one) registered device(s)
- *   e.g. "🔥 HOT: New product drop"
+ *   (idempotent; stores email/deviceId/userId/platform; marks last_seen_at).
+ * - GET  /api/notifications/devices   — admin: safe list of registered devices.
+ * - POST /api/notifications/send      — ADMIN: manual broadcast push.
+ * - POST /api/notifications/campaign  — ADMIN: send a named campaign.
  *
- * Tokens are stored in a JSON file (push-tokens.json) so this works without
- * Supabase. Uses Expo's push API to deliver.
+ * Tokens persist in Supabase (push_tokens) with JSON fallback — they survive
+ * Render restarts/deploys. All sends route through the centralized delivery
+ * service (utils/push-delivery.js).
+ *
+ * SECURITY: send/campaign are ADMIN-ONLY (requireAdmin middleware). There is
+ * NO unauthenticated broadcast endpoint.
  */
 
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const axios = require('axios');
+const { loadTokens, upsertToken, removeToken, deactivateToken, isLikelyRealToken } = require('../utils/push-tokens-db');
+const { requireAdmin } = require('../utils/admin-auth');
+const { sendPush, loadAllRecipients } = require('../utils/push-delivery');
+const { config, campaignPriorityOf } = require('../utils/push-config');
+const { sendCampaign } = require('../jobs/notification-campaigns');
 
 const router = express.Router();
-
-const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
-const { loadTokens, upsertToken, removeToken, isLikelyRealToken } = require('../utils/push-tokens-db');
 
 function safeString(value, fallback = '') {
   return String(value ?? fallback).trim();
 }
 
-/** Register (or upsert) a device push token. */
+// ─── Token registration ─────────────────────────────────────────────────
+
+/** Register (or upsert) a device push token. Idempotent. */
 router.post('/api/notifications/register-token', async (req, res) => {
   const token = safeString(req.body?.token);
   if (!token) {
@@ -31,69 +38,84 @@ router.post('/api/notifications/register-token', async (req, res) => {
   }
 
   const suffix = token.slice(-12);
-  console.log(`[PUSH] registration request received | suffix: ...${suffix} | platform: ${safeString(req.body?.platform, 'android')} | profileId: ${safeString(req.body?.userId, '(none)')}`);
-  console.log(`[PUSH] Supabase table: push_tokens`);
+  const platform = safeString(req.body?.platform, 'android');
+  const deviceId = safeString(req.body?.deviceId);
+  const userId = safeString(req.body?.userId);
+  const email = safeString(req.body?.email);
+  const appVersion = safeString(req.body?.appVersion);
+
+  console.log(
+    `[PUSH] registration request | suffix: ...${suffix} | platform: ${platform} | userId: ${userId || '(none)'} | email: ${email || '(none)'}`
+  );
 
   try {
-    console.log('[PUSH] database upsert started');
     await upsertToken({
       token,
-      platform: safeString(req.body?.platform, 'android'),
-      deviceId: safeString(req.body?.deviceId),
-      userId: safeString(req.body?.userId),
-      appVersion: safeString(req.body?.appVersion),
+      platform,
+      deviceId,
+      userId,
+      email,
+      appVersion,
       createdAt: req.body?.createdAt || new Date().toISOString(),
     });
-    console.log('[PUSH] database upsert SUCCESS');
+    console.log(`[PUSH] Registered token | suffix: ...${suffix} | userId: ${userId || '(guest)'}`);
   } catch (error) {
     console.error(`[PUSH] database upsert FAILED: ${error.message}`);
-    // Do NOT report success if the DB write failed.
     return res.status(500).json({ success: false, message: 'Database write failed', tokenSuffix: suffix });
   }
 
-  const tokens = await loadTokens();
-  console.log(`[PUSH] token registered | tokenCount: ${Object.keys(tokens).length} | suffix: ...${suffix}`);
-  return res.json({ success: true, message: 'Token registered', tokenCount: Object.keys(tokens).length, tokenSuffix: suffix });
+  return res.json({ success: true, message: 'Token registered', tokenSuffix: suffix });
 });
 
+// ─── Admin: device listing ──────────────────────────────────────────────
+
 /**
- * GET /api/notifications/devices — list registered devices for the admin page.
- * Returns a SAFE summary: no full tokens, no secrets. Includes platform,
- * user id, timestamps, and whether the token is flagged test.
+ * GET /api/notifications/devices — list registered devices.
+ * Returns a SAFE summary: no full tokens, no secrets.
  */
 router.get('/api/notifications/devices', async (req, res) => {
-  console.log('[PUSH ADMIN] querying registered devices');
-  console.log('[PUSH ADMIN] table: push_tokens');
-  const tokens = await loadTokens();
+  const tokens = await loadTokens({ includeInactive: true });
   const devices = Object.values(tokens).map((t) => ({
-    id: String(t.token).slice(-8), // last 8 chars only (not the full token)
+    id: String(t.token).slice(-8),
     platform: t.platform || 'unknown',
     userId: t.userId || 'guest',
+    email: t.email || '',
     appVersion: t.appVersion || '',
     test: Boolean(t.test),
+    active: t.active !== false,
     createdAt: t.createdAt || null,
     updatedAt: t.updatedAt || null,
+    lastSeenAt: t.lastSeenAt || null,
   }));
 
   console.log(`[PUSH ADMIN] device count: ${devices.length}`);
-  return res.json({
-    success: true,
-    total: devices.length,
-    devices,
-  });
+  return res.json({ success: true, total: devices.length, devices });
 });
 
+// ─── Admin: manual send ─────────────────────────────────────────────────
+
 /**
- * Send a push notification.
- * Body: { title, body, data?, targetUserId?, token? }
- * - If `token` given → send to that one device.
- * - Else if `targetUserId` given → send to all devices of that user.
- * - Else → send to ALL registered devices (broadcast).
+ * POST /api/notifications/send — manual broadcast (ADMIN ONLY).
+ *
+ * Body: {
+ *   title, body,
+ *   type?: campaign type ('broadcast' default),
+ *   route?: explicit app route,
+ *   productHandle?: open a product,
+ *   campaign?: campaign identifier (used for dedupe),
+ *   data?: extra payload,
+ *   targetUserId?: optional (structure supports audience targeting),
+ *   token?: optional single-token test send
+ * }
  */
-router.post('/api/notifications/send', async (req, res) => {
+router.post('/api/notifications/send', requireAdmin, async (req, res) => {
   const title = safeString(req.body?.title, 'NOOD');
   const body = safeString(req.body?.body);
-  const data = req.body?.data && typeof req.body?.data === 'object' ? req.body.data : {};
+  const type = safeString(req.body?.type, 'broadcast');
+  const route = safeString(req.body?.route);
+  const productHandle = safeString(req.body?.productHandle);
+  const campaign = safeString(req.body?.campaign);
+  const extraData = req.body?.data && typeof req.body?.data === 'object' ? req.body.data : {};
   const targetToken = safeString(req.body?.token);
   const targetUserId = safeString(req.body?.targetUserId);
 
@@ -101,8 +123,7 @@ router.post('/api/notifications/send', async (req, res) => {
     return res.status(400).json({ success: false, message: 'body is required' });
   }
 
-  const tokens = await loadTokens();
-  let recipients = Object.values(tokens);
+  let recipients = await loadAllRecipients();
 
   if (targetToken) {
     recipients = recipients.filter((t) => t.token === targetToken);
@@ -110,128 +131,107 @@ router.post('/api/notifications/send', async (req, res) => {
     recipients = recipients.filter((t) => t.userId === targetUserId);
   }
 
-  // Never send to tokens explicitly flagged as test/fake.
-  recipients = recipients.filter((t) => !t.test && isLikelyRealToken(t.token));
+  const data = { ...extraData };
+  if (type && !data.type) data.type = type;
+  if (route) data.route = route;
+  if (productHandle) data.productHandle = productHandle;
+  if (campaign) data.campaign = campaign;
+  if (!data.type) data.type = 'broadcast';
 
-  if (!recipients.length) {
-    return res.json({ success: false, message: 'No registered devices to notify', sent: 0 });
-  }
+  const campaignId = campaign || `manual_${type}_${Date.now().toString(36)}`;
 
-  const messages = recipients.map((r) => ({
-    to: r.token,
-    sound: 'default',
+  console.log(`[PUSH] Sending manual broadcast | type: ${type} | recipients: ${recipients.length}`);
+
+  const result = await sendPush({
+    recipients,
     title,
     body,
     data,
-  }));
+    campaignId,
+    campaignType: type,
+    dedupeKey: campaign ? `manual_${campaign}` : null,
+    frequency: { check: true },
+  });
 
-  try {
-    const response = await axios.post(EXPO_PUSH_URL, messages, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 15000,
-    });
-
-    const result = response?.data;
-    const status = Array.isArray(result?.data) ? result.data : [];
-
-    // Auto-remove invalid (DeviceNotRegistered) tokens so they don't accumulate.
-    if (status.length) {
-      let removed = 0;
-      for (let i = 0; i < status.length; i += 1) {
-        const err = status[i]?.details?.error;
-        if (err === 'DeviceNotRegistered' && messages[i]?.to) {
-          await removeToken(messages[i].to);
-          removed += 1;
-        }
-      }
-      if (removed) {
-        console.log(`[PUSH] removed ${removed} invalid token(s)`);
-      }
-    }
-
-    return res.json({
-      success: true,
-      sent: messages.length,
-      details: status,
-      message: `Notification sent to ${messages.length} device(s)`,
-    });
-  } catch (error) {
-    console.error('[PUSH] send failed:', error.message);
-    return res.status(500).json({ success: false, message: 'Failed to send notification' });
-  }
+  return res.json({
+    success: true,
+    sent: result.sent,
+    failed: result.failed,
+    skipped: result.skipped,
+    campaignId: result.campaignId,
+    message: `Notification sent to ${result.sent} device(s)`,
+  });
 });
 
+// ─── Admin: named campaign ──────────────────────────────────────────────
+
 /**
- * Trigger a campaign now (for testing / manual sends).
- * POST /api/notifications/campaign { campaign: 'daily-reward' | 'flash-live' | 'cart-nudge' | 'broadcast', title?, body?, data?, targetUserId? }
+ * POST /api/notifications/campaign — send a named campaign (ADMIN ONLY).
+ * Body: { campaign: 'daily-reward' | 'flash-live' | 'cart-nudge' |
+ *              'hot-product' | 'price-drop' | 'new_product' | 'broadcast',
+ *         title?, body?, data?, targetUserId?, productHandle? }
  */
-router.post('/api/notifications/campaign', async (req, res) => {
-  const campaign = safeString(req.body?.campaign, 'broadcast');
+router.post('/api/notifications/campaign', requireAdmin, async (req, res) => {
+  const campaignType = safeString(req.body?.campaign, 'broadcast');
   const title = safeString(req.body?.title);
   const body = safeString(req.body?.body);
-  const data = req.body?.data && typeof req.body?.data === 'object' ? req.body.data : {};
+  const extraData = req.body?.data && typeof req.body?.data === 'object' ? req.body.data : {};
   const targetUserId = safeString(req.body?.targetUserId);
+  const productHandle = safeString(req.body?.productHandle);
 
-  const templates = {
-    'daily-reward': {
-      title: title || 'Your daily reward is waiting 🎁',
-      body: body || 'Claim your NOOD reward and keep your streak alive!',
-      data: { ...data, type: 'daily-reward-reminder' },
-    },
-    'flash-live': {
-      title: title || '⚡ Flash Sale LIVE',
-      body: body || 'Up to 70% off — prices go back up when the timer hits zero!',
-      data: { ...data, type: 'flash-sale', screen: 'modal' },
-    },
-    'hot-product': {
-      title: title || '🔥 HOT DROP',
-      body: body || 'A product you will love just landed. Shop it before it sells out!',
-      data: { ...data, type: 'product_promo', screen: 'home' },
-    },
-    'price-drop': {
-      title: title || '📉 Price Drop',
-      body: body || 'An item on your wishlist just dropped in price!',
-      data: { ...data, type: 'price_drop', screen: 'wishlist' },
-    },
-  };
-
-  const template = templates[campaign] || {
-    title: title || 'NOOD',
-    body: body || 'Something great is waiting for you!',
-    data: { ...data, type: 'general' },
-  };
-
-  const tokens = await loadTokens();
-  let recipients = Object.values(tokens);
-  if (targetUserId) recipients = recipients.filter((t) => t.userId === targetUserId);
-
-  if (!recipients.length) {
-    return res.json({ success: false, message: 'No registered devices', sent: 0 });
+  let recipients = await loadAllRecipients();
+  if (targetUserId) {
+    recipients = recipients.filter((t) => t.userId === targetUserId);
   }
 
-  const messages = recipients.map((r) => ({
-    to: r.token,
-    sound: 'default',
-    title: template.title,
-    body: template.body,
-    data: template.data,
-  }));
+  console.log(`[PUSH] Sending campaign | type: ${campaignType} | recipients: ${recipients.length}`);
 
-  try {
-    const response = await axios.post(EXPO_PUSH_URL, messages, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 15000,
-    });
-    return res.json({
-      success: true,
-      sent: messages.length,
-      campaign,
-      details: response?.data?.data || [],
-    });
-  } catch (error) {
-    console.error('[PUSH] campaign send failed:', error.message);
-    return res.status(500).json({ success: false, message: 'Failed to send campaign' });
+  const result = await sendCampaign({
+    campaignType,
+    title,
+    body,
+    data: {
+      ...extraData,
+      ...(productHandle ? { productHandle, route: `/product/${productHandle}` } : {}),
+    },
+    recipients,
+    dedupeKey: targetUserId ? `campaign_${campaignType}_${targetUserId}` : null,
+  });
+
+  return res.json({
+    success: true,
+    sent: result.sent,
+    failed: result.failed,
+    skipped: result.skipped,
+    campaign: campaignType,
+    campaignId: result.campaignId,
+    message: `Campaign "${campaignType}" sent to ${result.sent} device(s)`,
+  });
+});
+
+// ─── Admin: token cleanup ───────────────────────────────────────────────
+
+/**
+ * POST /api/notifications/deactivate-token — admin: deactivate a token by
+ * suffix. Use when a device should stop receiving pushes.
+ */
+router.post('/api/notifications/deactivate-token', requireAdmin, async (req, res) => {
+  const suffix = safeString(req.body?.suffix);
+  if (!suffix) {
+    return res.status(400).json({ success: false, message: 'suffix is required' });
   }
+
+  const tokens = await loadTokens({ includeInactive: true });
+  const match = Object.values(tokens).find(
+    (t) => String(t.token).endsWith(suffix) || String(t.token).slice(-8) === suffix
+  );
+  if (!match) {
+    return res.status(404).json({ success: false, message: 'No token found with that suffix' });
+  }
+
+  await deactivateToken(match.token);
+  console.log(`[PUSH ADMIN] deactivated token | suffix: ...${suffix}`);
+  return res.json({ success: true, message: 'Token deactivated' });
 });
 
 module.exports = { router };

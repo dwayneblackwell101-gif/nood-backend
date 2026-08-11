@@ -1,162 +1,381 @@
 /**
- * Notification campaign engine — Temu-style automated pushes.
+ * NOOD campaign engine — Temu-style automated pushes with frequency control.
  *
- * Runs every 15 minutes and fires scheduled campaigns to registered users:
- *  - Daily reward reminder (once/day)
- *  - Flash sale live (during flash windows)
- *  - Price drop / hot product (when triggered by the API)
- *  - Cart abandonment nudge (users who synced a cart but didn't buy)
+ * One place to create + send every campaign type:
+ *   new_product, hot-product, price-drop, flash-live, daily-reward,
+ *   cart-nudge, order-update, broadcast, general
  *
- * Tokens live in push-tokens.json (registered by the app). Uses Expo's
- * push API. Campaigns are time-gated so users aren't spammed.
+ * All sends go through utils/push-delivery.js (single Expo integration point).
+ * Duplicate protection, per-device frequency caps and quiet hours are enforced
+ * by the delivery service + push-state-db + push-config.
  */
 
-const fs = require('fs');
-const path = require('path');
-const axios = require('axios');
+const { sendPush, loadAllRecipients } = require('../utils/push-delivery');
+const { config, isTransactionalType } = require('../utils/push-config');
+const { allowCartNudge } = require('../utils/push-state-db');
+const { supabase } = require('../utils/supabase');
 
-const TOKENS_FILE = path.join(__dirname, '..', 'push-tokens.json');
-const STATE_FILE = path.join(__dirname, '..', 'campaign-state.json');
-const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
-
-function loadJson(file, fallback) {
-  try {
-    if (!fs.existsSync(file)) return fallback;
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
-  }
+function log(message, extra) {
+  const detail = extra && Object.keys(extra).length ? ` | ${JSON.stringify(extra)}` : '';
+  console.log(`[CAMPAIGN] ${message}${detail}`);
 }
 
-function saveJson(file, data) {
-  try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
-  } catch (error) {
-    console.error('[CAMPAIGNS] save failed:', error.message);
-  }
-}
-
-function loadTokens() {
-  return loadJson(TOKENS_FILE, {});
-}
-
-function loadState() {
-  return loadJson(STATE_FILE, { lastSent: {}, sentToday: {} });
-}
-
-function saveState(state) {
-  saveJson(STATE_FILE, state);
-}
-
-/** Send a push to one or more tokens. */
-async function sendPush(tokens, { title, body, data }) {
-  if (!tokens.length) return 0;
-
-  const messages = tokens.map((t) => ({
-    to: t.token,
-    sound: 'default',
-    title,
-    body,
-    data: data || {},
-  }));
-
-  try {
-    const response = await axios.post(EXPO_PUSH_URL, messages, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 15000,
-    });
-    return messages.length;
-  } catch (error) {
-    console.error('[CAMPAIGNS] send failed:', error.message);
-    return 0;
-  }
-}
-
-function tokensForUser(state, userId) {
-  return Object.values(loadTokens()).filter((t) => t.userId === userId);
-}
-
-function tokensForAll() {
-  return Object.values(loadTokens());
+/** Generate a deterministic campaign id. */
+function makeCampaignId(type, seed) {
+  const safeSeed = String(seed || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
+  return `noo_${type}_${safeSeed}_${Date.now().toString(36)}`;
 }
 
 function todayKey() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function hasSentToday(state, campaign, userId) {
-  const key = `${campaign}:${userId || 'all'}`;
-  return state.sentToday[key] === todayKey();
+// ─── Campaign templates ─────────────────────────────────────────────────
+
+function templateFor(type, ctx) {
+  switch (type) {
+    case 'new_product':
+      return {
+        title: ctx.batched
+          ? '🔥 New Drop'
+          : '👟 Fresh on NOOD',
+        body: ctx.batched
+          ? `${ctx.productCount} new styles just landed on NOOD. See what's new.`
+          : `${ctx.productTitle} is now available.`,
+        data: {
+          type: 'new_product',
+          route: ctx.batched ? '/collection/new-arrivals' : `/product/${ctx.productHandle}`,
+          productHandle: ctx.batched ? undefined : ctx.productHandle,
+          screen: ctx.batched ? 'collection' : 'product',
+        },
+      };
+    case 'hot-product':
+      return {
+        title: '🔥 This one is moving fast',
+        body: `Customers are checking out ${ctx.productTitle}. Shop it now.`,
+        data: {
+          type: 'hot-product',
+          route: `/product/${ctx.productHandle}`,
+          productHandle: ctx.productHandle,
+          screen: 'product',
+        },
+      };
+    case 'price-drop':
+      return {
+        title: '⬇️ Price Drop',
+        body: `${ctx.productTitle} just dropped from $${ctx.oldPrice} to $${ctx.newPrice}.`,
+        data: {
+          type: 'price-drop',
+          route: `/product/${ctx.productHandle}`,
+          productHandle: ctx.productHandle,
+          screen: 'product',
+        },
+      };
+    case 'flash-live':
+      return {
+        title: '⚡ Flash Deal',
+        body: 'Your deal is live now — prices go back up when the timer hits zero.',
+        data: { type: 'flash-live', screen: 'modal', route: '/modal' },
+      };
+    case 'daily-reward':
+      return {
+        title: '🎁 Your NOOD reward is ready',
+        body: 'Open NOOD to claim it.',
+        data: { type: 'daily-reward', route: '/account/rewards', screen: 'rewards' },
+      };
+    case 'cart-nudge':
+      return {
+        title: '👀 Still thinking about it?',
+        body: 'Your NOOD cart is waiting.',
+        data: { type: 'cart-nudge', route: '/(tabs)/cart', screen: 'cart' },
+      };
+    case 'order-update':
+      return {
+        title: '📦 Order update',
+        body: ctx.body || 'Your NOOD order has an update.',
+        data: {
+          type: 'order-update',
+          route: '/account/orders',
+          orderId: ctx.orderId,
+          screen: 'orders',
+        },
+      };
+    case 'broadcast':
+    case 'general':
+    default:
+      return {
+        title: ctx.title || 'NOOD',
+        body: ctx.body || 'Something great is waiting for you!',
+        data: ctx.data && typeof ctx.data === 'object' ? ctx.data : { type: 'general' },
+      };
+  }
 }
 
-function markSentToday(state, campaign, userId) {
-  const key = `${campaign}:${userId || 'all'}`;
-  state.sentToday[key] = todayKey();
-  saveState(state);
-}
+// ─── New product campaign ───────────────────────────────────────────────
 
 /**
- * Runs all campaigns. Exposed for manual trigger + scheduled interval.
+ * Build + send a new-product campaign from a list of genuinely new products.
+ *
+ * Batching rule: if products.length >= config.newProductBatchThreshold, send a
+ * SINGLE batched push (deep-links to New Arrivals). Otherwise send one push
+ * per product (deduped per product via dedupeKey).
  */
-async function runCampaigns() {
-  const state = loadState();
-  const all = tokensForAll();
-
-  // 1. Daily reward reminder — once per day, ~6pm local.
-  const hour = new Date().getHours();
-  if (hour === 18 && !hasSentToday(state, 'daily-reward', 'all')) {
-    await sendPush(all, {
-      title: 'Your daily reward is waiting 🎁',
-      body: 'Claim your NOOD reward and keep your streak alive!',
-      data: { type: 'daily-reward-reminder' },
-    });
-    markSentToday(state, 'daily-reward', 'all');
-    console.log('[CAMPAIGNS] sent daily-reward to', all.length);
+async function sendNewProductCampaign({ products, campaignId }) {
+  if (!Array.isArray(products) || !products.length) {
+    return { sent: 0, failed: 0, skipped: 0 };
   }
 
-  // 2. Flash sale live — during active flash windows (6-10, 14-18, 22-2).
-  const isFlashActive =
-    (hour >= 6 && hour < 10) || (hour >= 14 && hour < 18) || (hour >= 22);
-  if (isFlashActive && !hasSentToday(state, 'flash-live', 'all')) {
-    await sendPush(all, {
-      title: '⚡ Flash Sale LIVE',
-      body: 'Up to 70% off — when the clock hits zero, prices go back up!',
-      data: { type: 'flash-sale', screen: 'modal' },
-    });
-    markSentToday(state, 'flash-live', 'all');
-    console.log('[CAMPAIGNS] sent flash-live to', all.length);
+  const recipients = await loadAllRecipients();
+  if (!recipients.length) {
+    log('new_product campaign — no recipients', { products: products.length });
+    return { sent: 0, failed: 0, skipped: 0 };
   }
 
-  // 3. Personalized cart nudge — per user (only if they have a cart).
-  const cartUsers = loadJson(path.join(__dirname, '..', 'cart-users.json'), {});
-  for (const [userId, cart] of Object.entries(cartUsers)) {
-    if (hasSentToday(state, 'cart-nudge', userId)) continue;
-    const userTokens = tokensForUser(state, userId);
-    if (!userTokens.length) continue;
+  const batched = products.length >= config.newProductBatchThreshold;
+  const batchCampaignId =
+    campaignId || makeCampaignId('new_product', `batch_${todayKey()}_${products.length}`);
 
-    const items = Array.isArray(cart?.items) ? cart.items : [];
-    if (items.length) {
-      await sendPush(userTokens, {
-        title: '🛒 Still thinking about it?',
-        body: 'You left items in your cart — complete your order before they sell out!',
-        data: { type: 'cart_reminder', screen: 'cart' },
-      });
-      markSentToday(state, 'cart-nudge', userId);
-      console.log('[CAMPAIGNS] cart-nudge to', userId);
+  log('Sending new_product campaign', {
+    batched,
+    products: products.length,
+    campaignId: batchCampaignId,
+  });
+
+  if (batched) {
+    const template = templateFor('new_product', {
+      batched: true,
+      productCount: products.length,
+    });
+    const result = await sendPush({
+      recipients,
+      title: template.title,
+      body: template.body,
+      data: template.data,
+      campaignId: batchCampaignId,
+      campaignType: 'new_product',
+      dedupeKey: `batch_${todayKey()}_${products.map((p) => p.handle).sort().join('|')}`,
+      frequency: { check: true },
+    });
+    return result;
+  }
+
+  // Individual product pushes, deduped per product.
+  let totalSent = 0;
+  let totalFailed = 0;
+  let totalSkipped = 0;
+  for (const product of products) {
+    const template = templateFor('new_product', {
+      batched: false,
+      productTitle: product.title,
+      productHandle: product.handle,
+    });
+    const result = await sendPush({
+      recipients,
+      title: template.title,
+      body: template.body,
+      data: template.data,
+      campaignId: makeCampaignId('new_product', `p_${product.handle}`),
+      campaignType: 'new_product',
+      dedupeKey: `product_${product.handle}`,
+      frequency: { check: true },
+    });
+    totalSent += result.sent || 0;
+    totalFailed += result.failed || 0;
+    totalSkipped += result.skipped || 0;
+  }
+  return { sent: totalSent, failed: totalFailed, skipped: totalSkipped };
+}
+
+// ─── Cart nudge ─────────────────────────────────────────────────────────
+
+/**
+ * Send cart-nudge push for users with non-empty, abandoned carts.
+ * Uses persisted cooldown via push-state-db. Only nudges users with a
+ * registered push token. If a cart already received a recovery EMAIL, the
+ * push nudge is suppressed (already engaged).
+ */
+async function runCartNudges() {
+  if (!supabase) {
+    log('cart-nudge — Supabase not configured, skipping');
+    return;
+  }
+
+  const cutoff = new Date(
+    Date.now() - Number(process.env.PUSH_CART_NUDGE_MIN_AGE_MINUTES || 60) * 60 * 1000
+  ).toISOString();
+
+  const { data: carts, error } = await supabase
+    .from('carts')
+    .select('id, email, name, profile_id, items, updated_at, recovery_email_sent_at, recovery_discount_code')
+    .lt('updated_at', cutoff)
+    .not('email', 'is', null)
+    .neq('items', '[]');
+
+  if (error) {
+    log('cart-nudge — fetch failed', { error: error.message });
+    return { sent: 0 };
+  }
+
+  const tokens = await loadAllRecipients();
+  if (!tokens.length) return { sent: 0 };
+
+  // Map tokens by email (best signal we have) then by user id.
+  const tokensByEmail = new Map();
+  const tokensByUserId = new Map();
+  for (const t of tokens) {
+    if (t.email) {
+      if (!tokensByEmail.has(t.email)) tokensByEmail.set(t.email, []);
+      tokensByEmail.get(t.email).push(t);
+    }
+    if (t.userId) {
+      if (!tokensByUserId.has(t.userId)) tokensByUserId.set(t.userId, []);
+      tokensByUserId.get(t.userId).push(t);
     }
   }
 
-  return { sent: true };
+  const cooldownHours = Number(process.env.PUSH_CART_NUDGE_COOLDOWN_HOURS || 48);
+  let nudged = 0;
+
+  for (const cart of carts || []) {
+    // Skip carts already engaged via recovery email (or discounted).
+    if (cart.recovery_email_sent_at || cart.recovery_discount_code) continue;
+
+    const scopeKey = cart.email || cart.profile_id || cart.id;
+    const allowed = await allowCartNudge(scopeKey, cooldownHours);
+    if (!allowed) continue;
+
+    const cartTokens = [
+      ...(tokensByEmail.get(cart.email) || []),
+      ...(tokensByUserId.get(cart.profile_id) || []),
+    ];
+    const unique = [...new Map(cartTokens.map((t) => [t.token, t])).values()];
+    if (!unique.length) continue;
+
+    const template = templateFor('cart-nudge', {});
+    const result = await sendPush({
+      recipients: unique,
+      title: template.title,
+      body: template.body,
+      data: template.data,
+      campaignId: makeCampaignId('cart-nudge', `cart_${cart.id}`),
+      campaignType: 'cart-nudge',
+      dedupeKey: `cart_${cart.id}_${todayKey()}`,
+      frequency: { check: true },
+    });
+
+    if ((result.sent || 0) > 0) {
+      nudged += 1;
+      log('cart-nudge sent', { cartId: cart.id, sent: result.sent });
+    }
+  }
+
+  log('cart-nudge run complete', { nudged });
+  return { nudged };
 }
 
-// Run every 15 minutes.
-setInterval(() => {
-  runCampaigns().catch((e) => console.error('[CAMPAIGNS] interval error:', e.message));
-}, 15 * 60 * 1000);
+// ─── Scheduled engagement campaigns ─────────────────────────────────────
 
-// Also run once on startup (after 30s so the server is up).
-setTimeout(() => {
-  runCampaigns().catch((e) => console.error('[CAMPAIGNS] startup error:', e.message));
-}, 30000);
+/**
+ * Daily reward reminder + flash sale live — time-windowed, once per day.
+ * Runs on the 15-minute interval.
+ */
+async function runScheduledEngagementCampaigns() {
+  const recipients = await loadAllRecipients();
+  if (!recipients.length) return;
 
-module.exports = { runCampaigns };
+  const hour = new Date().getHours();
+  const day = todayKey();
+
+  // Daily reward — once per day at the configured hour.
+  const rewardHour = Number(process.env.PUSH_REWARD_REMINDER_HOUR ?? 18);
+  if (hour === rewardHour) {
+    const template = templateFor('daily-reward', {});
+    await sendPush({
+      recipients,
+      title: template.title,
+      body: template.body,
+      data: template.data,
+      campaignId: makeCampaignId('daily-reward', `day_${day}`),
+      campaignType: 'daily-reward',
+      dedupeKey: `daily_reward_${day}`,
+      frequency: { check: true },
+    });
+  }
+
+  // Flash sale — once per day during an active flash window.
+  const flashStart = Number(process.env.PUSH_FLASH_WINDOW_START ?? 6);
+  const flashEnd = Number(process.env.PUSH_FLASH_WINDOW_END ?? 10);
+  const flashActive = hour >= flashStart && hour < flashEnd;
+  if (flashActive) {
+    const template = templateFor('flash-live', {});
+    await sendPush({
+      recipients,
+      title: template.title,
+      body: template.body,
+      data: template.data,
+      campaignId: makeCampaignId('flash-live', `day_${day}`),
+      campaignType: 'flash-live',
+      dedupeKey: `flash_live_${day}`,
+      frequency: { check: true },
+    });
+  }
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────
+
+/**
+ * Run ALL scheduled campaign work. Called on the interval + startup.
+ * Exposed for tests/manual triggers.
+ */
+async function runCampaigns() {
+  await runScheduledEngagementCampaigns();
+  await runCartNudges();
+  return { success: true };
+}
+
+/**
+ * Send a single manual/generated campaign with a fully-specified payload.
+ * Used by admin broadcast + internal events (price-drop, hot-product).
+ */
+async function sendCampaign({
+  campaignId,
+  campaignType = 'general',
+  title,
+  body,
+  data = {},
+  recipients,
+  dedupeKey,
+  frequency = { check: true },
+}) {
+  const recipientList =
+    recipients || (await loadAllRecipients());
+  const safeType = campaignTypes().includes(campaignType) ? campaignType : 'general';
+
+  return sendPush({
+    recipients: recipientList,
+    title,
+    body,
+    data: { ...data, type: data.type || safeType },
+    campaignId:
+      campaignId || makeCampaignId(safeType, `manual_${Date.now().toString(36)}`),
+    campaignType: safeType,
+    dedupeKey,
+    frequency,
+  });
+}
+
+function campaignTypes() {
+  return config.campaignTypes;
+}
+
+module.exports = {
+  runCampaigns,
+  runCartNudges,
+  runScheduledEngagementCampaigns,
+  sendNewProductCampaign,
+  sendCampaign,
+  templateFor,
+  makeCampaignId,
+  campaignTypes,
+  isTransactionalType,
+};

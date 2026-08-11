@@ -122,6 +122,9 @@
   <h1>🔔 <span>NOOD Push Sender</span></h1>
   <div class="subtitle">Send a notification to your app right now</div>
 
+  <label>Admin token (NOOD_ADMIN_TOKEN)</label>
+  <input id="adminToken" type="password" placeholder="Paste your backend NOOD_ADMIN_TOKEN" autocomplete="off" />
+
   <!-- Device status -->
   <div id="deviceStatus" style="margin-bottom:16px; padding:12px; border-radius:12px; background:#f0f8ff; border:1px solid #b8d4e8; display:none;">
     <b>Registered devices:</b> <span id="deviceCount">0</span>
@@ -229,9 +232,17 @@ async function send() {
   const productHandle = document.getElementById('productHandle').value.trim();
   const target = document.getElementById('target').value;
   const userId = document.getElementById('userId').value.trim();
+  const adminToken = document.getElementById('adminToken').value.trim();
 
   if (!body) {
     showResult('Please enter a message.', false);
+    btn.disabled = false;
+    btn.textContent = '📨 Send Notification';
+    return;
+  }
+
+  if (!adminToken) {
+    showResult('Enter your NOOD_ADMIN_TOKEN first (top of page).', false);
     btn.disabled = false;
     btn.textContent = '📨 Send Notification';
     return;
@@ -248,7 +259,10 @@ async function send() {
   try {
     const res = await fetch('https://nood-backend.onrender.com/api/notifications/campaign', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-admin-token': adminToken
+      },
       body: JSON.stringify(payload)
     });
     const data = await res.json();

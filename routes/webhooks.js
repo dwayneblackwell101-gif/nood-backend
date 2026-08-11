@@ -50,12 +50,63 @@ router.post('/webhooks/fulfillments/update', verifyShopifyWebhook, async (req, r
     // Update local order tracking from fulfillment data
     await updateOrderFromFulfillment(fulfillment);
 
+    // Transactional order-update push (always eligible — not frequency limited).
+    sendOrderUpdatePush({
+      orderId: String(fulfillment.order_id || ''),
+      email: fulfillment.email || null,
+      status: fulfillment.status || 'updated',
+    }).catch((error) => {
+      console.error('[WEBHOOK] order-update push failed:', error.message);
+    });
+
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('[WEBHOOK] Fulfillment update error:', error.message);
     res.status(500).json({ error: 'Processing failed' });
   }
 });
+
+/**
+ * Send a transactional order-update push to the customer's devices.
+ * Transactional pushes bypass promotional frequency limits.
+ */
+async function sendOrderUpdatePush({ orderId, email, status }) {
+  const { sendPush, loadAllRecipients } = require('../utils/push-delivery');
+
+  let recipients = await loadAllRecipients();
+  if (email) {
+    const emailRecipients = recipients.filter(
+      (t) => String(t.email || '').toLowerCase() === String(email).toLowerCase()
+    );
+    if (emailRecipients.length) {
+      recipients = emailRecipients;
+    }
+  }
+  if (!recipients.length) return;
+
+  const statusText =
+    status === 'fulfilled'
+      ? 'Your order has been shipped'
+      : status === 'cancelled'
+        ? 'Your order was cancelled'
+        : 'Your NOOD order has an update';
+
+  await sendPush({
+    recipients,
+    title: '📦 Order update',
+    body: `${statusText}. Tap to view tracking.`,
+    data: {
+      type: 'order-update',
+      route: '/account/orders',
+      orderId,
+      screen: 'orders',
+    },
+    campaignId: `noo_order_update_${orderId}_${Date.now().toString(36)}`,
+    campaignType: 'order-update',
+    frequency: { check: false },
+  });
+  console.log(`[WEBHOOK] order-update push sent for order ${orderId}`);
+}
 
 // Order fulfilled webhook (legacy)
 router.post('/webhooks/orders/fulfilled', verifyShopifyWebhook, async (req, res) => {

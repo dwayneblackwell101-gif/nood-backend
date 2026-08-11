@@ -15,11 +15,74 @@ create table if not exists push_tokens (
   platform text default 'android',
   device_id text,
   user_id text,
+  email text,
   app_version text,
   is_test boolean not null default false,
+  is_active boolean not null default true,
+  last_seen_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+-- RLS stays ENABLED. The backend uses the service-role key which bypasses
+-- RLS. These policies only allow the service role / no-one publicly.
+alter table push_tokens enable row level security;
+
+-- Service role bypasses RLS automatically; these policies are a safety net.
+-- No public/anonymous policies — the mobile app must never write here.
+create policy "service role can manage push_tokens" on push_tokens
+  for all to service_role using (true) with check (true);
+
+-- Push campaign events — idempotency / duplicate protection + delivery stats.
+-- campaign_id is the primary dedupe key; dedupe_key allows a second, semantic
+-- dedupe (e.g. "don't promote this product handle twice in a window").
+create table if not exists push_campaign_events (
+  id uuid primary key default gen_random_uuid(),
+  campaign_id text unique not null,
+  campaign_type text not null default 'general',
+  dedupe_key text unique,
+  title text,
+  body text,
+  payload jsonb default '{}',
+  status text not null default 'created',
+  recipient_count integer not null default 0,
+  sent_count integer not null default 0,
+  failed_count integer not null default 0,
+  skipped_count integer not null default 0,
+  created_at timestamptz not null default now()
+);
+
+alter table push_campaign_events enable row level security;
+create policy "service role can manage push_campaign_events" on push_campaign_events
+  for all to service_role using (true) with check (true);
+
+create index if not exists push_campaign_events_dedupe_key_idx
+  on push_campaign_events (dedupe_key);
+
+-- Per-token daily promotional frequency counters.
+create table if not exists push_frequency (
+  token text not null,
+  day text not null,
+  promo_count integer not null default 0,
+  last_promo_at timestamptz,
+  updated_at timestamptz not null default now(),
+  primary key (token, day)
+);
+
+alter table push_frequency enable row level security;
+create policy "service role can manage push_frequency" on push_frequency
+  for all to service_role using (true) with check (true);
+
+-- Cart nudge cooldown (one row per cart scope).
+create table if not exists push_cart_nudges (
+  cart_key text primary key,
+  last_nudge_at timestamptz,
+  updated_at timestamptz not null default now()
+);
+
+alter table push_cart_nudges enable row level security;
+create policy "service role can manage push_cart_nudges" on push_cart_nudges
+  for all to service_role using (true) with check (true);
 
 -- Per-video engagement counters
 create table if not exists video_engagement (
@@ -94,6 +157,8 @@ create table if not exists products (
   available_for_sale boolean default true,
   total_inventory integer default 0,
   variants jsonb default '[]',
+  created_at timestamptz not null default now(),
+  notified_at timestamptz,
   updated_at timestamptz not null default now()
 );
 

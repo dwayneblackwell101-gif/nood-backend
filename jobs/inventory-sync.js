@@ -1,10 +1,19 @@
 /**
  * Inventory sync — periodic job to keep local product inventory in sync
  * with Shopify. Runs every 30 minutes using setInterval (no external deps).
+ *
+ * New-product detection:
+ *   The job fetches the full active product list from Shopify Admin, then
+ *   INSERTS any product whose shopify_product_id is not already in the
+ *   `products` table. Inserts happen BEFORE the new-product campaign fires,
+ *   so the product is saved/indexed and can be opened in the app before any
+ *   push is sent. Repeated syncs never re-insert (upsert-on-conflict) and
+ *   never re-fire (campaign dedupe keys are per product/batch + day).
  */
 
 const axios = require('axios');
-const { updateProductInventory, syncCatalog } = require('../utils/inventory');
+const { updateProductInventory, syncCatalog, detectNewProducts } = require('../utils/inventory');
+const { sendNewProductCampaign } = require('./notification-campaigns');
 
 const INVENTORY_SYNC_INTERVAL_MINUTES = 30;
 
@@ -63,6 +72,26 @@ async function runInventorySync() {
     }
 
     console.log(`[INVENTORY SYNC] Updated ${updated} products`);
+
+    // ── New-product push pipeline ───────────────────────────────────────
+    // detectNewProducts() inserts genuinely new products into the products
+    // table (idempotent). Then sendNewProductCampaign fires the pushes.
+    try {
+      const newProducts = await detectNewProducts(products);
+      if (newProducts.length) {
+        console.log(`[INVENTORY SYNC] Detected ${newProducts.length} genuinely new product(s)`);
+        const result = await sendNewProductCampaign({ products: newProducts });
+        console.log(
+          `[INVENTORY SYNC] new_product campaign result | sent: ${result.sent} failed: ${result.failed} skipped: ${result.skipped}`
+        );
+      } else {
+        console.log('[INVENTORY SYNC] No genuinely new products — no push campaign fired');
+      }
+    } catch (campaignError) {
+      // A campaign failure must never break the sync itself.
+      console.error('[INVENTORY SYNC] new-product campaign error:', campaignError.message);
+    }
+
     console.log('[INVENTORY SYNC] Completed');
   } catch (error) {
     console.error('[INVENTORY SYNC] Failed:', error.message);
