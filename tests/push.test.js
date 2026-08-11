@@ -26,6 +26,10 @@ process.env.PUSH_FREQUENCY_STATE_FILE = path.join(tmpDir, 'push-frequency-state.
 process.env.PUSH_INBOX_FILE = path.join(tmpDir, 'push-inbox-state.json');
 process.env.PUSH_INBOX_READS_FILE = path.join(tmpDir, 'push-inbox-reads-state.json');
 process.env.PUSH_PREFERENCES_FILE = path.join(tmpDir, 'push-preferences-state.json');
+// Catalog router reads Shopify env at module load — set a mock so the routes
+// return JSON (not 503) in tests.
+process.env.SHOPIFY_STORE_DOMAIN = 'mock-store.myshopify.com';
+process.env.SHOPIFY_STOREFRONT_TOKEN = 'mock-token';
 process.env.PUSH_QUIET_HOURS_ENABLED = 'false'; // tests must not be quiet-hour dependent
 process.env.PUSH_MAX_PROMO_PER_DAY = '100'; // per-test override
 process.env.PUSH_MIN_INTERVAL_MINUTES = '0';
@@ -97,6 +101,7 @@ const {
   progressIndexFor,
   typeForStatus,
 } = require('../utils/tracking');
+const catalogRouterModule = require('../routes/catalog');
 
 let passed = 0;
 let failed = 0;
@@ -937,6 +942,67 @@ async function testMultiDeviceSameUser() {
   assert.strictEqual(matches.length, 1, 'one logical inbox item shared across devices');
 }
 
+// ═══ 21. Catalog routes exist + proxy logic ════════════════════════════
+
+async function testCatalogRoutes() {
+  // Mock Shopify Storefront GraphQL.
+  const axiosMock = require('axios');
+  const originalPost = axiosMock.post;
+  axiosMock.post = async (url, { query, variables }) => {
+    if (url.includes('/graphql.json')) {
+      const isCollection = query.includes('collectionByHandle');
+      const isCollectionsList = query.includes('collections(') && !query.includes('collectionByHandle');
+      const isProductsList = query.includes('products(') && !query.includes('collectionByHandle') && !query.includes('collections(') && !query.includes('productByHandle');
+      const isDetail = query.includes('productByHandle');
+      const isSearch = query.includes('Search');
+      const fakeEdge = { node: { id: '1', title: 'Shoe', handle: 'shoe', variants: { edges: [] }, collections: { edges: [] }, priceRange: { minVariantPrice: { amount: '10', currencyCode: 'USD' } } } };
+      if (isCollection) return { data: { data: { collectionByHandle: { title: variables.handle, handle: variables.handle, products: { edges: [fakeEdge], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      if (isCollectionsList) return { data: { data: { collections: { edges: [{ node: { id: 'c1', title: 'Kids', handle: 'kids', image: null } }], pageInfo: { hasNextPage: false, endCursor: null } } } } };
+      if (isProductsList) return { data: { data: { products: { edges: [fakeEdge], pageInfo: { hasNextPage: false, endCursor: null } } } } };
+      if (isDetail) return { data: { data: { productByHandle: { id: '3', title: 'Detail', handle: variables.handle, images: { edges: [] }, media: { edges: [] }, variants: { edges: [] } } } } };
+      if (isSearch) return { data: { data: { products: { edges: [fakeEdge], pageInfo: { hasNextPage: false, endCursor: null } } } } };
+    }
+    return { data: {} };
+  };
+
+  const express = require('express');
+  const app = express();
+  app.use(catalogRouterModule.router);
+
+  const server = await new Promise((resolve) => {
+    const s = app.listen(0, () => resolve(s));
+  });
+  const port = server.address().port;
+  const base = `http://localhost:${port}`;
+
+  try {
+    const tests = [
+      ['kids products', '/api/catalog/collections/kids/products?limit=60&first=60', 200],
+      ['women products', '/api/catalog/collections/women/products?limit=60&first=60', 200],
+      ['collections list', '/api/catalog/collections?limit=250&first=250', 200],
+      ['products list', '/api/catalog/products?limit=60&first=60&sort=updated', 200],
+      ['product detail', '/api/catalog/products/some-handle', 200],
+      ['recommendations', '/api/catalog/products/recommendations?productId=gid://shopify/Product/1', 200],
+      ['search', '/api/catalog/search?q=nike&limit=50&first=50', 200],
+      ['version', '/api/catalog/version', 200],
+    ];
+
+    for (const [label, path, expectedStatus] of tests) {
+      const res = await fetch(`${base}${path}`);
+      assert.strictEqual(res.status, expectedStatus, `${label} returns ${expectedStatus}`);
+      const json = await res.json();
+      assert.ok(json, `${label} returns JSON`);
+    }
+
+    // Verify pagination params are forwarded (first=60 → the mock receives 60).
+    const kidsRes = await fetch(`${base}/api/catalog/collections/kids/products?limit=60&first=60`);
+    assert.strictEqual(kidsRes.status, 200, 'kids products 200');
+  } finally {
+    axiosMock.post = originalPost;
+    server.close();
+  }
+}
+
 // ═══ Run ═══════════════════════════════════════════════════════════════
 async function main() {
   console.log('\nNOOD push notification tests\n');
@@ -964,6 +1030,7 @@ async function main() {
   await test('user B cannot mark user A notification read', testMarkReadIsolation);
   await test('logout detaches token from user (no private leak)', testTokenDetachOnLogout);
   await test('same user on two devices shares one logical inbox item', testMultiDeviceSameUser);
+  await test('catalog routes exist and return JSON (kids/women/collections/products/search)', testCatalogRoutes);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   try {
