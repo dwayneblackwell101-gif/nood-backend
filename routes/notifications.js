@@ -16,7 +16,7 @@
  */
 
 const express = require('express');
-const { loadTokens, upsertToken, removeToken, deactivateToken, isLikelyRealToken } = require('../utils/push-tokens-db');
+const { loadTokens, upsertToken, removeToken, deactivateToken, detachTokenUser, findTokenRecord, isLikelyRealToken } = require('../utils/push-tokens-db');
 const { requireAdmin } = require('../utils/admin-auth');
 const { sendPush, loadAllRecipients } = require('../utils/push-delivery');
 const { config, campaignPriorityOf } = require('../utils/push-config');
@@ -36,16 +36,35 @@ function safeString(value, fallback = '') {
 }
 
 /**
- * Resolve the requesting user identity.
- * - `userId` query/body param (profile id from the app)
- * - falls back to `deviceId` (stable guest identity)
- * Returns null if neither is provided.
+ * Resolve the requesting user identity securely.
+ *
+ * Priority:
+ *   1. `x-push-token` header — the device's Expo push token. The token is a
+ *      bearer credential only the device owner holds. The user_id bound to
+ *      that token in push_tokens is AUTHORITATIVE for private data.
+ *   2. `deviceId` param — stable guest/installation identity.
+ *
+ * A raw `userId` query/body param is NEVER trusted for private data — it can
+ * only scope GLOBAL (broadcast) reads.
  */
-function resolveIdentity(req) {
-  const userId = safeString(req.query?.userId || req.body?.userId);
+async function resolveIdentity(req) {
+  // Header (x-push-token) is preferred — bound identity from push_tokens.
+  const bearerToken = safeString(
+    req.headers?.['x-push-token'] || req.body?.token || req.query?.token
+  );
+  if (bearerToken) {
+    const record = await findTokenRecord(bearerToken);
+    if (record?.userId) {
+      return { kind: 'user', id: record.userId, token: bearerToken };
+    }
+    if (record?.deviceId) {
+      return { kind: 'device', id: record.deviceId, token: bearerToken };
+    }
+  }
+
   const deviceId = safeString(req.query?.deviceId || req.body?.deviceId);
-  if (userId) return { kind: 'user', id: userId };
   if (deviceId) return { kind: 'device', id: deviceId };
+
   return null;
 }
 
@@ -86,6 +105,22 @@ router.post('/api/notifications/register-token', async (req, res) => {
   }
 
   return res.json({ success: true, message: 'Token registered', tokenSuffix: suffix });
+});
+
+/**
+ * POST /api/notifications/logout — detach this device token from its user.
+ * Called on app logout so private notifications (orders, cart, tracking,
+ * rewards) cannot leak to the next person using the device. The token stays
+ * active for global broadcasts as a guest.
+ */
+router.post('/api/notifications/logout', async (req, res) => {
+  const token = safeString(req.body?.token);
+  if (!token) {
+    return res.status(400).json({ success: false, message: 'token is required' });
+  }
+  await detachTokenUser(token);
+  console.log(`[PUSH] Token detached from user on logout | suffix: ...${token.slice(-12)}`);
+  return res.json({ success: true, message: 'Token detached from user' });
 });
 
 // ─── Admin: device listing ──────────────────────────────────────────────
@@ -263,9 +298,9 @@ router.post('/api/notifications/deactivate-token', requireAdmin, async (req, res
  * newest first, each with `read` state.
  */
 router.get('/api/notifications/inbox', async (req, res) => {
-  const identity = resolveIdentity(req);
+  const identity = await resolveIdentity(req);
   if (!identity) {
-    return res.status(400).json({ success: false, message: 'userId or deviceId is required' });
+    return res.status(400).json({ success: false, message: 'x-push-token header or deviceId is required' });
   }
 
   const limit = Number(req.query.limit) > 0 ? Number(req.query.limit) : undefined;
@@ -277,9 +312,9 @@ router.get('/api/notifications/inbox', async (req, res) => {
  * GET /api/notifications/inbox/unread-count?userId=...&deviceId=...
  */
 router.get('/api/notifications/inbox/unread-count', async (req, res) => {
-  const identity = resolveIdentity(req);
+  const identity = await resolveIdentity(req);
   if (!identity) {
-    return res.status(400).json({ success: false, message: 'userId or deviceId is required' });
+    return res.status(400).json({ success: false, message: 'x-push-token header or deviceId is required' });
   }
   const unread = await getUnreadCount({ userId: identity.id });
   return res.json({ success: true, unreadCount: unread });
@@ -290,9 +325,9 @@ router.get('/api/notifications/inbox/unread-count', async (req, res) => {
  * Mark a single notification read for this user/device.
  */
 router.post('/api/notifications/inbox/:id/read', async (req, res) => {
-  const identity = resolveIdentity(req);
+  const identity = await resolveIdentity(req);
   if (!identity) {
-    return res.status(400).json({ success: false, message: 'userId or deviceId is required' });
+    return res.status(400).json({ success: false, message: 'x-push-token header or deviceId is required' });
   }
   const notificationId = safeString(req.params?.id);
   if (!notificationId) {
@@ -307,9 +342,9 @@ router.post('/api/notifications/inbox/:id/read', async (req, res) => {
  * Mark all visible notifications read for this user/device.
  */
 router.post('/api/notifications/inbox/read-all', async (req, res) => {
-  const identity = resolveIdentity(req);
+  const identity = await resolveIdentity(req);
   if (!identity) {
-    return res.status(400).json({ success: false, message: 'userId or deviceId is required' });
+    return res.status(400).json({ success: false, message: 'x-push-token header or deviceId is required' });
   }
   const result = await markAllInboxRead({ userId: identity.id });
   return res.json({ success: result.success, marked: result.marked });

@@ -66,6 +66,8 @@ const {
   loadTokens,
   upsertToken,
   deactivateToken,
+  detachTokenUser,
+  findTokenRecord,
   isLikelyRealToken,
 } = require('../utils/push-tokens-db');
 const {
@@ -828,6 +830,113 @@ async function testTrackingDeepLink() {
   assert.deepStrictEqual(support, { pathname: '/account/support' });
 }
 
+// ═══ 20. Per-user isolation ════════════════════════════════════════════
+
+async function testUserInboxIsolation() {
+  clearStateFiles();
+  // User A personal notification + a broadcast.
+  await createInboxItem({
+    campaignId: 'iso_a_1',
+    type: 'order-update',
+    title: '📦 Order update',
+    body: 'Your order shipped.',
+    data: { type: 'order-update', route: '/account/tracking', orderId: 'o1' },
+    orderId: 'o1',
+    userId: 'user-A',
+  });
+  await createInboxItem({
+    campaignId: 'iso_broadcast_1',
+    type: 'flash-live',
+    title: '⚡ Flash Deal',
+    body: 'Live now.',
+    data: { type: 'flash-live', route: '/modal' },
+    userId: null,
+  });
+
+  // User A sees their own + broadcast.
+  const forA = await listInboxForUser({ userId: 'user-A' });
+  assert.ok(forA.some((i) => i.campaignId === 'iso_a_1'), 'A sees own personal item');
+  assert.ok(forA.some((i) => i.campaignId === 'iso_broadcast_1'), 'A sees broadcast');
+
+  // User B must NOT see A's personal item.
+  const forB = await listInboxForUser({ userId: 'user-B' });
+  assert.ok(
+    !forB.some((i) => i.campaignId === 'iso_a_1'),
+    'user B cannot read user A inbox (personal item invisible)'
+  );
+  assert.ok(forB.some((i) => i.campaignId === 'iso_broadcast_1'), 'B still sees broadcast');
+}
+
+async function testMarkReadIsolation() {
+  clearStateFiles();
+  await createInboxItem({
+    campaignId: 'iso_mark_1',
+    type: 'cart-nudge',
+    title: '👀 Cart',
+    body: 'Your cart is waiting.',
+    data: { type: 'cart-nudge', route: '/(tabs)/cart' },
+    userId: 'user-A',
+  });
+
+  const forA = await listInboxForUser({ userId: 'user-A' });
+  const item = forA.find((i) => i.campaignId === 'iso_mark_1');
+  assert.ok(item, 'A has the item');
+
+  // User B cannot mark A's notification read (B can't even see it).
+  const forB = await listInboxForUser({ userId: 'user-B' });
+  assert.ok(
+    !forB.some((i) => i.campaignId === 'iso_mark_1'),
+    'user B cannot see (or mark) user A notification'
+  );
+}
+
+async function testTokenDetachOnLogout() {
+  clearStateFiles();
+  const token = 'ExponentPushToken[iso-logout-token]';
+  await upsertToken({ token, userId: 'user-A', email: 'a@example.com', deviceId: 'dev-a' });
+
+  // Before logout: identity resolves to user-A.
+  const before = await findTokenRecord(token);
+  assert.strictEqual(before.userId, 'user-A', 'token bound to user-A before logout');
+
+  // Logout detaches.
+  await detachTokenUser(token);
+  const after = await findTokenRecord(token);
+  assert.strictEqual(after.userId, null, 'token detached from user after logout');
+  assert.strictEqual(after.email, null, 'email detached after logout');
+
+  // Token still active (device can still receive global broadcasts).
+  const tokens = await loadTokens();
+  assert.strictEqual(tokens[token].active, true, 'token stays active after logout');
+}
+
+async function testMultiDeviceSameUser() {
+  clearStateFiles();
+  const token1 = 'ExponentPushToken[iso-device-1]';
+  const token2 = 'ExponentPushToken[iso-device-2]';
+  await upsertToken({ token: token1, userId: 'user-X', deviceId: 'dev-1' });
+  await upsertToken({ token: token2, userId: 'user-X', deviceId: 'dev-2' });
+
+  // Both devices resolve to the same user.
+  const r1 = await findTokenRecord(token1);
+  const r2 = await findTokenRecord(token2);
+  assert.strictEqual(r1.userId, 'user-X', 'device 1 bound to user-X');
+  assert.strictEqual(r2.userId, 'user-X', 'device 2 bound to user-X');
+
+  // Personal inbox item belongs to user-X once (shared across devices).
+  await createInboxItem({
+    campaignId: 'iso_multi_1',
+    type: 'daily-reward',
+    title: '🎁 Reward',
+    body: 'Your reward is ready.',
+    data: { type: 'daily-reward', route: '/account/rewards' },
+    userId: 'user-X',
+  });
+  const items = await listInboxForUser({ userId: 'user-X' });
+  const matches = items.filter((i) => i.campaignId === 'iso_multi_1');
+  assert.strictEqual(matches.length, 1, 'one logical inbox item shared across devices');
+}
+
 // ═══ Run ═══════════════════════════════════════════════════════════════
 async function main() {
   console.log('\nNOOD push notification tests\n');
@@ -851,6 +960,10 @@ async function main() {
   await test('push campaign creates an inbox item with matching payload', testPushCreatesInboxItem);
   await test('broadcast push inbox item visible to all users', testBroadcastInboxVisibility);
   await test('tracking deep-link routes to tracking screen', testTrackingDeepLink);
+  await test('user A cannot read user B inbox (personal isolation)', testUserInboxIsolation);
+  await test('user B cannot mark user A notification read', testMarkReadIsolation);
+  await test('logout detaches token from user (no private leak)', testTokenDetachOnLogout);
+  await test('same user on two devices shares one logical inbox item', testMultiDeviceSameUser);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   try {

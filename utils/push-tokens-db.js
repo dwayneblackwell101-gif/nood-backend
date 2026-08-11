@@ -156,6 +156,78 @@ async function deactivateToken(token) {
   }
 }
 
+/**
+ * Look up the identity bound to an Expo push token.
+ * The token acts as a bearer credential — only the device that owns the
+ * token can present it, so the bound user_id is authoritative for private
+ * inbox/tracking data.
+ * @returns {Promise<{userId, deviceId, email} | null>}
+ */
+async function findTokenRecord(token) {
+  if (!token) return null;
+  if (supabaseAdmin) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('push_tokens')
+        .select('user_id, device_id, email, is_active')
+        .eq('token', token)
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) return null;
+      return {
+        userId: data.user_id || null,
+        deviceId: data.device_id || null,
+        email: data.email || null,
+        active: data.is_active !== false,
+      };
+    } catch (error) {
+      console.error('[PUSH-DB] findTokenRecord failed:', error.message);
+      return null;
+    }
+  }
+  const map = loadJsonFallback();
+  const row = map[token];
+  if (!row) return null;
+  return {
+    userId: row.userId || null,
+    deviceId: row.deviceId || null,
+    email: row.email || null,
+    active: row.active !== false,
+  };
+}
+
+/**
+ * Detach a device token from its user (called on LOGOUT).
+ * Nulls user_id + email so private notifications (orders, cart, tracking,
+ * rewards) can never leak to the next person using the device. The token
+ * stays active so the device can still receive global broadcasts as a guest.
+ */
+async function detachTokenUser(token) {
+  if (!token) return;
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin
+        .from('push_tokens')
+        .update({
+          user_id: null,
+          email: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('token', token);
+      return;
+    } catch (error) {
+      console.error('[PUSH-DB] detach failed:', error.message);
+    }
+  }
+  const map = loadJsonFallback();
+  if (map[token]) {
+    map[token].userId = '';
+    map[token].email = '';
+    map[token].updatedAt = new Date().toISOString();
+    saveJsonFallback(map);
+  }
+}
+
 /** Remove a token completely. */
 async function removeToken(token) {
   if (!token) return;
@@ -172,4 +244,4 @@ async function removeToken(token) {
   saveJsonFallback(map);
 }
 
-module.exports = { loadTokens, upsertToken, removeToken, deactivateToken, isLikelyRealToken };
+module.exports = { loadTokens, upsertToken, removeToken, deactivateToken, detachTokenUser, findTokenRecord, isLikelyRealToken };
