@@ -16,13 +16,14 @@
 
 const axios = require('axios');
 const { supabaseAdmin } = require('./supabase-admin');
-const { config, isTransactionalType } = require('./push-config');
+const { config, isTransactionalType, categoryForType } = require('./push-config');
 const { loadTokens, deactivateToken, isLikelyRealToken } = require('./push-tokens-db');
 const {
   createCampaignEvent,
   updateCampaignStats,
   checkAndIncrementFrequency,
 } = require('./push-state-db');
+const { isCategoryEnabledForUser } = require('./preferences-db');
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_RECEIPTS_URL = 'https://exp.host/--/api/v2/push/getReceipts';
@@ -161,7 +162,23 @@ async function sendPush(opts) {
     return { campaignId, ...totals, duplicate: false, quietHours: true };
   }
 
+  // ── Preference suppression (marketing categories only) ────────────────
+  const category = categoryForType(campaignType);
+  const checkPreferences = opts.frequency && opts.frequency.check && !isTransactionalType(campaignType);
+
   for (const recipient of activeTokens(recipients)) {
+    // Server-side preference opt-out (marketing categories).
+    if (checkPreferences && (recipient.userId || recipient.email)) {
+      const identity = recipient.userId || recipient.email;
+      const prefAllowed = await isCategoryEnabledForUser(identity, category);
+      if (!prefAllowed) {
+        skipped += 1;
+        const reason = 'preference_disabled';
+        skipReasons[reason] = (skipReasons[reason] || 0) + 1;
+        continue;
+      }
+    }
+
     if (!applyFrequency) {
       eligible.push(recipient);
       continue;
@@ -170,7 +187,8 @@ async function sendPush(opts) {
     const freq = await checkAndIncrementFrequency(
       recipient.token,
       config.minPromoIntervalMinutes,
-      config.maxPromoPerDay
+      config.maxPromoPerDay,
+      recipient.userId
     );
     if (freq.allowed) {
       eligible.push(recipient);
@@ -192,6 +210,40 @@ async function sendPush(opts) {
     }
     log('info', 'No eligible recipients', { campaignId, ...totals });
     return { campaignId, ...totals, details: [] };
+  }
+
+  // ── Inbox persistence ─────────────────────────────────────────────────
+  // Save the in-app NOOD Inbox item BEFORE attempting delivery so it exists
+  // even if Expo delivery fails. Transactional + promotional pushes both
+  // appear. Duplicate campaigns were already filtered above (idempotent).
+  if (opts.saveInbox !== false) {
+    try {
+      const { createInboxItem } = require('./inbox-db');
+      const inferredUserId = opts.userId || inferSharedUserId(eligible);
+      const result = await createInboxItem({
+        campaignId,
+        type: campaignType,
+        title: opts.title,
+        body: opts.body,
+        data: opts.data,
+        route: opts.data?.route,
+        productHandle: opts.data?.productHandle,
+        orderId: opts.data?.orderId,
+        campaign: opts.data?.campaign,
+        userId: inferredUserId,
+        expiresAt: opts.expiresAt,
+      });
+      if (result.created) {
+        log('info', 'Inbox item created', {
+          campaignId: result.item?.campaignId || campaignId,
+          campaignType,
+          userId: inferredUserId || 'broadcast',
+        });
+      }
+    } catch (error) {
+      // Inbox persistence must never break the push send.
+      log('error', 'Inbox item save failed', { campaignId, error: error.message });
+    }
   }
 
   // ── Build + chunk + send ──────────────────────────────────────────────
@@ -269,6 +321,23 @@ async function campaignExistsSafe(campaignId) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Infer a shared user identity for the inbox record when a single user's
+ * devices dominate the recipient list. When recipients span multiple users
+ * (a true broadcast), returns null so the inbox item is a global broadcast.
+ */
+function inferSharedUserId(eligible) {
+  const counts = new Map();
+  for (const r of eligible) {
+    if (!r.userId) continue;
+    counts.set(r.userId, (counts.get(r.userId) || 0) + 1);
+  }
+  if (counts.size === 1) {
+    return counts.keys().next().value;
+  }
+  return null;
 }
 
 /**

@@ -6,6 +6,11 @@
 const express = require('express');
 const crypto = require('crypto');
 const { updateOrderFromFulfillment, updateOrderStatus } = require('../utils/order-sync');
+const {
+  upsertOrderTracking,
+  notifyTrackingChange,
+  normalizeStatus,
+} = require('../utils/tracking');
 
 const router = express.Router();
 
@@ -50,14 +55,48 @@ router.post('/webhooks/fulfillments/update', verifyShopifyWebhook, async (req, r
     // Update local order tracking from fulfillment data
     await updateOrderFromFulfillment(fulfillment);
 
-    // Transactional order-update push (always eligible — not frequency limited).
-    sendOrderUpdatePush({
-      orderId: String(fulfillment.order_id || ''),
+    // Normalize + persist tracking; only notify on meaningful changes.
+    const tracking = await upsertOrderTracking({
+      shopifyOrderId: String(fulfillment.order_id || ''),
+      orderName: String(fulfillment.name || ''),
       email: fulfillment.email || null,
-      status: fulfillment.status || 'updated',
-    }).catch((error) => {
-      console.error('[WEBHOOK] order-update push failed:', error.message);
+      carrier:
+        fulfillment.tracking_company ||
+        fulfillment.fulfillments?.[0]?.tracking_company ||
+        null,
+      trackingNumber:
+        fulfillment.tracking_number ||
+        fulfillment.fulfillments?.[0]?.tracking_number ||
+        null,
+      trackingUrl:
+        fulfillment.tracking_url ||
+        fulfillment.fulfillments?.[0]?.tracking_url ||
+        null,
+      rawStatus:
+        fulfillment.status ||
+        fulfillment.fulfillment_status ||
+        'confirmed',
+      latestEvent: {
+        title: fulfillment.message || null,
+        description: fulfillment.message || null,
+        location: null,
+        at: fulfillment.updated_at || null,
+      },
     });
+
+    console.log(
+      `[WEBHOOK] tracking normalized | order: ${fulfillment.order_id} | status: ${tracking.status} | changed: ${tracking.changed}`
+    );
+
+    if (tracking.changed) {
+      notifyTrackingChange(
+        String(fulfillment.order_id),
+        null,
+        { userId: null }
+      ).catch((error) => {
+        console.error('[WEBHOOK] tracking notify failed:', error.message);
+      });
+    }
 
     res.status(200).json({ success: true });
   } catch (error) {
@@ -65,48 +104,6 @@ router.post('/webhooks/fulfillments/update', verifyShopifyWebhook, async (req, r
     res.status(500).json({ error: 'Processing failed' });
   }
 });
-
-/**
- * Send a transactional order-update push to the customer's devices.
- * Transactional pushes bypass promotional frequency limits.
- */
-async function sendOrderUpdatePush({ orderId, email, status }) {
-  const { sendPush, loadAllRecipients } = require('../utils/push-delivery');
-
-  let recipients = await loadAllRecipients();
-  if (email) {
-    const emailRecipients = recipients.filter(
-      (t) => String(t.email || '').toLowerCase() === String(email).toLowerCase()
-    );
-    if (emailRecipients.length) {
-      recipients = emailRecipients;
-    }
-  }
-  if (!recipients.length) return;
-
-  const statusText =
-    status === 'fulfilled'
-      ? 'Your order has been shipped'
-      : status === 'cancelled'
-        ? 'Your order was cancelled'
-        : 'Your NOOD order has an update';
-
-  await sendPush({
-    recipients,
-    title: '📦 Order update',
-    body: `${statusText}. Tap to view tracking.`,
-    data: {
-      type: 'order-update',
-      route: '/account/orders',
-      orderId,
-      screen: 'orders',
-    },
-    campaignId: `noo_order_update_${orderId}_${Date.now().toString(36)}`,
-    campaignType: 'order-update',
-    frequency: { check: false },
-  });
-  console.log(`[WEBHOOK] order-update push sent for order ${orderId}`);
-}
 
 // Order fulfilled webhook (legacy)
 router.post('/webhooks/orders/fulfilled', verifyShopifyWebhook, async (req, res) => {

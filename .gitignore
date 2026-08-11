@@ -8,3 +8,6 @@ push-frequency-state.json
 new-product-state.json
 cart-users.json
 push-tokens.json
+push-inbox-state.json
+push-inbox-reads-state.json
+push-preferences-state.json

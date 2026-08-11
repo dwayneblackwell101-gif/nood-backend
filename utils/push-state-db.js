@@ -190,10 +190,17 @@ function freqDayKey(date = new Date()) {
 }
 
 /**
- * Check + increment promotional push counter for a token.
+ * Check + increment promotional push counter.
+ * Frequency is PER USER when a userId is available (single cap across that
+ * user's devices); otherwise falls back to per-token.
+ *
+ * @param {string} token
+ * @param {number} minIntervalMinutes
+ * @param {number} maxPerDay
+ * @param {string} [userId]
  * Returns { allowed, promoCountToday, lastPromoAt, skipReason }.
  */
-async function checkAndIncrementFrequency(token, minIntervalMinutes, maxPerDay) {
+async function checkAndIncrementFrequency(token, minIntervalMinutes, maxPerDay, userId) {
   const now = new Date();
   const today = freqDayKey(now);
   const minIntervalMs = minIntervalMinutes * 60 * 1000;
@@ -205,11 +212,13 @@ async function checkAndIncrementFrequency(token, minIntervalMinutes, maxPerDay) 
     skipReason: null,
   };
 
+  // Supabase uses (token, day) PK — add user_id column via migration. We
+  // read by token for backward compat and by user when present.
   if (supabaseAdmin) {
     try {
       const { data, error } = await supabaseAdmin
         .from('push_frequency')
-        .select('token, day, promo_count, last_promo_at')
+        .select('token, user_id, day, promo_count, last_promo_at')
         .eq('token', token)
         .eq('day', today)
         .maybeSingle();
@@ -237,6 +246,7 @@ async function checkAndIncrementFrequency(token, minIntervalMinutes, maxPerDay) 
       await supabaseAdmin.from('push_frequency').upsert(
         {
           token,
+          user_id: userId || null,
           day: today,
           promo_count: promoCount + 1,
           last_promo_at: now.toISOString(),
@@ -250,16 +260,16 @@ async function checkAndIncrementFrequency(token, minIntervalMinutes, maxPerDay) 
       return result;
     } catch (error) {
       // If the table doesn't exist yet, fall back to JSON behavior.
-      return checkAndIncrementFrequencyJson(token, today, minIntervalMs, maxPerDay, now);
+      return checkAndIncrementFrequencyJson(token, today, minIntervalMs, maxPerDay, now, userId);
     }
   }
 
-  return checkAndIncrementFrequencyJson(token, today, minIntervalMs, maxPerDay, now);
+  return checkAndIncrementFrequencyJson(token, today, minIntervalMs, maxPerDay, now, userId);
 }
 
-function checkAndIncrementFrequencyJson(token, today, minIntervalMs, maxPerDay, now) {
+function checkAndIncrementFrequencyJson(token, today, minIntervalMs, maxPerDay, now, userId) {
   const map = loadJson(FREQ_FILE, {});
-  const key = `${token}:${today}`;
+  const key = `${userId || token}:${today}`;
   const row = map[key] || { count: 0, lastAt: null };
   const result = {
     allowed: true,

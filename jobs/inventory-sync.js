@@ -17,26 +17,115 @@ const { sendNewProductCampaign } = require('./notification-campaigns');
 
 const INVENTORY_SYNC_INTERVAL_MINUTES = 30;
 
+/**
+ * Fetch the full active product list from Shopify.
+ *
+ * Primary: Admin REST API (https://<domain>/admin/api/2026-04/products.json).
+ * Fallback: Storefront GraphQL API — available on ALL Shopify plans, so the
+ * sync + new-product detection keep working even when the Admin API returns
+ * 402 (Payment Required — usually an unpaid invoice or a plan that does not
+ * include the Admin REST endpoint).
+ */
 async function fetchShopifyProductsForSync() {
   const domain = process.env.SHOPIFY_STORE_DOMAIN;
-  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  const adminToken = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  const storefrontToken = process.env.SHOPIFY_STOREFRONT_TOKEN;
+  const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION || '2026-04';
 
-  if (!domain || !token || domain.includes('your-store')) {
-    console.warn('[INVENTORY SYNC] Shopify Admin credentials not configured — skipping fetch');
+  if (!domain || domain.includes('your-store')) {
+    console.warn('[INVENTORY SYNC] Shopify domain not configured — skipping fetch');
     return [];
   }
 
-  try {
-    const response = await axios.get(`https://${domain}/admin/api/2026-04/products.json`, {
-      headers: { 'X-Shopify-Access-Token': token },
-      params: { limit: 250, status: 'active' },
-      timeout: 15000,
-    });
-    return Array.isArray(response?.data?.products) ? response.data.products : [];
-  } catch (error) {
-    console.error('[INVENTORY SYNC] Shopify fetch failed:', error.message);
-    return [];
+  // 1) Admin REST API.
+  if (adminToken) {
+    try {
+      const response = await axios.get(`https://${domain}/admin/api/${apiVersion}/products.json`, {
+        headers: { 'X-Shopify-Access-Token': adminToken },
+        params: { limit: 250, status: 'active' },
+        timeout: 15000,
+      });
+      if (Array.isArray(response?.data?.products)) {
+        console.log(`[INVENTORY SYNC] Fetched ${response.data.products.length} products via Admin API`);
+        return response.data.products;
+      }
+    } catch (error) {
+      const status = error?.response?.status;
+      if (status === 402) {
+        console.warn(
+          '[INVENTORY SYNC] Admin API returned 402 (Payment Required / plan limitation). Falling back to Storefront API.'
+        );
+      } else {
+        console.error('[INVENTORY SYNC] Shopify Admin fetch failed:', error.message);
+      }
+    }
   }
+
+  // 2) Storefront GraphQL fallback (works on all plans).
+  if (storefrontToken) {
+    try {
+      const query = `
+        query ProductsForSync {
+          products(first: 250, sortKey: CREATED_AT, reverse: true) {
+            edges {
+              node {
+                id
+                title
+                handle
+                createdAt
+                availableForSale
+                variants(first: 10) {
+                  edges {
+                    node {
+                      id
+                      availableForSale
+                      quantityAvailable
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+      const response = await axios.post(
+        `https://${domain}/api/${apiVersion}/graphql.json`,
+        { query },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Shopify-Storefront-Access-Token': storefrontToken,
+          },
+          timeout: 15000,
+        }
+      );
+      const edges = response?.data?.data?.products?.edges || [];
+      const products = edges.map((e) => {
+        const node = e.node;
+        // Convert gid://shopify/Product/123 → "123".
+        const idMatch = String(node.id || '').match(/(\d+)$/);
+        const variants = (node.variants?.edges || []).map((ve) => ({
+          id: String(ve.node.id || '').match(/(\d+)$/)?.[1] || String(ve.node.id || ''),
+          availableForSale: ve.node.availableForSale !== false,
+          inventoryQuantity: Number(ve.node.quantityAvailable || 0),
+        }));
+        return {
+          id: idMatch ? idMatch[1] : node.id,
+          title: node.title,
+          handle: node.handle,
+          variants,
+        };
+      });
+      if (products.length) {
+        console.log(`[INVENTORY SYNC] Fetched ${products.length} products via Storefront API fallback`);
+        return products;
+      }
+    } catch (error) {
+      console.error('[INVENTORY SYNC] Storefront API fallback failed:', error.message);
+    }
+  }
+
+  return [];
 }
 
 async function runInventorySync() {

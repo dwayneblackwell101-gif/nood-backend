@@ -1003,6 +1003,14 @@ app.listen(PORT, '0.0.0.0', () => {
     console.error('[JOBS] notifications routes failed to mount:', error.message);
   }
 
+  // Mount order tracking routes
+  try {
+    const { router: trackingRouter } = require('./routes/tracking');
+    app.use('/', trackingRouter);
+  } catch (error) {
+    console.error('[JOBS] tracking routes failed to mount:', error.message);
+  }
+
   // Start automated notification campaigns (Temu-style pushes with
   // frequency control + dedupe). Replaces the old new-product-campaign job,
   // which directly hit Expo's API — new-product pushes now fire from

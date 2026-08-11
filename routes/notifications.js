@@ -21,11 +21,32 @@ const { requireAdmin } = require('../utils/admin-auth');
 const { sendPush, loadAllRecipients } = require('../utils/push-delivery');
 const { config, campaignPriorityOf } = require('../utils/push-config');
 const { sendCampaign } = require('../jobs/notification-campaigns');
+const {
+  listInboxForUser,
+  getUnreadCount,
+  markInboxRead,
+  markAllInboxRead,
+} = require('../utils/inbox-db');
+const { loadPreferences, setPreference } = require('../utils/preferences-db');
 
 const router = express.Router();
 
 function safeString(value, fallback = '') {
   return String(value ?? fallback).trim();
+}
+
+/**
+ * Resolve the requesting user identity.
+ * - `userId` query/body param (profile id from the app)
+ * - falls back to `deviceId` (stable guest identity)
+ * Returns null if neither is provided.
+ */
+function resolveIdentity(req) {
+  const userId = safeString(req.query?.userId || req.body?.userId);
+  const deviceId = safeString(req.query?.deviceId || req.body?.deviceId);
+  if (userId) return { kind: 'user', id: userId };
+  if (deviceId) return { kind: 'device', id: deviceId };
+  return null;
 }
 
 // ─── Token registration ─────────────────────────────────────────────────
@@ -232,6 +253,95 @@ router.post('/api/notifications/deactivate-token', requireAdmin, async (req, res
   await deactivateToken(match.token);
   console.log(`[PUSH ADMIN] deactivated token | suffix: ...${suffix}`);
   return res.json({ success: true, message: 'Token deactivated' });
+});
+
+// ─── NOOD Inbox ─────────────────────────────────────────────────────────
+
+/**
+ * GET /api/notifications/inbox?userId=...&deviceId=...&limit=...
+ * Latest notifications visible to this user (broadcasts + their own),
+ * newest first, each with `read` state.
+ */
+router.get('/api/notifications/inbox', async (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) {
+    return res.status(400).json({ success: false, message: 'userId or deviceId is required' });
+  }
+
+  const limit = Number(req.query.limit) > 0 ? Number(req.query.limit) : undefined;
+  const items = await listInboxForUser({ userId: identity.id, limit });
+  return res.json({ success: true, items, total: items.length });
+});
+
+/**
+ * GET /api/notifications/inbox/unread-count?userId=...&deviceId=...
+ */
+router.get('/api/notifications/inbox/unread-count', async (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) {
+    return res.status(400).json({ success: false, message: 'userId or deviceId is required' });
+  }
+  const unread = await getUnreadCount({ userId: identity.id });
+  return res.json({ success: true, unreadCount: unread });
+});
+
+/**
+ * POST /api/notifications/inbox/:id/read
+ * Mark a single notification read for this user/device.
+ */
+router.post('/api/notifications/inbox/:id/read', async (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) {
+    return res.status(400).json({ success: false, message: 'userId or deviceId is required' });
+  }
+  const notificationId = safeString(req.params?.id);
+  if (!notificationId) {
+    return res.status(400).json({ success: false, message: 'notification id is required' });
+  }
+  const result = await markInboxRead({ userId: identity.id, notificationId });
+  return res.json({ success: result.success });
+});
+
+/**
+ * POST /api/notifications/inbox/read-all
+ * Mark all visible notifications read for this user/device.
+ */
+router.post('/api/notifications/inbox/read-all', async (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) {
+    return res.status(400).json({ success: false, message: 'userId or deviceId is required' });
+  }
+  const result = await markAllInboxRead({ userId: identity.id });
+  return res.json({ success: result.success, marked: result.marked });
+});
+
+// ─── Notification preferences ───────────────────────────────────────────
+
+/**
+ * GET /api/notifications/preferences?userId=...
+ */
+router.get('/api/notifications/preferences', async (req, res) => {
+  const userId = safeString(req.query?.userId);
+  if (!userId) {
+    return res.status(400).json({ success: false, message: 'userId is required' });
+  }
+  const prefs = await loadPreferences(userId);
+  return res.json({ success: true, preferences: prefs });
+});
+
+/**
+ * POST /api/notifications/preferences
+ * Body: { userId, category, enabled }
+ */
+router.post('/api/notifications/preferences', async (req, res) => {
+  const userId = safeString(req.body?.userId);
+  const category = safeString(req.body?.category);
+  const enabled = Boolean(req.body?.enabled);
+  if (!userId || !category) {
+    return res.status(400).json({ success: false, message: 'userId and category are required' });
+  }
+  const result = await setPreference(userId, category, enabled);
+  return res.json({ success: result.success });
 });
 
 module.exports = { router };

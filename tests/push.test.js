@@ -23,6 +23,9 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nood-push-test-'));
 process.env.PUSH_TOKENS_FILE = path.join(tmpDir, 'push-tokens.json');
 process.env.PUSH_CAMPAIGN_STATE_FILE = path.join(tmpDir, 'push-campaign-state.json');
 process.env.PUSH_FREQUENCY_STATE_FILE = path.join(tmpDir, 'push-frequency-state.json');
+process.env.PUSH_INBOX_FILE = path.join(tmpDir, 'push-inbox-state.json');
+process.env.PUSH_INBOX_READS_FILE = path.join(tmpDir, 'push-inbox-reads-state.json');
+process.env.PUSH_PREFERENCES_FILE = path.join(tmpDir, 'push-preferences-state.json');
 process.env.PUSH_QUIET_HOURS_ENABLED = 'false'; // tests must not be quiet-hour dependent
 process.env.PUSH_MAX_PROMO_PER_DAY = '100'; // per-test override
 process.env.PUSH_MIN_INTERVAL_MINUTES = '0';
@@ -79,6 +82,19 @@ const {
   isSupabaseServiceRoleKey,
   describeSupabaseKeyType,
 } = require('../utils/supabase-credential');
+const {
+  createInboxItem,
+  listInboxForUser,
+  getUnreadCount,
+  markInboxRead,
+  markAllInboxRead,
+} = require('../utils/inbox-db');
+const {
+  normalizeStatus,
+  upsertOrderTracking,
+  progressIndexFor,
+  typeForStatus,
+} = require('../utils/tracking');
 
 let passed = 0;
 let failed = 0;
@@ -107,6 +123,9 @@ function clearStateFiles() {
     process.env.PUSH_TOKENS_FILE,
     process.env.PUSH_CAMPAIGN_STATE_FILE,
     process.env.PUSH_FREQUENCY_STATE_FILE,
+    process.env.PUSH_INBOX_FILE,
+    process.env.PUSH_INBOX_READS_FILE,
+    process.env.PUSH_PREFERENCES_FILE,
   ]) {
     try {
       fs.unlinkSync(f);
@@ -519,7 +538,7 @@ async function testFrontendRouteMapping() {
   assert.deepStrictEqual(cart, { pathname: '/(tabs)/cart' });
 
   const order = mod.notificationToRoute({ type: 'order-update', orderId: '42' });
-  assert.deepStrictEqual(order, { pathname: '/account/orders', params: { orderId: '42' } });
+  assert.deepStrictEqual(order, { pathname: '/account/tracking', params: { orderId: '42' } });
 
   // Unsafe external route is rejected.
   const unsafe = mod.notificationToRoute({ type: 'general', route: 'https://evil.example.com' });
@@ -532,6 +551,281 @@ async function testFrontendRouteMapping() {
   // Invalid route falls back to typed routing.
   const invalidRoute = mod.notificationToRoute({ type: 'cart-nudge', route: '/../etc/passwd' });
   assert.deepStrictEqual(invalidRoute, { pathname: '/(tabs)/cart' });
+}
+
+// ═══ 14. Inbox persistence + read state ═════════════════════════════════
+
+async function testInboxPersistence() {
+  clearStateFiles();
+  const created = await createInboxItem({
+    campaignId: 'inbox_camp_1',
+    type: 'price-drop',
+    title: '⬇️ Price Drop',
+    body: 'Air Max dropped from $450 to $399.',
+    data: { type: 'price-drop', route: '/product/air-max', productHandle: 'air-max' },
+    productHandle: 'air-max',
+    userId: null, // broadcast
+  });
+  assert.strictEqual(created.created, true, 'first inbox item created');
+
+  // Retry same campaign → duplicate, NOT a second row.
+  const retry = await createInboxItem({
+    campaignId: 'inbox_camp_1',
+    type: 'price-drop',
+    title: '⬇️ Price Drop',
+    body: 'Air Max dropped.',
+    data: { type: 'price-drop' },
+  });
+  assert.strictEqual(retry.created, false, 'retry does not duplicate inbox item');
+
+  // User-specific inbox item.
+  const personal = await createInboxItem({
+    campaignId: 'inbox_camp_2',
+    type: 'daily-reward',
+    title: '🎁 Your NOOD reward is ready',
+    body: 'Open NOOD to claim it.',
+    data: { type: 'daily-reward', route: '/account/rewards' },
+    userId: 'user-123',
+  });
+  assert.strictEqual(personal.created, true, 'user-specific item created');
+
+  // Broadcast visible to everyone.
+  const forUserA = await listInboxForUser({ userId: 'user-123' });
+  const broadcastVisible = forUserA.some((i) => i.campaignId === 'inbox_camp_1');
+  assert.strictEqual(broadcastVisible, true, 'broadcast inbox item visible to user');
+  assert.ok(
+    forUserA.some((i) => i.campaignId === 'inbox_camp_2'),
+    'user-specific item visible to that user'
+  );
+
+  // User B sees broadcast but NOT user A's personal item.
+  const forUserB = await listInboxForUser({ userId: 'user-456' });
+  assert.ok(
+    forUserB.some((i) => i.campaignId === 'inbox_camp_1'),
+    'broadcast visible to another user'
+  );
+  assert.ok(
+    !forUserB.some((i) => i.campaignId === 'inbox_camp_2'),
+    'user-specific item NOT visible to another user'
+  );
+}
+
+async function testInboxUnreadAndMarkRead() {
+  clearStateFiles();
+  await createInboxItem({
+    campaignId: 'inbox_unread_1',
+    type: 'flash-live',
+    title: '⚡ Flash Deal',
+    body: 'Your deal is live now.',
+    data: { type: 'flash-live', route: '/modal' },
+    userId: null,
+  });
+  await createInboxItem({
+    campaignId: 'inbox_unread_2',
+    type: 'cart-nudge',
+    title: '👀 Still thinking about it?',
+    body: 'Your NOOD cart is waiting.',
+    data: { type: 'cart-nudge', route: '/(tabs)/cart' },
+    userId: 'user-x',
+  });
+
+  const before = await getUnreadCount({ userId: 'user-x' });
+  assert.strictEqual(before, 2, 'unread count is 2 before marking');
+
+  const items = await listInboxForUser({ userId: 'user-x' });
+  const broadcast = items.find((i) => i.campaignId === 'inbox_unread_1');
+  assert.ok(broadcast, 'broadcast found');
+  assert.strictEqual(broadcast.read, false, 'broadcast initially unread');
+
+  await markInboxRead({ userId: 'user-x', notificationId: broadcast.id });
+  const afterOne = await getUnreadCount({ userId: 'user-x' });
+  assert.strictEqual(afterOne, 1, 'unread count drops to 1 after marking one read');
+
+  await markAllInboxRead({ userId: 'user-x' });
+  const afterAll = await getUnreadCount({ userId: 'user-x' });
+  assert.strictEqual(afterAll, 0, 'unread count drops to 0 after mark all read');
+}
+
+// ═══ 15. Tracking normalization ═════════════════════════════════════════
+
+async function testTrackingNormalization() {
+  assert.strictEqual(normalizeStatus('fulfilled'), 'shipped');
+  assert.strictEqual(normalizeStatus('out_for_delivery'), 'out_for_delivery');
+  assert.strictEqual(normalizeStatus('Out for delivery'), 'out_for_delivery');
+  assert.strictEqual(normalizeStatus('delivered'), 'delivered');
+  assert.strictEqual(normalizeStatus('in_transit'), 'in_transit');
+  assert.strictEqual(normalizeStatus('delayed'), 'delayed');
+  assert.strictEqual(normalizeStatus('exception'), 'exception');
+  assert.strictEqual(normalizeStatus(''), 'confirmed');
+
+  assert.strictEqual(progressIndexFor('packed'), 1);
+  assert.strictEqual(progressIndexFor('out_for_delivery'), 4);
+  assert.strictEqual(progressIndexFor('delivered'), 5);
+  assert.strictEqual(progressIndexFor('exception'), -1);
+
+  assert.strictEqual(typeForStatus('out_for_delivery'), 'order-out-for-delivery');
+  assert.strictEqual(typeForStatus('delivered'), 'order-delivered');
+  assert.strictEqual(typeForStatus('exception'), 'order-exception');
+}
+
+// ═══ 16. Deep-link payload consistency (push ↔ inbox) ═══════════════════
+
+async function testDeepLinkConsistency() {
+  clearStateFiles();
+  const { templateFor } = require('../jobs/notification-campaigns');
+  const t = templateFor('price-drop', {
+    productTitle: 'Air Max',
+    productHandle: 'air-max',
+    oldPrice: '450',
+    newPrice: '399',
+  });
+
+  const inboxItem = await createInboxItem({
+    campaignId: 'inbox_deeplink_1',
+    type: 'price-drop',
+    title: t.title,
+    body: t.body,
+    data: t.data,
+    productHandle: t.data.productHandle,
+    route: t.data.route,
+    userId: null,
+  });
+  assert.strictEqual(inboxItem.created, true);
+
+  // The inbox item must carry the SAME deep-link target as the push.
+  const items = await listInboxForUser({ userId: 'any-user' });
+  const item = items.find((i) => i.campaignId === 'inbox_deeplink_1');
+  assert.ok(item, 'inbox item exists');
+  assert.strictEqual(item.title, t.title, 'same title as push');
+  assert.strictEqual(item.body, t.body, 'same body as push');
+  assert.strictEqual(item.route, t.data.route, 'same route as push');
+  assert.strictEqual(item.productHandle, t.data.productHandle, 'same productHandle as push');
+  assert.strictEqual(item.type, 'price-drop', 'same type as push');
+}
+
+// ═══ 17. Push → inbox integration ══════════════════════════════════════
+
+async function testPushCreatesInboxItem() {
+  clearStateFiles();
+  freshTokens({
+    'ExponentPushToken[test-token-hhh]': {
+      token: 'ExponentPushToken[test-token-hhh]',
+      userId: 'user-push',
+      active: true,
+      test: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  sentBatches.length = 0;
+
+  // sendPush with a single-user recipient → inbox item should be created
+  // for that user.
+  const { sendPush, loadAllRecipients } = require('../utils/push-delivery');
+  const result = await sendPush({
+    recipients: await loadAllRecipients(),
+    title: '🔥 New Drop',
+    body: 'Air Max Plus just landed.',
+    data: { type: 'new_product', route: '/product/air-max-plus', productHandle: 'air-max-plus' },
+    campaignId: 'push_inbox_camp_1',
+    campaignType: 'new_product',
+    frequency: { check: false },
+  });
+  assert.strictEqual(result.sent, 1, 'push sent');
+
+  const items = await listInboxForUser({ userId: 'user-push' });
+  const item = items.find((i) => i.campaignId === 'push_inbox_camp_1');
+  assert.ok(item, 'push created an inbox item');
+  assert.strictEqual(item.title, '🔥 New Drop', 'inbox title matches push title');
+  assert.strictEqual(item.type, 'new_product', 'inbox type matches push type');
+  assert.strictEqual(item.productHandle, 'air-max-plus', 'inbox productHandle matches push');
+  assert.strictEqual(item.route, '/product/air-max-plus', 'inbox route matches push route');
+}
+
+// ═══ 18. Broadcast inbox visibility (all users see it) ═════════════════
+
+async function testBroadcastInboxVisibility() {
+  clearStateFiles();
+  // Two users registered.
+  freshTokens({
+    'ExponentPushToken[test-token-iii]': {
+      token: 'ExponentPushToken[test-token-iii]',
+      userId: 'user-a',
+      active: true,
+      test: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    'ExponentPushToken[test-token-jjj]': {
+      token: 'ExponentPushToken[test-token-jjj]',
+      userId: 'user-b',
+      active: true,
+      test: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  sentBatches.length = 0;
+
+  const { sendPush, loadAllRecipients } = require('../utils/push-delivery');
+  await sendPush({
+    recipients: await loadAllRecipients(),
+    title: '⚡ Flash Deal',
+    body: 'Your deal is live now.',
+    data: { type: 'flash-live', route: '/modal' },
+    campaignId: 'broadcast_inbox_1',
+    campaignType: 'flash-live',
+    frequency: { check: false },
+  });
+
+  // Multi-user recipients → broadcast inbox item (userId null).
+  const forA = await listInboxForUser({ userId: 'user-a' });
+  const forB = await listInboxForUser({ userId: 'user-b' });
+  assert.ok(
+    forA.some((i) => i.campaignId === 'broadcast_inbox_1'),
+    'user A sees the broadcast inbox item'
+  );
+  assert.ok(
+    forB.some((i) => i.campaignId === 'broadcast_inbox_1'),
+    'user B sees the broadcast inbox item'
+  );
+}
+
+// ═══ 19. Tracking deep-link routes ═════════════════════════════════════
+
+async function testTrackingDeepLink() {
+  const appDir = path.resolve(__dirname, '..', '..', 'nood-app');
+  const outDir = path.join(tmpDir, 'nht2');
+  fs.mkdirSync(outDir, { recursive: true });
+  execSync(
+    `npx tsc ${path.join(appDir, 'utils', 'notification-handling.ts')} --outDir ${outDir} --module commonjs --target es2020 --skipLibCheck --esModuleInterop`,
+    { cwd: appDir, stdio: 'pipe' }
+  );
+  const mod = require(path.join(outDir, 'notification-handling.js'));
+
+  // Order tracking → tracking screen.
+  const track = mod.notificationToRoute({ type: 'order-out-for-delivery', orderId: 'abc123' });
+  assert.deepStrictEqual(track, { pathname: '/account/tracking', params: { orderId: 'abc123' } });
+
+  // Refund → returns screen.
+  const refund = mod.notificationToRoute({ type: 'refund-completed', orderId: 'abc123' });
+  assert.deepStrictEqual(refund, { pathname: '/account/returns', params: { orderId: 'abc123' } });
+
+  // Wishlist price drop → product.
+  const wishlist = mod.notificationToRoute({ type: 'wishlist-sale', productHandle: 'air-force-1' });
+  assert.deepStrictEqual(wishlist, { pathname: '/product/[handle]', params: { handle: 'air-force-1' } });
+
+  // Spin ready → rewards with autoSpin.
+  const spin = mod.notificationToRoute({ type: 'spin-ready' });
+  assert.deepStrictEqual(spin, { pathname: '/account/rewards', params: { autoSpin: '1' } });
+
+  // Deal → deals tab.
+  const deal = mod.notificationToRoute({ type: 'deal-ending' });
+  assert.deepStrictEqual(deal, { pathname: '/(tabs)/deals' });
+
+  // Support → support screen.
+  const support = mod.notificationToRoute({ type: 'support-reply' });
+  assert.deepStrictEqual(support, { pathname: '/account/support' });
 }
 
 // ═══ Run ═══════════════════════════════════════════════════════════════
@@ -550,6 +844,13 @@ async function main() {
   await test('admin auth rejects invalid tokens', testAdminAuth);
   await test('frontend deep-link routing validates routes', testFrontendRouteMapping);
   await test('supabase credential validation accepts secret + service_role, rejects publishable/anon/missing', testSupabaseCredentialValidation);
+  await test('inbox persistence: created on push, retry no duplicate, broadcast + user visibility', testInboxPersistence);
+  await test('inbox unread count + mark read + mark all read', testInboxUnreadAndMarkRead);
+  await test('tracking normalization maps all statuses', testTrackingNormalization);
+  await test('deep-link payload consistency between push and inbox', testDeepLinkConsistency);
+  await test('push campaign creates an inbox item with matching payload', testPushCreatesInboxItem);
+  await test('broadcast push inbox item visible to all users', testBroadcastInboxVisibility);
+  await test('tracking deep-link routes to tracking screen', testTrackingDeepLink);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   try {
