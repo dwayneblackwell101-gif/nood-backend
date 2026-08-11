@@ -75,6 +75,10 @@ const { sendPush, loadAllRecipients } = require('../utils/push-delivery');
 const { detectNewProducts } = require('../utils/inventory');
 const { sendNewProductCampaign, sendCampaign, templateFor } = require('../jobs/notification-campaigns');
 const { requireAdmin, isAdminConfigured } = require('../utils/admin-auth');
+const {
+  isSupabaseServiceRoleKey,
+  describeSupabaseKeyType,
+} = require('../utils/supabase-credential');
 
 let passed = 0;
 let failed = 0;
@@ -446,6 +450,57 @@ function testAdminAuth() {
   assert.strictEqual(rejected, true, 'invalid admin token rejected with 401');
 }
 
+// ═══ 13. Supabase credential validation ═════════════════════════════════
+function makeLegacyJwt(role) {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ role })).toString('base64url');
+  return `${header}.${payload}.signature`;
+}
+
+async function testSupabaseCredentialValidation() {
+  // Modern sb_secret_ keys accepted.
+  assert.strictEqual(
+    isSupabaseServiceRoleKey('sb_secret_AbCdEfGhIjKlMnOpQrStUvWxYz1234567890'),
+    true,
+    'sb_secret_ key accepted'
+  );
+  assert.strictEqual(
+    describeSupabaseKeyType('sb_secret_AbCdEfGhIjKlMnOpQrStUvWxYz1234567890'),
+    'modern-secret',
+    'modern key typed as modern-secret'
+  );
+
+  // Legacy service_role JWT accepted.
+  const legacy = makeLegacyJwt('service_role');
+  assert.strictEqual(isSupabaseServiceRoleKey(legacy), true, 'legacy service_role JWT accepted');
+  assert.strictEqual(
+    describeSupabaseKeyType(legacy),
+    'legacy-service-role',
+    'legacy key typed as legacy-service-role'
+  );
+
+  // sb_publishable_ rejected.
+  assert.strictEqual(
+    isSupabaseServiceRoleKey('sb_publishable_AbCdEfGhIjKlMnOpQrStUvWxYz'),
+    false,
+    'sb_publishable_ key rejected'
+  );
+  assert.strictEqual(
+    describeSupabaseKeyType('sb_publishable_AbCdEfGhIjKlMnOpQrStUvWxYz'),
+    'publishable-rejected',
+    'publishable key typed as publishable-rejected'
+  );
+
+  // Legacy anon JWT rejected.
+  assert.strictEqual(isSupabaseServiceRoleKey(makeLegacyJwt('anon')), false, 'anon JWT rejected');
+
+  // Missing / empty / malformed rejected.
+  assert.strictEqual(isSupabaseServiceRoleKey(''), false, 'empty key rejected');
+  assert.strictEqual(isSupabaseServiceRoleKey(undefined), false, 'missing key rejected');
+  assert.strictEqual(isSupabaseServiceRoleKey('eyJ.not-a-valid-jwt'), false, 'malformed JWT rejected');
+  assert.strictEqual(isSupabaseServiceRoleKey('sb_unknown_xyz'), false, 'unknown sb_ key rejected');
+}
+
 // ═══ 12. Frontend deep-link routing (compiled TS) ══════════════════════
 async function testFrontendRouteMapping() {
   const appDir = path.resolve(__dirname, '..', '..', 'nood-app');
@@ -494,6 +549,7 @@ async function main() {
   await test('deep-link payload generation for all campaign types', testDeepLinkPayloads);
   await test('admin auth rejects invalid tokens', testAdminAuth);
   await test('frontend deep-link routing validates routes', testFrontendRouteMapping);
+  await test('supabase credential validation accepts secret + service_role, rejects publishable/anon/missing', testSupabaseCredentialValidation);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   try {
