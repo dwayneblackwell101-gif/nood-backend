@@ -123,6 +123,48 @@ router.post('/api/notifications/logout', async (req, res) => {
   return res.json({ success: true, message: 'Token detached from user' });
 });
 
+/**
+ * POST /api/notifications/dev-seed — DEV-ONLY visual test seeding.
+ * Creates one real inbox event per card style (Deal, Reward, Shipping,
+ * New Arrival, Cart, Wishlist, Support) so the Home fourth slide can be
+ * visually tested in development. Disabled in production.
+ *
+ * SECURITY: guarded by PUSH_DEV_SEED=1 (not by admin token — never enabled
+ * on Render). Creates GLOBAL broadcast inbox items only.
+ */
+const DEV_SEED_EVENTS = [
+  { type: 'deal-live', title: '🔥 Deal Live', body: "Up to 40% off today's picks.", route: '/(tabs)/deals' },
+  { type: 'reward-unlocked', title: '🎁 Reward Unlocked', body: 'You earned a new NOOD reward.', route: '/account/rewards' },
+  { type: 'order-shipped', title: '📦 Order Shipped', body: 'Your order is on its way.', route: '/account/tracking' },
+  { type: 'new_product', title: '🆕 New Arrival', body: 'Fresh styles just landed on NOOD.', route: '/collection/new-arrivals' },
+  { type: 'cart-nudge', title: '🛒 Cart Waiting', body: 'Your NOOD cart is waiting for you.', route: '/(tabs)/cart' },
+  { type: 'wishlist-sale', title: '💜 Wishlist Sale', body: 'An item you saved just dropped in price.', route: '/(tabs)/wishlist' },
+  { type: 'support-reply', title: '💬 Support Reply', body: 'Your support case has a new reply.', route: '/account/support' },
+];
+
+router.post('/api/notifications/dev-seed', async (req, res) => {
+  if (String(process.env.PUSH_DEV_SEED || '').trim() !== '1') {
+    return res.status(403).json({ success: false, message: 'Dev seeding disabled' });
+  }
+
+  const { createInboxItem } = require('../utils/inbox-db');
+  let created = 0;
+  for (const event of DEV_SEED_EVENTS) {
+    const result = await createInboxItem({
+      campaignId: `dev_seed_${event.type}_${Date.now().toString(36)}`,
+      type: event.type,
+      title: event.title,
+      body: event.body,
+      data: { type: event.type, route: event.route },
+      route: event.route,
+      userId: null, // global broadcast so all dev devices see them
+    });
+    if (result.created) created += 1;
+  }
+  console.log(`[PUSH DEV] seeded ${created} visual test inbox events`);
+  return res.json({ success: true, created });
+});
+
 // ─── Admin: device listing ──────────────────────────────────────────────
 
 /**
