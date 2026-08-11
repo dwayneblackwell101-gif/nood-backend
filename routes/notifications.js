@@ -304,7 +304,8 @@ router.get('/api/notifications/inbox', async (req, res) => {
   }
 
   const limit = Number(req.query.limit) > 0 ? Number(req.query.limit) : undefined;
-  const items = await listInboxForUser({ userId: identity.id, limit });
+  const offset = Number(req.query.offset) > 0 ? Number(req.query.offset) : undefined;
+  const items = await listInboxForUser({ userId: identity.id, limit, offset });
   return res.json({ success: true, items, total: items.length });
 });
 

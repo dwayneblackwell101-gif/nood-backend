@@ -187,9 +187,9 @@ function createInboxItemJson(item) {
 
 /**
  * List inbox items visible to a user (broadcasts + their own), newest first,
- * each annotated with `read`.
+ * each annotated with `read`. Supports `limit` + `offset` for load-more.
  */
-async function listInboxForUser({ userId, limit }) {
+async function listInboxForUser({ userId, limit, offset }) {
   let items;
   if (supabaseAdmin) {
     try {
@@ -203,7 +203,11 @@ async function listInboxForUser({ userId, limit }) {
       if (personalResult.error) throw personalResult.error;
 
       const rows = [...(broadcastResult.data || []), ...(personalResult.data || [])];
-      rows.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+      rows.sort((a, b) => {
+        const timeDiff = new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+        if (timeDiff !== 0) return timeDiff;
+        return String(b.id || '').localeCompare(String(a.id || ''));
+      });
       items = rows.map(serializeItem);
     } catch (error) {
       console.error('[INBOX] Supabase list failed, using JSON fallback:', error.message);
@@ -220,8 +224,12 @@ async function listInboxForUser({ userId, limit }) {
     read: Boolean(reads[item.id]),
   }));
 
+  const start = Number(offset) > 0 ? Number(offset) : 0;
   if (limit && Number(limit) > 0) {
-    return annotated.slice(0, Number(limit));
+    return annotated.slice(start, start + Number(limit));
+  }
+  if (start > 0) {
+    return annotated.slice(start);
   }
   return annotated;
 }
@@ -230,7 +238,13 @@ function listInboxJson(userId) {
   const store = loadJson(INBOX_FILE, { items: [] });
   return store.items
     .filter((i) => !i.userId || i.userId === userId)
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    .sort((a, b) => {
+      const timeDiff = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      if (timeDiff !== 0) return timeDiff;
+      // Deterministic tiebreak (newest id first) so same-millisecond inserts
+      // still paginate consistently.
+      return String(b.id || '').localeCompare(String(a.id || ''));
+    })
     .map(serializeItem);
 }
 

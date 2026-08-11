@@ -942,7 +942,47 @@ async function testMultiDeviceSameUser() {
   assert.strictEqual(matches.length, 1, 'one logical inbox item shared across devices');
 }
 
-// ═══ 21. Catalog routes exist + proxy logic ════════════════════════════
+// ═══ 21. Inbox offset pagination (load-more) ═══════════════════════════
+
+async function testInboxPagination() {
+  clearStateFiles();
+  for (let i = 0; i < 5; i += 1) {
+    await createInboxItem({
+      campaignId: `page_item_${i}`,
+      type: 'broadcast',
+      title: `Item ${i}`,
+      body: `Body ${i}`,
+      data: { type: 'broadcast', route: '/(tabs)' },
+      userId: null,
+    });
+  }
+
+  // Page 1: limit 2 → first 2 items (newest first by createdAt).
+  const page1 = await listInboxForUser({ userId: 'any-user', limit: 2 });
+  assert.strictEqual(page1.length, 2, 'page 1 has 2 items');
+  const allIds = (await listInboxForUser({ userId: 'any-user' })).map((i) => i.campaignId);
+  assert.strictEqual(allIds.length, 5, 'all 5 items visible');
+
+  // Newest first: createdAt must be non-increasing across the full list.
+  for (let i = 1; i < allIds.length; i += 1) {
+    const prev = (await listInboxForUser({ userId: 'any-user' })).find((x) => x.campaignId === allIds[i - 1]);
+    const cur = (await listInboxForUser({ userId: 'any-user' })).find((x) => x.campaignId === allIds[i]);
+    assert.ok(
+      new Date(prev.createdAt).getTime() >= new Date(cur.createdAt).getTime(),
+      'newest first ordering by createdAt'
+    );
+  }
+
+  // Pages are disjoint and cover all 5 items.
+  const p1 = (await listInboxForUser({ userId: 'any-user', limit: 2 })).map((i) => i.campaignId);
+  const p2 = (await listInboxForUser({ userId: 'any-user', limit: 2, offset: 2 })).map((i) => i.campaignId);
+  const p3 = (await listInboxForUser({ userId: 'any-user', limit: 2, offset: 4 })).map((i) => i.campaignId);
+  const combined = [...p1, ...p2, ...p3];
+  assert.strictEqual(new Set(combined).size, 5, 'pages are disjoint and cover all items');
+  assert.deepStrictEqual([...combined].sort(), [...allIds].sort(), 'same item set across pages');
+}
+
+// ═══ 22. Catalog routes exist + proxy logic ════════════════════════════
 
 async function testCatalogRoutes() {
   // Mock Shopify Storefront GraphQL.
@@ -1031,6 +1071,7 @@ async function main() {
   await test('logout detaches token from user (no private leak)', testTokenDetachOnLogout);
   await test('same user on two devices shares one logical inbox item', testMultiDeviceSameUser);
   await test('catalog routes exist and return JSON (kids/women/collections/products/search)', testCatalogRoutes);
+  await test('inbox offset pagination (load-more) returns pages correctly', testInboxPagination);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   try {
