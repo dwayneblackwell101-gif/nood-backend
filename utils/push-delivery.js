@@ -24,6 +24,7 @@ const {
   checkAndIncrementFrequency,
 } = require('./push-state-db');
 const { isCategoryEnabledForUser } = require('./preferences-db');
+const { trackNotificationEvent } = require('./notification-analytics');
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_RECEIPTS_URL = 'https://exp.host/--/api/v2/push/getReceipts';
@@ -142,7 +143,21 @@ async function sendPush(opts) {
       return { campaignId, sent: 0, failed: 0, skipped: recipients.length, duplicate: true };
     }
     log('info', 'Campaign created', { campaignId, campaignType, recipients: recipients.length });
+    await trackNotificationEvent('campaign_created', {
+      type: campaignType,
+      category: categoryForType(campaignType),
+      campaignId,
+      count: recipients.length,
+    });
   }
+
+  // ── Analytics: notification created ───────────────────────────────────
+  await trackNotificationEvent('notification_created', {
+    type: campaignType,
+    category: categoryForType(campaignType),
+    campaignId,
+    count: recipients.length,
+  });
 
   // ── Frequency gates (promotional only) ────────────────────────────────
   const applyFrequency = opts.frequency && opts.frequency.check && !isTransactionalType(campaignType);
@@ -278,11 +293,23 @@ async function sendPush(opts) {
           sent += 1;
           details.push({ to: message.to, status: 'ok', ticketId: status.id || null });
           log('info', 'Sent', { ticketId: status.id || null, tokenSuffix: message.to.slice(-12) });
+          await trackNotificationEvent('push_sent', {
+            type: campaignType,
+            category: categoryForType(campaignType),
+            campaignId,
+            tokenSuffix: message.to.slice(-12),
+          });
         } else {
           failed += 1;
           const error = status?.details?.error || 'Unknown';
           details.push({ to: message.to, status: 'error', error });
           log('error', 'Send failed', { error, tokenSuffix: message.to.slice(-12) });
+          await trackNotificationEvent('push_failed', {
+            type: campaignType,
+            category: categoryForType(campaignType),
+            campaignId,
+            tokenSuffix: message.to.slice(-12),
+          });
 
           if (error === 'DeviceNotRegistered') {
             failedTokens.push(message.to);
@@ -309,6 +336,14 @@ async function sendPush(opts) {
   if (campaignId) {
     await updateCampaignStats(campaignId, totals);
   }
+
+  // ── Analytics: campaign sent (post-delivery totals) ───────────────────
+  await trackNotificationEvent('campaign_sent', {
+    type: campaignType,
+    category: categoryForType(campaignType),
+    campaignId,
+    count: sent,
+  });
 
   log('info', `Sent: ${sent} Failed: ${failed} Skipped: ${skipped}`, { campaignId });
   return { campaignId, ...totals, details };

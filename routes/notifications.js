@@ -28,6 +28,8 @@ const {
   markAllInboxRead,
 } = require('../utils/inbox-db');
 const { loadPreferences, setPreference } = require('../utils/preferences-db');
+const { REGISTRY, entryFor, statusFor } = require('../utils/notification-registry');
+const { getAnalyticsSummary } = require('../utils/notification-analytics');
 
 const router = express.Router();
 
@@ -129,8 +131,9 @@ router.post('/api/notifications/logout', async (req, res) => {
  * New Arrival, Cart, Wishlist, Support) so the Home fourth slide can be
  * visually tested in development. Disabled in production.
  *
- * SECURITY: guarded by PUSH_DEV_SEED=1 (not by admin token — never enabled
- * on Render). Creates GLOBAL broadcast inbox items only.
+ * SECURITY: guarded by BOTH PUSH_DEV_SEED=1 AND NODE_ENV !== 'production'.
+ * A production environment can never enable dev seeding even if the env var
+ * is accidentally set — production customers must never reach this route.
  */
 const DEV_SEED_EVENTS = [
   { type: 'deal-live', title: '🔥 Deal Live', body: "Up to 40% off today's picks.", route: '/(tabs)/deals' },
@@ -142,8 +145,15 @@ const DEV_SEED_EVENTS = [
   { type: 'support-reply', title: '💬 Support Reply', body: 'Your support case has a new reply.', route: '/account/support' },
 ];
 
+/** Dev seeding is enabled only when PUSH_DEV_SEED=1 AND NODE_ENV is not production. */
+function devSeedEnabled() {
+  const flag = String(process.env.PUSH_DEV_SEED || '').trim() === '1';
+  const isProd = String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
+  return flag && !isProd;
+}
+
 router.post('/api/notifications/dev-seed', async (req, res) => {
-  if (String(process.env.PUSH_DEV_SEED || '').trim() !== '1') {
+  if (!devSeedEnabled()) {
     return res.status(403).json({ success: false, message: 'Dev seeding disabled' });
   }
 
@@ -422,4 +432,124 @@ router.post('/api/notifications/preferences', async (req, res) => {
   return res.json({ success: result.success });
 });
 
-module.exports = { router };
+// ─── Campaign Center API ────────────────────────────────────────────────
+
+/**
+ * GET /api/campaign-center/summary — dashboard stats (ADMIN).
+ * Returns recent campaigns, delivery totals, device count, analytics.
+ */
+router.get('/api/campaign-center/summary', requireAdmin, async (req, res) => {
+  try {
+    const { campaignExists } = require('../utils/push-state-db');
+    const campaigns = await getRecentCampaigns(20);
+    const devices = await loadTokens();
+    const analytics = await getAnalyticsSummary();
+    return res.json({
+      success: true,
+      campaigns,
+      deviceCount: Object.keys(devices).length,
+      analytics,
+      config: {
+        minPromoIntervalMinutes: config.minPromoIntervalMinutes,
+        maxPromoPerDay: config.maxPromoPerDay,
+        quietHoursEnabled: config.quietHoursEnabled,
+        quietHoursStart: config.quietHoursStart,
+        quietHoursEnd: config.quietHoursEnd,
+        newProductBatchThreshold: config.newProductBatchThreshold,
+      },
+    });
+  } catch (error) {
+    console.error('[CAMPAIGN CENTER] summary error:', error.message);
+    return res.status(500).json({ success: false, message: 'Failed to load summary' });
+  }
+});
+
+/**
+ * GET /api/campaign-center/registry — full notification type registry (ADMIN).
+ */
+router.get('/api/campaign-center/registry', requireAdmin, async (req, res) => {
+  return res.json({ success: true, registry: REGISTRY });
+});
+
+/**
+ * POST /api/campaign-center/preview — preview a campaign before sending (ADMIN).
+ * Body: { type, title, body, productHandle, orderId, route }
+ * Returns the template + validated deep link WITHOUT sending.
+ */
+router.post('/api/campaign-center/preview', requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const type = safeString(body.type, 'general');
+  const entry = entryFor(type);
+
+  // Deep-link builder (mirrors frontend notification-handling.ts logic).
+  let route = safeString(body.route);
+  if (!route && entry?.deepLink) {
+    route = entry.deepLink;
+    // Substitute placeholders.
+    route = route.replace('<handle>', encodeURIComponent(safeString(body.productHandle)))
+      .replace('<product>', encodeURIComponent(safeString(body.productHandle)))
+      .replace('<orderId>', encodeURIComponent(safeString(body.orderId)));
+  }
+
+  return res.json({
+    success: true,
+    type,
+    status: statusFor(type),
+    title: safeString(body.title) || entry?.template?.title || 'NOOD',
+    body: safeString(body.body) || entry?.template?.body || '',
+    deepLink: route || null,
+    category: entry?.category || 'general',
+    priority: entry?.priority || 'promotional',
+    freqCapped: entry ? entry.freqCapped !== false : true,
+  });
+});
+
+/**
+ * GET /api/campaign-center/audit — audit log (ADMIN).
+ * Returns recent campaign events from push_campaign_events.
+ */
+router.get('/api/campaign-center/audit', requireAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  try {
+    const events = await getRecentCampaigns(limit);
+    return res.json({ success: true, events });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Failed to load audit log' });
+  }
+});
+
+/** Load recent campaign events from push_campaign_events (Supabase or JSON). */
+async function getRecentCampaigns(limit) {
+  const { supabaseAdmin } = require('../utils/supabase-admin');
+  if (supabaseAdmin) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('push_campaign_events')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(limit);
+      if (error) throw error;
+      return data || [];
+    } catch (error) {
+      console.error('[CAMPAIGN CENTER] campaign fetch failed:', error.message);
+    }
+  }
+  // JSON fallback.
+  const fs = require('fs');
+  const path = require('path');
+  const file = process.env.PUSH_CAMPAIGN_STATE_FILE || path.join(__dirname, '..', 'push-campaign-state.json');
+  try {
+    if (!fs.existsSync(file)) return [];
+    const raw = fs.readFileSync(file, 'utf8');
+    if (!raw.trim()) return [];
+    const parsed = JSON.parse(raw);
+    const byId = parsed?.byId || {};
+    return Object.values(byId)
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+      .slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+module.exports = { router, devSeedEnabled };

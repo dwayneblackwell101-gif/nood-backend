@@ -11,3 +11,6 @@ push-tokens.json
 push-inbox-state.json
 push-inbox-reads-state.json
 push-preferences-state.json
+push-analytics-state.json
+# Stray captured git output (harmless, never commit)
+ersShellsonDesktopnood-backend

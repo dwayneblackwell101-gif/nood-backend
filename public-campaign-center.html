@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NOOD Campaign Center</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #f6f3ef;
+    min-height: 100vh;
+    color: #111;
+  }
+  header {
+    background: #111;
+    color: #fff;
+    padding: 20px 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  header h1 { font-size: 20px; font-weight: 900; }
+  header .sub { color: #bbb; font-size: 12px; margin-top: 2px; }
+  .admin-token {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .admin-token input {
+    background: #222; border: 1px solid #444; color: #fff;
+    padding: 8px 10px; border-radius: 8px; font-size: 12px; width: 220px;
+  }
+  .tabs { display: flex; gap: 8px; padding: 16px 24px 0; }
+  .tab {
+    padding: 10px 18px; border-radius: 10px 10px 0 0; font-size: 13px; font-weight: 700;
+    background: #e8e2da; color: #555; cursor: pointer; border: none;
+  }
+  .tab.active { background: #fff; color: #111; }
+  .panel { background: #fff; margin: 0 24px 24px; border-radius: 0 12px 12px 12px; padding: 24px; }
+  .hidden { display: none; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+  .stat {
+    background: #fbf7f2; border: 1px solid #e5d9ce; border-radius: 12px; padding: 16px;
+  }
+  .stat .label { font-size: 11px; font-weight: 800; color: #8a7a6f; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat .value { font-size: 28px; font-weight: 900; color: #111; margin-top: 6px; }
+
+  label { display: block; font-size: 12px; font-weight: 800; color: #333; margin: 14px 0 6px; }
+  input, textarea, select {
+    width: 100%; padding: 10px 12px; border: 1.5px solid #e5d9ce; border-radius: 10px;
+    font-size: 14px; background: #fbf7f2; font-family: inherit;
+  }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: #ff6a00; background: #fff; }
+  textarea { min-height: 70px; resize: vertical; }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 1; }
+  .btn {
+    background: linear-gradient(135deg, #ff6a00, #ff8a3d); border: none; color: #fff;
+    font-size: 14px; font-weight: 900; padding: 12px 18px; border-radius: 10px; cursor: pointer;
+    margin-top: 16px;
+  }
+  .btn.secondary { background: #f0ece6; color: #333; border: 1px solid #ddd; }
+  .btn.danger { background: #ff3b30; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .result { margin-top: 14px; border-radius: 10px; padding: 12px; font-size: 13px; font-weight: 600; display: none; line-height: 1.5; word-break: break-word; }
+  .result.success { display: block; background: #e0f5e8; color: #1a7a3d; }
+  .result.error { display: block; background: #fdecea; color: #c0392b; }
+  .note { margin-top: 14px; background: #fff7e6; border-radius: 8px; padding: 10px; font-size: 12px; color: #8a6a1a; border: 1px solid #ffe3a8; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; padding: 8px; background: #f6f3ef; color: #555; font-weight: 800; }
+  td { padding: 8px; border-bottom: 1px solid #f0ece6; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 800; }
+  .badge.real { background: #e0f5e8; color: #1a7a3d; }
+  .badge.partial { background: #fff7e6; color: #8a6a1a; }
+  .badge.nw { background: #f0ece6; color: #777; }
+
+  .preview-box {
+    background: #fbf7f2; border: 1px solid #e5d9ce; border-radius: 10px; padding: 14px; margin-top: 12px;
+  }
+  .preview-box .ptitle { font-size: 15px; font-weight: 800; }
+  .preview-box .pbody { font-size: 13px; color: #555; margin-top: 4px; }
+  .preview-box .proute { font-size: 11px; color: #ff6a00; font-weight: 700; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>📣 NOOD Campaign Center</h1>
+    <div class="sub">Send push + Inbox notifications without a deploy</div>
+  </div>
+  <div class="admin-token">
+    <input id="adminToken" type="password" placeholder="NOOD_ADMIN_TOKEN" autocomplete="off" />
+  </div>
+</header>
+
+<div class="tabs">
+  <button class="tab active" data-panel="dashboard">Dashboard</button>
+  <button class="tab" data-panel="create">Create Campaign</button>
+  <button class="tab" data-panel="registry">Notification Types</button>
+  <button class="tab" data-panel="audit">Audit Log</button>
+</div>
+
+<!-- Dashboard -->
+<div class="panel" id="panel-dashboard">
+  <div class="grid" id="statGrid"></div>
+  <h3 style="margin-top:24px; font-size:15px;">Recent Campaigns</h3>
+  <table style="margin-top:12px;">
+    <thead><tr><th>Campaign</th><th>Type</th><th>Status</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Created</th></tr></thead>
+    <tbody id="campaignRows"></tbody>
+  </table>
+  <div class="note" style="margin-top:16px;">Delivery totals are written to the push_campaign_events table after each send.</div>
+</div>
+
+<!-- Create -->
+<div class="panel hidden" id="panel-create">
+  <div class="row">
+    <div>
+      <label>Notification type</label>
+      <select id="campaignType"></select>
+    </div>
+    <div>
+      <label>Category</label>
+      <input id="category" readonly />
+    </div>
+  </div>
+
+  <label>Title</label>
+  <input id="title" placeholder="e.g. 🔥 HOT DROP" />
+
+  <label>Body</label>
+  <textarea id="body" placeholder="e.g. The item everyone wants just landed!"></textarea>
+
+  <div class="row">
+    <div>
+      <label>Product handle (optional — product deep link)</label>
+      <input id="productHandle" placeholder="e.g. premium-lace-front-wig" />
+    </div>
+    <div>
+      <label>Order ID (optional — tracking deep link)</label>
+      <input id="orderId" placeholder="e.g. gid://shopify/Order/123" />
+    </div>
+  </div>
+
+  <label>Deep link (optional — overrides auto-built route)</label>
+  <input id="route" placeholder="/collection/new-arrivals" />
+
+  <div class="row">
+    <div>
+      <label>Delivery</label>
+      <select id="delivery">
+        <option value="push-inbox">Push + Inbox</option>
+        <option value="inbox-only">Inbox only</option>
+        <option value="push-only">Push only</option>
+      </select>
+    </div>
+    <div>
+      <label>Audience</label>
+      <select id="target">
+        <option value="all">All users</option>
+        <option value="user">One user (ID below)</option>
+      </select>
+    </div>
+  </div>
+  <div id="userIdWrap" class="hidden">
+    <label>User ID</label>
+    <input id="userId" placeholder="profileId" />
+  </div>
+
+  <div class="row">
+    <button class="btn secondary" id="previewBtn">👁️ Preview</button>
+    <button class="btn danger" id="testSendBtn">📲 Test send to self</button>
+    <button class="btn" id="sendBtn">📨 Send Campaign</button>
+  </div>
+
+  <div class="result" id="previewResult"></div>
+  <div class="result" id="sendResult"></div>
+  <div class="preview-box hidden" id="previewBox">
+    <div class="ptitle" id="previewTitle"></div>
+    <div class="pbody" id="previewBody"></div>
+    <div class="proute" id="previewRoute"></div>
+  </div>
+</div>
+
+<!-- Registry -->
+<div class="panel hidden" id="panel-registry">
+  <table>
+    <thead><tr><th>Type</th><th>Category</th><th>Status</th><th>Priority</th><th>Freq-capped</th><th>Deep link</th></tr></thead>
+    <tbody id="registryRows"></tbody>
+  </table>
+</div>
+
+<!-- Audit -->
+<div class="panel hidden" id="panel-audit">
+  <table>
+    <thead><tr><th>Campaign</th><th>Type</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Skipped</th><th>Created</th></tr></thead>
+    <tbody id="auditRows"></tbody>
+  </table>
+</div>
+
+<script>
+const API = '';
+let REGISTRY = [];
+
+function getToken() { return document.getElementById('adminToken').value.trim(); }
+
+function showResult(el, msg, ok) {
+  el.textContent = msg;
+  el.className = 'result ' + (ok ? 'success' : 'error');
+}
+
+async function api(path, opts = {}) {
+  const token = getToken();
+  if (!token) throw new Error('Enter NOOD_ADMIN_TOKEN first.');
+  const res = await fetch(API + path, {
+    method: opts.method || 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-admin-token': token,
+    },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.success === false) {
+    throw new Error(data.message || 'Request failed (' + res.status + ')');
+  }
+  return data;
+}
+
+// ─── Tabs ───────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.add('hidden'));
+    tab.classList.add('active');
+    document.getElementById('panel-' + tab.dataset.panel).classList.remove('hidden');
+    const panel = tab.dataset.panel;
+    if (panel === 'dashboard') loadDashboard();
+    if (panel === 'registry') loadRegistry();
+    if (panel === 'audit') loadAudit();
+    if (panel === 'create') loadCreateForm();
+  });
+});
+
+// ─── Dashboard ──────────────────────────────────────────────────────────
+async function loadDashboard() {
+  try {
+    const data = await api('/api/campaign-center/summary');
+    const stats = data.analytics?.totals || {};
+    document.getElementById('statGrid').innerHTML = [
+      ['Devices', data.deviceCount],
+      ['Campaigns', (data.campaigns || []).length],
+      ['Pushes sent', stats.push_sent || 0],
+      ['Pushes failed', stats.push_failed || 0],
+      ['Notifications created', stats.notification_created || 0],
+      ['Campaigns created', stats.campaign_created || 0],
+    ].map(([label, value]) =>
+      `<div class="stat"><div class="label">${label}</div><div class="value">${value}</div></div>`
+    ).join('');
+
+    document.getElementById('campaignRows').innerHTML = (data.campaigns || []).map(c =>
+      `<tr>
+        <td><strong>${escapeHtml(c.campaign_id || c.campaignId || '—')}</strong></td>
+        <td>${escapeHtml(c.campaign_type || c.campaignType || '—')}</td>
+        <td>${escapeHtml(c.status || '—')}</td>
+        <td>${c.recipient_count ?? c.recipientCount ?? 0}</td>
+        <td>${c.sent_count ?? c.sentCount ?? 0}</td>
+        <td>${c.failed_count ?? c.failedCount ?? 0}</td>
+        <td>${formatDate(c.created_at || c.createdAt)}</td>
+      </tr>`
+    ).join('') || '<tr><td colspan="7">No campaigns yet.</td></tr>';
+  } catch (e) {
+    document.getElementById('campaignRows').innerHTML = `<tr><td colspan="7">⚠️ ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+// ─── Registry ───────────────────────────────────────────────────────────
+async function loadRegistry() {
+  try {
+    const data = await api('/api/campaign-center/registry');
+    REGISTRY = data.registry || [];
+    document.getElementById('registryRows').innerHTML = REGISTRY.map(r =>
+      `<tr>
+        <td><strong>${escapeHtml(r.type)}</strong></td>
+        <td>${escapeHtml(r.category)}</td>
+        <td><span class="badge ${r.status === 'REAL' ? 'real' : r.status === 'PARTIAL' ? 'partial' : 'nw'}">${r.status}</span></td>
+        <td>${escapeHtml(r.priority)}</td>
+        <td>${r.freqCapped ? 'yes' : 'no'}</td>
+        <td style="font-size:11px;color:#ff6a00;">${escapeHtml(r.deepLink || '')}</td>
+      </tr>`
+    ).join('');
+    populateTypeSelect();
+  } catch (e) {
+    document.getElementById('registryRows').innerHTML = `<tr><td colspan="6">⚠️ ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+function populateTypeSelect() {
+  const select = document.getElementById('campaignType');
+  select.innerHTML = REGISTRY.map(r => `<option value="${escapeHtml(r.type)}">${escapeHtml(r.type)} (${r.status})</option>`).join('');
+  if (REGISTRY.length) onTypeChange();
+}
+
+// ─── Create ─────────────────────────────────────────────────────────────
+async function loadCreateForm() {
+  if (!REGISTRY.length) {
+    try { await loadRegistry(); } catch {}
+  }
+}
+
+function onTypeChange() {
+  const type = document.getElementById('campaignType').value;
+  const entry = REGISTRY.find(r => r.type === type);
+  if (entry) {
+    document.getElementById('category').value = entry.category;
+    document.getElementById('title').value = entry.template?.title || '';
+    document.getElementById('body').value = entry.template?.body || '';
+    document.getElementById('route').value = '';
+  }
+}
+document.getElementById('campaignType').addEventListener('change', onTypeChange);
+document.getElementById('target').addEventListener('change', () => {
+  document.getElementById('userIdWrap').classList.toggle('hidden', document.getElementById('target').value !== 'user');
+});
+
+// Preview
+document.getElementById('previewBtn').addEventListener('click', async () => {
+  const body = buildPayload();
+  const res = document.getElementById('previewResult');
+  const box = document.getElementById('previewBox');
+  try {
+    const data = await api('/api/campaign-center/preview', { method: 'POST', body });
+    document.getElementById('previewTitle').textContent = data.title;
+    document.getElementById('previewBody').textContent = data.body;
+    document.getElementById('previewRoute').textContent = '→ ' + (data.deepLink || 'no deep link');
+    box.classList.remove('hidden');
+    showResult(res, 'Preview ready. Status: ' + data.status + ' | Freq-capped: ' + data.freqCapped, true);
+  } catch (e) {
+    box.classList.add('hidden');
+    showResult(res, '⚠️ ' + e.message, false);
+  }
+});
+
+// Test send to self
+document.getElementById('testSendBtn').addEventListener('click', async () => {
+  const body = buildPayload();
+  body.targetUserId = body.targetUserId || document.getElementById('userId').value.trim();
+  const res = document.getElementById('sendResult');
+  if (!body.targetUserId) {
+    showResult(res, 'Enter a user ID to test-send to (or pick "One user").', false);
+    return;
+  }
+  try {
+    const data = await api('/api/notifications/campaign', { method: 'POST', body });
+    showResult(res, '✅ Test sent to ' + data.sent + ' device(s). ' + (data.skipped || 0) + ' skipped.', data.sent > 0);
+  } catch (e) {
+    showResult(res, '⚠️ ' + e.message, false);
+  }
+});
+
+// Send
+document.getElementById('sendBtn').addEventListener('click', async () => {
+  const body = buildPayload();
+  const res = document.getElementById('sendResult');
+  const preview = document.getElementById('previewResult');
+  try {
+    // Preview first (safety).
+    const prev = await api('/api/campaign-center/preview', { method: 'POST', body });
+    const confirmMsg = `Send "${prev.title}" to ${document.getElementById('target').value === 'all' ? 'ALL users' : 'one user'}?`;
+    if (!window.confirm(confirmMsg)) return;
+
+    const data = await api('/api/notifications/campaign', { method: 'POST', body });
+    showResult(res, '✅ Sent: ' + data.sent + ' | Failed: ' + data.failed + ' | Skipped: ' + data.skipped, data.sent > 0 || data.failed === 0);
+    loadDashboard();
+  } catch (e) {
+    showResult(res, '⚠️ ' + e.message, false);
+    preview.classList.remove('hidden');
+  }
+});
+
+function buildPayload() {
+  const type = document.getElementById('campaignType').value || 'broadcast';
+  const delivery = document.getElementById('delivery').value;
+  const payload = {
+    campaign: type,
+    title: document.getElementById('title').value.trim() || 'NOOD',
+    body: document.getElementById('body').value.trim(),
+    delivery,
+    type,
+  };
+  const productHandle = document.getElementById('productHandle').value.trim();
+  const orderId = document.getElementById('orderId').value.trim();
+  const route = document.getElementById('route').value.trim();
+  const target = document.getElementById('target').value;
+  const userId = document.getElementById('userId').value.trim();
+
+  payload.data = {};
+  if (productHandle) payload.data.productHandle = productHandle;
+  if (orderId) payload.data.orderId = orderId;
+  if (route) payload.data.route = route;
+
+  if (target === 'user' && userId) payload.targetUserId = userId;
+  return payload;
+}
+
+// ─── Audit ──────────────────────────────────────────────────────────────
+async function loadAudit() {
+  try {
+    const data = await api('/api/campaign-center/audit');
+    document.getElementById('auditRows').innerHTML = (data.events || []).map(c =>
+      `<tr>
+        <td>${escapeHtml(c.campaign_id || c.campaignId || '—')}</td>
+        <td>${escapeHtml(c.campaign_type || c.campaignType || '—')}</td>
+        <td>${c.recipient_count ?? c.recipientCount ?? 0}</td>
+        <td>${c.sent_count ?? c.sentCount ?? 0}</td>
+        <td>${c.failed_count ?? c.failedCount ?? 0}</td>
+        <td>${c.skipped_count ?? c.skippedCount ?? 0}</td>
+        <td>${formatDate(c.created_at || c.createdAt)}</td>
+      </tr>`
+    ).join('') || '<tr><td colspan="7">No campaign events yet.</td></tr>';
+  } catch (e) {
+    document.getElementById('auditRows').innerHTML = `<tr><td colspan="7">⚠️ ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function formatDate(d) {
+  if (!d) return '—';
+  const date = new Date(d);
+  return isNaN(date.getTime()) ? String(d).slice(0, 20) : date.toLocaleString();
+}
+
+// Load dashboard on page open.
+loadDashboard();
+</script>
+</body>
+</html>

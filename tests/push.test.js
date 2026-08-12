@@ -1251,6 +1251,115 @@ async function testStorefrontVariantNormalization() {
   assert.deepStrictEqual(product.variants[0].selectedOptions, [{ name: 'Size', value: 'L' }], 'options parsed');
 }
 
+// ═══ 24. Notification registry coverage ═════════════════════════════════
+const { REGISTRY, entryFor, statusFor, categoryFor, isFreqCapped } = require('../utils/notification-registry');
+
+const EXPECTED_TYPES = [
+  // Shopping
+  'new_product','new_brand','new-category','restock','size-restock','color-restock',
+  'price-drop','wishlist-sale','wishlist-restock','wishlist-low-stock','low-stock',
+  'hot-product','trending-product','personalized-pick','recently-viewed','similar-product',
+  'recommended-restock',
+  // Deals
+  'deal-live','deal-ending','deal-upgraded','flash-live','flash-ending','coupon-ready',
+  'coupon-expiring','coupon-applied','free-shipping','free-shipping-close','cart-discount',
+  'brand-sale','category-sale','personalized-deal',
+  // Games / rewards
+  'spin-ready','scratch-ready','game-live','game-ending','streak-reminder','streak-at-risk',
+  'streak-completed','reward-unlocked','reward-expiring','reward-won','daily-reward',
+  'bonus-unlocked','points-earned','points-expiring','credit-earned','credit-expiring',
+  // Cart / wishlist
+  'cart-nudge','cart-price-drop','cart-low-stock','cart-restock','cart-reward-ready',
+  'cart-coupon-ready','cart-free-shipping-close','wishlist-price-drop','wishlist-restock',
+  // Orders / payment
+  'order-confirmed','payment-confirmed','payment-failed','payment-action-needed',
+  'order-processing','order-packed','order-ready','order-shipped','order-in-transit',
+  'order-local-facility','order-out-for-delivery','delivery-attempted','order-delivered',
+  'order-delayed','order-exception','address-action-needed','pickup-ready','pickup-reminder',
+  // Returns / refunds
+  'return-requested','return-approved','return-rejected','return-dropoff-reminder',
+  'return-in-transit','return-received','exchange-approved','exchange-shipped',
+  'refund-started','refund-processing','refund-completed','refund-failed',
+  // Account / service / security
+  'support-reply','support-case-update','security-alert','new-login','password-changed',
+  'email-changed','phone-changed','account-warning','broadcast','general','maintenance',
+  'service-update',
+  // Referrals / loyalty
+  'referral-invite','referral-joined','referral-qualified','referral-reward','vip-tier-up',
+  'loyalty-milestone',
+];
+
+async function testRegistryCoverage() {
+  // Every expected type has a registry entry.
+  const registeredTypes = new Set(REGISTRY.map(r => r.type));
+  const missing = EXPECTED_TYPES.filter(t => !registeredTypes.has(t));
+  assert.strictEqual(missing.length, 0, 'all expected types registered, missing: ' + missing.join(', '));
+
+  // Every registry entry has required fields.
+  for (const r of REGISTRY) {
+    assert.ok(r.type, 'type present');
+    assert.ok(r.category, 'category present for ' + r.type);
+    assert.ok(['global', 'personal'].includes(r.scope), 'scope valid for ' + r.type);
+    assert.ok(['REAL', 'PARTIAL', 'NOT WIRED'].includes(r.status), 'status valid for ' + r.type);
+    assert.ok(r.template?.title && r.template?.body, 'template present for ' + r.type);
+    assert.ok(r.deepLink, 'deep link present for ' + r.type);
+    assert.ok(r.dedupeKey, 'dedupe key present for ' + r.type);
+  }
+
+  // Helper functions work.
+  assert.strictEqual(entryFor('new_product').type, 'new_product');
+  assert.strictEqual(categoryFor('order-shipped'), 'orders');
+  assert.strictEqual(statusFor('security-alert'), 'NOT WIRED');
+  assert.strictEqual(isFreqCapped('order-shipped'), false, 'transactional not freq-capped');
+  assert.strictEqual(isFreqCapped('new_product'), true, 'promotional is freq-capped');
+}
+
+// ═══ 25. Dev-seed production lockout ════════════════════════════════════
+async function testDevSeedProductionLockout() {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalFlag = process.env.PUSH_DEV_SEED;
+
+  try {
+    // Production + flag set → must still be disabled.
+    process.env.NODE_ENV = 'production';
+    process.env.PUSH_DEV_SEED = '1';
+    const { devSeedEnabled } = require('../routes/notifications');
+    assert.strictEqual(devSeedEnabled(), false, 'dev seed disabled in production even with flag');
+
+    // Non-production + flag → enabled.
+    process.env.NODE_ENV = 'development';
+    process.env.PUSH_DEV_SEED = '1';
+    assert.strictEqual(devSeedEnabled(), true, 'dev seed enabled in development with flag');
+
+    // Non-production + no flag → disabled.
+    process.env.PUSH_DEV_SEED = '0';
+    assert.strictEqual(devSeedEnabled(), false, 'dev seed disabled without flag');
+  } finally {
+    process.env.NODE_ENV = originalNodeEnv;
+    process.env.PUSH_DEV_SEED = originalFlag;
+  }
+}
+
+// ═══ 26. Notification analytics events ══════════════════════════════════
+const { trackNotificationEvent, summarizeEvents } = require('../utils/notification-analytics');
+
+async function testAnalyticsTracking() {
+  // Redirect analytics to a temp file.
+  const analyticsFile = path.join(tmpDir, 'analytics.json');
+  process.env.PUSH_ANALYTICS_FILE = analyticsFile;
+  const fs2 = require('fs');
+  try { fs2.unlinkSync(analyticsFile); } catch {}
+
+  await trackNotificationEvent('notification_created', { type: 'new_product', category: 'arrivals' });
+  await trackNotificationEvent('push_sent', { type: 'new_product', category: 'arrivals', count: 5 });
+  await trackNotificationEvent('campaign_created', { type: 'broadcast', category: 'general' });
+
+  const summary = summarizeEvents(JSON.parse(fs2.readFileSync(analyticsFile, 'utf8')).events);
+  assert.strictEqual(summary.totals.notification_created, 1, 'notification_created counted');
+  assert.strictEqual(summary.totals.push_sent, 5, 'push_sent counted (5)');
+  assert.strictEqual(summary.totals.campaign_created, 1, 'campaign_created counted');
+}
+
 // ═══ Run ═══════════════════════════════════════════════════════════════
 async function main() {
   console.log('\nNOOD push notification tests\n');
@@ -1286,6 +1395,9 @@ async function main() {
   await test('inventory sync: GraphQL error falls back to availableForSale', testStorefrontGraphqlErrorFallsBackToNoInventory);
   await test('inventory sync: zero-result Storefront returns empty', testStorefrontZeroResultsReturnsEmpty);
   await test('inventory sync: variant normalization preserves price/inventory/options', testStorefrontVariantNormalization);
+  await test('notification registry covers all expected types', testRegistryCoverage);
+  await test('dev-seed locked out in production even with flag', testDevSeedProductionLockout);
+  await test('notification analytics events tracked', testAnalyticsTracking);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   try {

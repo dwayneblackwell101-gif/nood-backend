@@ -555,6 +555,39 @@ DROP POLICY IF EXISTS "public insert challenge_votes" ON challenge_votes;
 DROP POLICY IF EXISTS "public delete own vote" ON challenge_votes;
 
 -- ============================================================
+-- 12b. Notification Analytics (lightweight event tracking)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS notification_analytics (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  event TEXT NOT NULL,
+  type TEXT,
+  category TEXT,
+  campaign_id TEXT,
+  token_suffix TEXT,
+  count INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE notification_analytics ADD COLUMN IF NOT EXISTS id UUID;
+ALTER TABLE notification_analytics ADD COLUMN IF NOT EXISTS event TEXT;
+ALTER TABLE notification_analytics ADD COLUMN IF NOT EXISTS type TEXT;
+ALTER TABLE notification_analytics ADD COLUMN IF NOT EXISTS category TEXT;
+ALTER TABLE notification_analytics ADD COLUMN IF NOT EXISTS campaign_id TEXT;
+ALTER TABLE notification_analytics ADD COLUMN IF NOT EXISTS token_suffix TEXT;
+ALTER TABLE notification_analytics ADD COLUMN IF NOT EXISTS count INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE notification_analytics ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE notification_analytics ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage notification_analytics" ON notification_analytics;
+CREATE POLICY "service role can manage notification_analytics" ON notification_analytics
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+CREATE INDEX IF NOT EXISTS notification_analytics_created_at_idx
+  ON notification_analytics (created_at DESC);
+CREATE INDEX IF NOT EXISTS notification_analytics_event_idx
+  ON notification_analytics (event);
+
+-- ============================================================
 -- 13. Video Engagement (likes, comments, shares)
 --     PUBLIC READ ONLY on counts + comments (public feed content).
 --     Likes writes (insert/delete) are backend-only.

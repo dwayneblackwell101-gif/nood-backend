@@ -1056,4 +1056,19 @@ app.listen(PORT, '0.0.0.0', () => {
     }
     res.status(404).send('Push sender page not found');
   });
+
+  // Serve the admin Campaign Center page at /campaign-center.
+  const campaignCenterPath = path.join(__dirname, 'public-campaign-center.html');
+  app.get('/campaign-center', (req, res) => {
+    try {
+      if (fs2.existsSync(campaignCenterPath)) {
+        res.set('Content-Type', 'text/html');
+        res.send(fs2.readFileSync(campaignCenterPath, 'utf8'));
+        return;
+      }
+    } catch (error) {
+      console.error('[CAMPAIGN CENTER] failed to serve page:', error.message);
+    }
+    res.status(404).send('Campaign Center page not found');
+  });
 });
