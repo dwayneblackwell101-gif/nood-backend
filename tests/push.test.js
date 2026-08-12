@@ -35,6 +35,8 @@ process.env.PUSH_MAX_PROMO_PER_DAY = '100'; // per-test override
 process.env.PUSH_MIN_INTERVAL_MINUTES = '0';
 process.env.PUSH_NEW_PRODUCT_BATCH_THRESHOLD = '3';
 process.env.NOOD_ADMIN_TOKEN = 'test-admin-token-0123456789abcdef';
+// Disable the inventory-sync scheduler while tests run.
+process.env.NOOD_INVENTORY_SYNC_DISABLED = '1';
 
 // ─── Mock Expo HTTP endpoint ───────────────────────────────────────────
 const axios = require('axios');
@@ -145,11 +147,12 @@ function makeFakeDb() {
   const store = new Map(); // shopify_product_id -> row
   return {
     _store: store,
+    _count: () => store.size,
     from() {
       return {
-        select() {
-          const filter = {};
-          return {
+        select(cols, options) {
+          const isCount = Boolean(options?.count && options?.head);
+          const result = {
             in: async (col, values) => {
               const data = [];
               for (const id of values) {
@@ -160,6 +163,15 @@ function makeFakeDb() {
               return { data, error: null };
             },
           };
+          if (isCount) {
+            // Make the count query awaitable directly (supabase chain:
+            // select(cols, {count:'exact',head:true}) resolves to { count }).
+            // NOTE: must call resolve() synchronously — the Promise resolution
+            // procedure ignores the return value of `then`, so an async fn
+            // (which returns a new promise) would never resolve the await.
+            result.then = (resolve) => resolve({ count: store.size, data: null, error: null });
+          }
+          return result;
         },
         insert: async (rows) => {
           for (const row of rows) {
@@ -196,15 +208,18 @@ async function testDuplicateTokenRegistration() {
   assert.strictEqual(tokens[token].userId, 'u2');
 }
 
-// ═══ 3. New-product detection (genuinely new only) ═════════════════════
+// ═══ 3. New-product detection (baseline + genuinely new only) ══════════
 async function testNewProductDetection() {
   const db = makeFakeDb();
   const products = [
     { id: '111', title: 'Air Max Plus', handle: 'air-max-plus', variants: [] },
     { id: '222', title: 'Nike Dunk', handle: 'nike-dunk', variants: [] },
   ];
+  // FIRST sync on an empty table establishes the BASELINE — products are
+  // inserted but NONE are reported as new (no mass notifications).
   const first = await detectNewProducts(products, db);
-  assert.strictEqual(first.length, 2, 'first sync detects 2 new products');
+  assert.strictEqual(first.length, 0, 'first sync (baseline) reports 0 new products');
+  assert.strictEqual(db._store.size, 2, 'baseline inserts all products into the table');
 
   // Re-sync the SAME products → no new products.
   const second = await detectNewProducts(products, db);
@@ -217,6 +232,23 @@ async function testNewProductDetection() {
   );
   assert.strictEqual(third.length, 1, 'third sync detects only the truly new product');
   assert.strictEqual(third[0].handle, 'air-force-1');
+}
+
+// ═══ 3b. Baseline rule: a pre-populated table does NOT re-fire all products
+async function testBaselineDoesNotFlagExistingProducts() {
+  const db = makeFakeDb();
+  // Simulate an already-populated products table (e.g. from a prior sync
+  // that used the old code path).
+  db._store.set('111', { shopify_product_id: '111' });
+
+  const products = [
+    { id: '111', title: 'Air Max Plus', handle: 'air-max-plus', variants: [] },
+    { id: '222', title: 'Nike Dunk', handle: 'nike-dunk', variants: [] },
+  ];
+  // Table has rows → NOT baseline. Only 222 is genuinely new.
+  const result = await detectNewProducts(products, db);
+  assert.strictEqual(result.length, 1, 'only the truly new product is reported');
+  assert.strictEqual(result[0].handle, 'nike-dunk');
 }
 
 // ═══ 4. Repeated sync does not generate another new-product campaign ══
@@ -1043,12 +1075,189 @@ async function testCatalogRoutes() {
   }
 }
 
+// ═══ 23. Inventory sync — Admin 402 → Storefront fallback ══════════════
+const inventorySyncModule = require('../jobs/inventory-sync');
+const {
+  fetchShopifyProductsForSync,
+  fetchStorefrontProductsForSync,
+  normalizeStorefrontProduct,
+} = inventorySyncModule;
+
+function installStorefrontMock({ pages, errors }) {
+  const axiosMock = require('axios');
+  const originalPost = axiosMock.post;
+  const originalGet = axiosMock.get;
+
+  let pageIndex = 0;
+  axiosMock.post = async (url, { query, variables }) => {
+    if (url.includes('/graphql.json')) {
+      // If errors configured for this call, return GraphQL errors.
+      if (errors && pageIndex < errors.length) {
+        const errPage = errors[pageIndex];
+        pageIndex += 1;
+        return { status: 200, data: { errors: [{ message: errPage }] } };
+      }
+      const page = pages[Math.min(pageIndex, pages.length - 1)];
+      pageIndex += 1;
+      return { status: 200, data: { data: { products: page } } };
+    }
+    if (url.includes('exp.host/--/api/v2/push/send')) {
+      const messages = Array.isArray(payload) ? payload : [payload];
+      return { data: { data: messages.map((m) => ({ status: 'ok', id: `ticket-${m.to.slice(-8)}` })) } };
+    }
+    throw new Error(`Unexpected POST in inventory test: ${url}`);
+  };
+  axiosMock.get = async () => {
+    throw Object.assign(new Error('Admin API 402'), { response: { status: 402 } });
+  };
+
+  return { originalPost, originalGet };
+}
+
+function makeStorefrontPage(edges, { hasNextPage = false, endCursor = null } = {}) {
+  return { edges, pageInfo: { hasNextPage, endCursor } };
+}
+
+function makeStorefrontEdge(id, handle, title = 'Product', variants = []) {
+  return {
+    node: {
+      id: `gid://shopify/Product/${id}`,
+      title,
+      handle,
+      createdAt: new Date().toISOString(),
+      availableForSale: true,
+      variants: { edges: variants },
+    },
+  };
+}
+
+function makeStorefrontVariantEdge(id, { quantity = 10 } = {}) {
+  return {
+    node: {
+      id: `gid://shopify/ProductVariant/${id}`,
+      title: 'Default Title',
+      price: { amount: '25.00', currencyCode: 'USD' },
+      compareAtPrice: { amount: '40.00', currencyCode: 'USD' },
+      availableForSale: true,
+      quantityAvailable: quantity,
+      selectedOptions: [{ name: 'Color', value: 'Black' }],
+    },
+  };
+}
+
+async function testAdmin402FallsBackToStorefront() {
+  const { originalPost, originalGet } = installStorefrontMock({
+    pages: [
+      makeStorefrontPage([
+        makeStorefrontEdge('111', 'air-max-plus', 'Air Max Plus', [makeStorefrontVariantEdge('v1')]),
+        makeStorefrontEdge('222', 'nike-dunk', 'Nike Dunk', [makeStorefrontVariantEdge('v2', { quantity: 5 })]),
+      ]),
+    ],
+  });
+  try {
+    const products = await fetchShopifyProductsForSync();
+    assert.strictEqual(products.length, 2, 'Admin 402 falls back to Storefront and returns 2 products');
+    assert.strictEqual(products[0].id, '111', 'product id stripped from gid');
+    assert.strictEqual(products[0].variants[0].quantityAvailable, 10, 'variant quantityAvailable parsed');
+    assert.strictEqual(products[0].variants[0].price, 25, 'variant price parsed');
+    assert.strictEqual(products[0].variants[0].compareAtPrice, 40, 'variant compareAtPrice parsed');
+  } finally {
+    require('axios').post = originalPost;
+    require('axios').get = originalGet;
+  }
+}
+
+async function testStorefrontPaginationFetchesAllPages() {
+  const { originalPost, originalGet } = installStorefrontMock({
+    pages: [
+      makeStorefrontPage(
+        [makeStorefrontEdge('1', 'p1'), makeStorefrontEdge('2', 'p2')],
+        { hasNextPage: true, endCursor: 'cursor-1' }
+      ),
+      makeStorefrontPage(
+        [makeStorefrontEdge('3', 'p3')],
+        { hasNextPage: false, endCursor: null }
+      ),
+    ],
+  });
+  try {
+    const { products, pageCount } = await fetchStorefrontProductsForSync();
+    assert.strictEqual(products.length, 3, 'pagination fetches products across ALL pages');
+    assert.strictEqual(pageCount, 2, 'two pages fetched');
+    assert.deepStrictEqual(products.map((p) => p.handle), ['p1', 'p2', 'p3'], 'all handles in order');
+  } finally {
+    require('axios').post = originalPost;
+    require('axios').get = originalGet;
+  }
+}
+
+async function testStorefrontGraphqlErrorFallsBackToNoInventory() {
+  // First call (inventory query) → GraphQL error (scope missing).
+  // Second call (no-inventory query) → succeeds.
+  const { originalPost, originalGet } = installStorefrontMock({
+    errors: ['Field quantityAvailable requires the inventory scope'],
+    pages: [
+      makeStorefrontPage([makeStorefrontEdge('111', 'air-max-plus', 'Air Max Plus', [makeStorefrontVariantEdge('v1')])]),
+    ],
+  });
+  try {
+    const { products, inventoryAvailable } = await fetchStorefrontProductsForSync();
+    assert.strictEqual(products.length, 1, 'fallback returns products');
+    assert.strictEqual(inventoryAvailable, false, 'inventory flag false when scope missing');
+    assert.strictEqual(products[0].variants[0].quantityAvailable, null, 'no fabricated quantity');
+    assert.strictEqual(products[0].variants[0].availableForSale, true, 'availableForSale still present');
+  } finally {
+    require('axios').post = originalPost;
+    require('axios').get = originalGet;
+  }
+}
+
+async function testStorefrontZeroResultsReturnsEmpty() {
+  const { originalPost, originalGet } = installStorefrontMock({
+    pages: [makeStorefrontPage([], { hasNextPage: false, endCursor: null })],
+  });
+  try {
+    const { products } = await fetchStorefrontProductsForSync();
+    assert.strictEqual(products.length, 0, 'zero-result storefront returns empty array without crashing');
+  } finally {
+    require('axios').post = originalPost;
+    require('axios').get = originalGet;
+  }
+}
+
+async function testStorefrontVariantNormalization() {
+  const product = normalizeStorefrontProduct({
+    id: 'gid://shopify/Product/999',
+    title: 'Test',
+    handle: 'test-handle',
+    availableForSale: true,
+    variants: {
+      edges: [
+        { node: {
+          id: 'gid://shopify/ProductVariant/777',
+          title: 'Large',
+          price: { amount: '12.50', currencyCode: 'USD' },
+          compareAtPrice: null,
+          availableForSale: true,
+          quantityAvailable: 42,
+          selectedOptions: [{ name: 'Size', value: 'L' }],
+        } },
+      ],
+    },
+  }, true);
+  assert.strictEqual(product.id, '999', 'product gid stripped');
+  assert.strictEqual(product.variants[0].id, '777', 'variant gid stripped');
+  assert.strictEqual(product.variants[0].quantityAvailable, 42, 'quantity parsed');
+  assert.deepStrictEqual(product.variants[0].selectedOptions, [{ name: 'Size', value: 'L' }], 'options parsed');
+}
+
 // ═══ Run ═══════════════════════════════════════════════════════════════
 async function main() {
   console.log('\nNOOD push notification tests\n');
   await test('token registration stores token + metadata', testTokenRegistration);
   await test('duplicate token registration is idempotent', testDuplicateTokenRegistration);
   await test('new-product detection returns only genuinely new products', testNewProductDetection);
+  await test('baseline rule does not flag existing products as new', testBaselineDoesNotFlagExistingProducts);
   await test('repeated sync does not generate another new-product campaign', testRepeatedSyncNoDuplicateCampaign);
   await test('product batch notification sends one batched push', testProductBatchNotification);
   await test('manual broadcast reaches all active devices', testManualBroadcast);
@@ -1072,6 +1281,11 @@ async function main() {
   await test('same user on two devices shares one logical inbox item', testMultiDeviceSameUser);
   await test('catalog routes exist and return JSON (kids/women/collections/products/search)', testCatalogRoutes);
   await test('inbox offset pagination (load-more) returns pages correctly', testInboxPagination);
+  await test('inventory sync: Admin 402 falls back to Storefront', testAdmin402FallsBackToStorefront);
+  await test('inventory sync: Storefront pagination fetches all pages', testStorefrontPaginationFetchesAllPages);
+  await test('inventory sync: GraphQL error falls back to availableForSale', testStorefrontGraphqlErrorFallsBackToNoInventory);
+  await test('inventory sync: zero-result Storefront returns empty', testStorefrontZeroResultsReturnsEmpty);
+  await test('inventory sync: variant normalization preserves price/inventory/options', testStorefrontVariantNormalization);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   try {

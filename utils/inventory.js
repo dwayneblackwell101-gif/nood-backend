@@ -47,12 +47,19 @@ async function syncCatalog() {
 /**
  * Detect + persist genuinely new products.
  *
- * Given the full list of active products fetched from Shopify Admin, returns
- * only the ones that did NOT previously exist in the `products` table, after
+ * Given the full list of active products fetched from Shopify, returns only
+ * the ones that did NOT previously exist in the `products` table, after
  * inserting them. Idempotent:
  *  - products that already exist are only updated (never re-created),
  *  - new products are inserted with created_at set,
  *  - repeated syncs return an empty list for the same product set.
+ *
+ * BASELINE RULE:
+ *  The first successful FULL catalog population (when the products table has
+ *  zero rows) establishes the baseline. Every product is inserted, but NONE
+ *  are returned as "new" — so a first sync can never fire a mass
+ *  "everything is new" push. Only products discovered AFTER the baseline
+ *  qualify as genuinely new.
  *
  * IMPORTANT: The insert happens BEFORE this returns, so any push campaign
  * fired from the result is guaranteed to reference a saved/indexed product
@@ -85,6 +92,30 @@ async function detectNewProducts(shopifyProducts, db = supabase) {
   const ids = rows.map((r) => r.shopify_product_id);
   const chunkSize = 100;
   const knownIds = new Set();
+
+  // 0. Baseline check: if the products table has zero rows, this is the first
+  //    successful FULL catalog population. Insert everything as the baseline
+  //    but do NOT report any product as "new" (no mass notifications).
+  const { count, error: countError } = await db
+    .from('products')
+    .select('shopify_product_id', { count: 'exact', head: true });
+  if (countError) {
+    console.error('[INVENTORY] Baseline count failed:', countError.message);
+  }
+  const isBaseline = !countError && count === 0;
+  if (isBaseline) {
+    console.log(`[INVENTORY] Baseline established — inserting ${rows.length} product(s), NOT firing new-product notifications`);
+    for (let i = 0; i < rows.length; i += chunkSize) {
+      const chunk = rows.slice(i, i + chunkSize);
+      const { error } = await db
+        .from('products')
+        .insert(chunk);
+      if (error) {
+        console.error('[INVENTORY] Baseline insert failed:', error.message);
+      }
+    }
+    return [];
+  }
 
   // 1. Find which of these products are ALREADY stored.
   for (let i = 0; i < ids.length; i += chunkSize) {
