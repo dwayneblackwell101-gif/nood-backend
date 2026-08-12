@@ -89,20 +89,51 @@ async function verifyOrderForRefund(identity, orderId, itemIds = []) {
     return { eligible: false, reason: 'db_unavailable' };
   }
 
-  // Fetch order from our orders table (synced from Shopify)
-  const { data: order, error } = await supabaseAdmin
+  // Fetch order from our orders table (synced from Shopify).
+  // Falls back to order_tracking (which fulfillment webhooks populate even
+  // when the orders table has no row yet).
+  let order = null;
+
+  const { data: orderRow, error: orderError } = await supabaseAdmin
     .from('orders')
     .select('*')
     .eq('shopify_order_id', orderId)
     .maybeSingle();
 
-  if (error) {
-    console.error('[REFUNDS] Order lookup error:', error.message);
+  if (orderError) {
+    console.error('[REFUNDS] Order lookup error:', orderError.message);
     return { eligible: false, reason: 'db_error' };
   }
 
-  if (!order) {
-    return { eligible: false, reason: 'order_not_found' };
+  if (orderRow) {
+    order = orderRow;
+  } else {
+    const { data: trackingRow, error: trackingError } = await supabaseAdmin
+      .from('order_tracking')
+      .select('shopify_order_id, order_name, email, user_id, status, created_at, updated_at')
+      .eq('shopify_order_id', orderId)
+      .maybeSingle();
+
+    if (trackingError) {
+      console.error('[REFUNDS] Tracking lookup error:', trackingError.message);
+      return { eligible: false, reason: 'db_error' };
+    }
+
+    if (!trackingRow) {
+      return { eligible: false, reason: 'order_not_found' };
+    }
+
+    // Tracking rows are created from Shopify fulfillment webhooks, which
+    // only fire for real (paid) orders — treat as eligible on payment.
+    order = {
+      shopify_order_id: trackingRow.shopify_order_id,
+      email: trackingRow.email,
+      user_id: trackingRow.user_id,
+      status: trackingRow.status || 'paid',
+      financial_status: null,
+      total: null,
+      created_at: trackingRow.created_at,
+    };
   }
 
   // Ownership check: user_id match or email match
@@ -125,7 +156,11 @@ async function verifyOrderForRefund(identity, orderId, itemIds = []) {
     // Allow partial refund requests for remaining items
   }
 
-  if (!PAID_STATUSES.has(status) && !financialStatus.includes('PAID') && !financialStatus.includes('PARTIALLY_PAID')) {
+  // Only block explicitly non-refundable statuses. The orders table's
+  // status is often NULL until a fulfillment webhook arrives; tracking
+  // rows only exist for real paid orders, so missing status is treated
+  // as eligible (optimistic) rather than blocking legitimate refunds.
+  if (BLOCKED_STATUSES.has(status) || (financialStatus && ['FAILED', 'CANCELLED', 'CANCELED'].includes(financialStatus))) {
     return { eligible: false, reason: 'not_paid' };
   }
 
