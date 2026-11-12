@@ -30,7 +30,7 @@ const axios = require('axios');
 const router = express.Router();
 
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
-const SHOPIFY_STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN;
+const SHOPIFY_STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN || process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_ADMIN_API_VERSION || '2026-04';
 
 const SHOPIFY_STOREFRONT_ENDPOINT =
@@ -190,6 +190,12 @@ async function storefrontGraphql(query, variables) {
     }
   );
   const json = response?.data || {};
+  // Inventory counts are optional: stores may only grant availability access.
+  // Retry only this permission failure; keep all other Shopify errors intact.
+  if (/\bquantityAvailable\b/.test(query) && json.errors?.some(error =>
+    /quantityAvailable/.test(error.message || '') && /access|scope|permission/i.test(error.message || ''))) {
+    return storefrontGraphql(query.replace(/\bquantityAvailable\b/g, ''), variables);
+  }
   if (json?.errors?.length) {
     const err = new Error(json.errors[0]?.message || 'Shopify Storefront error');
     err.status = 400;
