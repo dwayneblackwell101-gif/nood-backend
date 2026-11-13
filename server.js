@@ -13,8 +13,12 @@ const app = express();
 
 app.set('trust proxy', 1);
 const allowedOrigins = new Set(
-  String(process.env.CORS_ALLOWED_ORIGINS || process.env.FRONTEND_URL || '')
-    .split(',').map((value) => value.trim()).filter(Boolean)
+  [
+    'https://noodcaribbean.com',
+    'https://www.noodcaribbean.com',
+    ...String(process.env.CORS_ALLOWED_ORIGINS || process.env.FRONTEND_URL || '')
+      .split(',').map((value) => value.trim()).filter(Boolean),
+  ]
 );
 app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }));
 app.use(cors({
