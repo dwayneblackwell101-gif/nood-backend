@@ -4,20 +4,31 @@
   "description": "",
   "main": "server.js",
   "scripts": {
-    "test": "node tests/push.test.js",
+    "test": "node tests/push.test.js && node tests/commerce.test.js && node tests/wipay.test.js && node tests/shopify-admin-auth.test.js && node tests/paypal-currency.test.js && node tests/paypal-conversion-route.test.js && node tests/support.test.js && node tests/support-assistant.test.js && node tests/shopping-fixes.test.js && node tests/nood-ai.test.js && node tests/groq-synthetic.test.js && node tests/nine-router-synthetic.test.js && node tests/nood-ai-practice.test.js && node tests/khiel-openai.test.js",
+    "test:groq": "node tests/groq-synthetic.test.js",
+    "test:groq:live": "node scripts/test-groq-synthetic-live.js",
+    "test:nood-ai": "node tests/nood-ai.test.js",
+    "test:nood-ai:live": "node scripts/test-nood-ai-live.js",
     "test:push": "node tests/push.test.js",
-    "start": "node server.js"
+    "check": "node scripts/check-syntax.js",
+    "verify": "npm run check && npm test",
+    "start": "node server.js",
+    "test:9router": "node tests/nine-router-synthetic.test.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@sendgrid/mail": "^8.1.4",
+    "@sendgrid/mail": "8.1.6",
     "@supabase/supabase-js": "^2.48.1",
-    "axios": "^1.15.0",
+    "axios": "1.19.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1"
+    "express": "5.2.1",
+    "express-rate-limit": "8.6.2",
+    "helmet": "8.3.0"
   }
 }
+
+

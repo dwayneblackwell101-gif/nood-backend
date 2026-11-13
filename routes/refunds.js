@@ -7,27 +7,26 @@
  *   GET    /api/refunds/requests           — list requests for customer (customer)
  *   POST   /api/refunds/requests/:id/update — update request status (admin/support)
  *
- * Identity: customer endpoints use x-push-token header (bearer credential bound
- * to user_id in push_tokens). Admin endpoints use x-admin-token.
+ * Identity: customer endpoints validate a Shopify Customer Account token.
+ * Admin endpoints use x-admin-token.
  */
 
 const express = require('express');
 const crypto = require('crypto');
 const { supabaseAdmin } = require('../utils/supabase-admin');
 const { requireAdmin } = require('../utils/admin-auth');
-const { findTokenRecord } = require('../utils/push-tokens-db');
+const { authenticateCustomer } = require('../services/customer-auth');
 const { createInboxItem } = require('../utils/inbox-db');
 const { sendPush } = require('../utils/push-delivery');
+const { applyWalletTxn } = require('../utils/reward-ledger');
+const paypal = require('../services/paypal');
+const { refundSettlement } = require('../services/paypal-currency');
+const { getPaymentByCapture } = require('../utils/payment-state');
 
 const router = express.Router();
 
 function safeString(value, fallback = '') {
   return String(value ?? fallback).trim();
-}
-
-function safeNumber(value, fallback = 0) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
 }
 
 const RETURN_WINDOW_DAYS = 30;
@@ -58,22 +57,10 @@ const REFUND_TYPE_TO_CATEGORY = {
 };
 
 /**
- * Resolve authenticated customer identity from x-push-token header.
- * Returns { userId, deviceId, email } or null.
+ * Resolve authenticated Shopify customer identity.
  */
 async function resolveCustomerIdentity(req) {
-  const bearerToken = safeString(req.headers?.['x-push-token'] || req.query?.token);
-  if (!bearerToken) return null;
-
-  const record = await findTokenRecord(bearerToken);
-  if (!record) return null;
-
-  return {
-    userId: record.userId,
-    deviceId: record.deviceId,
-    email: record.email,
-    token: bearerToken,
-  };
+  return authenticateCustomer(req);
 }
 
 /**
@@ -195,6 +182,55 @@ async function verifyOrderForRefund(identity, orderId, itemIds = []) {
   return { order, eligible: true, reason: 'eligible' };
 }
 
+/** Recalculate a refund from the server-stored order snapshot. */
+function calculateTrustedRefund(order, requestedItems) {
+  const purchased = Array.isArray(order?.items) ? order.items : [];
+  if (!purchased.length) return { ok: false, reason: 'order_items_unavailable' };
+
+  const byId = new Map();
+  for (const item of purchased) {
+    const key = String(item.variantId || item.variant_id || item.id || '').trim();
+    const quantity = Math.max(0, Math.floor(Number(item.quantity || 0)));
+    const price = Number(item.price || item.unitPrice || item.unit_price || 0);
+    if (key && quantity > 0 && Number.isFinite(price) && price >= 0) {
+      byId.set(key, { item, quantity, price });
+    }
+  }
+
+  let amount = 0;
+  const normalized = [];
+  const seen = new Set();
+  for (const requested of requestedItems) {
+    const key = String(requested.variantId || requested.id || '').trim();
+    const match = byId.get(key);
+    const quantity = Math.max(0, Math.floor(Number(requested.quantity || 0)));
+    if (!match || !quantity || quantity > match.quantity || seen.has(key)) {
+      return { ok: false, reason: 'invalid_refund_items' };
+    }
+    seen.add(key);
+    amount += match.price * quantity;
+    normalized.push({
+      id: key,
+      variantId: key,
+      title: String(match.item.title || requested.title || 'Product'),
+      quantity,
+      unitPrice: Number(match.price.toFixed(2)),
+    });
+  }
+
+  const orderTotalCents = Math.round(Number(order.total || 0) * 100);
+  const amountCents = Math.round(amount * 100);
+  if (!amountCents || !orderTotalCents || amountCents > orderTotalCents) {
+    return { ok: false, reason: 'invalid_refund_amount' };
+  }
+  return {
+    ok: true,
+    amount: amountCents / 100,
+    currency: String(order.currency || 'USD').toUpperCase(),
+    items: normalized,
+  };
+}
+
 /**
  * POST /api/refunds/requests
  * Body: {
@@ -207,7 +243,7 @@ async function verifyOrderForRefund(identity, orderId, itemIds = []) {
 router.post('/api/refunds/requests', async (req, res) => {
   const identity = await resolveCustomerIdentity(req);
   if (!identity) {
-    return res.status(401).json({ success: false, message: 'Authenticated identity required (x-push-token header)' });
+    return res.status(401).json({ success: false, message: 'Authenticated identity required' });
   }
 
   const body = req.body || {};
@@ -216,12 +252,12 @@ router.post('/api/refunds/requests', async (req, res) => {
   const orderId = safeString(body.order_id);
   const orderNumber = safeString(body.order_number || body.order_id);
   const customerEmail = safeString(body.customer_email || identity.email).toLowerCase();
-  const amount = safeNumber(body.amount);
-  const currency = safeString(body.currency || 'USD');
+  let amount = 0;
+  let currency = 'USD';
   const refundMethod = safeString(body.refund_method);
-  const paymentProvider = safeString(body.payment_provider);
-  const paymentMethod = safeString(body.payment_method);
-  const paymentTransactionId = safeString(body.payment_transaction_id) || null;
+  let paymentProvider = '';
+  let paymentMethod = '';
+  let paymentTransactionId = null;
   const shopifyOrderId = safeString(body.shopify_order_id || body.order_id);
   const reason = safeString(body.reason);
   const notes = safeString(body.notes);
@@ -229,9 +265,6 @@ router.post('/api/refunds/requests', async (req, res) => {
 
   if (!orderId || !orderNumber || !customerEmail) {
     return res.status(400).json({ success: false, message: 'order_id, order_number, customer_email are required' });
-  }
-  if (!amount || amount < 1) {
-    return res.status(400).json({ success: false, message: 'Valid amount is required (minimum 1)' });
   }
   if (!ALLOWED_REFUND_METHODS.has(refundMethod)) {
     return res.status(400).json({ success: false, message: 'refund_method must be original_payment or wallet' });
@@ -262,6 +295,24 @@ router.post('/api/refunds/requests', async (req, res) => {
     return res.status(statusCode).json({ success: false, message: messages[verification.reason] || 'Not eligible' });
   }
 
+  const trustedRefund = calculateTrustedRefund(verification.order, items);
+  if (!trustedRefund.ok) {
+    const messages = {
+      order_items_unavailable: 'Order item details are not available yet. Please retry after order sync completes.',
+      invalid_refund_items: 'One or more selected items do not match the purchased order.',
+      invalid_refund_amount: 'The refundable amount could not be verified.',
+    };
+    return res.status(409).json({
+      success: false,
+      message: messages[trustedRefund.reason] || 'Refund could not be verified',
+    });
+  }
+  amount = trustedRefund.amount;
+  currency = trustedRefund.currency;
+  paymentProvider = safeString(verification.order.payment_provider).toLowerCase();
+  paymentMethod = paymentProvider;
+  paymentTransactionId = safeString(verification.order.payment_transaction_id) || null;
+
   if (!supabaseAdmin) {
     return res.status(503).json({ success: false, message: 'Database not configured' });
   }
@@ -285,7 +336,7 @@ router.post('/api/refunds/requests', async (req, res) => {
       shopify_order_id: shopifyOrderId,
       reason,
       notes,
-      items,
+      items: trustedRefund.items,
       status: 'pending_review',
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -320,9 +371,14 @@ router.post('/api/refunds/requests', async (req, res) => {
     });
 
     // Send push notification (transactional, no frequency cap)
-    if (identity.token) {
+    const { loadTokens } = require('../utils/push-tokens-db');
+    const registeredTokens = await loadTokens();
+    const customerTokens = Object.values(registeredTokens).filter(
+      (token) => token.userId === identity.userId && token.active !== false
+    );
+    if (customerTokens.length) {
       await sendPush({
-        recipients: [{ token: identity.token, userId: identity.userId, email: identity.email }],
+        recipients: customerTokens,
         title: '📋 Return Requested',
         body: `Your return request for order ${orderNumber} is pending review.`,
         data: { type: 'return-requested', route: '/account/returns', orderId: shopifyOrderId, requestId },
@@ -457,6 +513,54 @@ router.post('/api/refunds/requests/:id/update', requireAdmin, async (req, res) =
       return res.status(404).json({ success: false, message: 'Request not found' });
     }
 
+    const completedStatuses = new Set(['refunded_to_wallet', 'refunded_to_original', 'partially_refunded']);
+    if (completedStatuses.has(existing.status)) {
+      if (newStatus === existing.status) {
+        return res.json({ success: true, requestId, status: existing.status, replay: true });
+      }
+      return res.status(409).json({ success: false, message: 'A completed refund cannot be changed' });
+    }
+
+    if (newStatus === 'refunded_to_wallet') {
+      if (existing.refund_method !== 'wallet' || !existing.user_id) {
+        return res.status(409).json({ success: false, message: 'This request is not eligible for a wallet refund' });
+      }
+      const credit = await applyWalletTxn({
+        user_id: existing.user_id,
+        amount: Number(existing.amount),
+        currency: existing.currency,
+        type: 'credit',
+        source: 'refund',
+        reference: requestId,
+        idempotency_key: `refund-wallet:${requestId}`,
+        metadata: { refundRequestId: requestId, orderId: existing.shopify_order_id },
+      });
+      if (!credit.ok && !credit.replay) {
+        return res.status(500).json({ success: false, message: 'Wallet refund transaction failed' });
+      }
+    }
+
+    if (newStatus === 'refunded_to_original' || newStatus === 'partially_refunded') {
+      if (existing.refund_method !== 'original_payment') {
+        return res.status(409).json({ success: false, message: 'This request selected a wallet refund' });
+      }
+      if (!String(existing.payment_provider || '').includes('paypal') || !existing.payment_transaction_id) {
+        return res.status(409).json({
+          success: false,
+          message: 'Automatic original-payment refund is unavailable for this provider; use manual_refund_required.',
+        });
+      }
+      const paymentSession = await getPaymentByCapture(existing.payment_transaction_id);
+      const refundQuote = refundSettlement(existing.amount, existing.currency, paymentSession);
+      const providerRefund = await paypal.refundCapture(existing.payment_transaction_id, {
+        ...refundQuote,
+        requestId: `nood-refund-${requestId}`,
+      });
+      if (String(providerRefund?.status || '').toUpperCase() !== 'COMPLETED') {
+        return res.status(502).json({ success: false, message: 'PayPal has not confirmed the refund as completed' });
+      }
+    }
+
     const updateData = {
       status: newStatus,
       admin_notes: adminNotes || existing.admin_notes,
@@ -534,4 +638,4 @@ router.post('/api/refunds/requests/:id/update', requireAdmin, async (req, res) =
   }
 });
 
-module.exports = { router };
+module.exports = { router, calculateTrustedRefund };

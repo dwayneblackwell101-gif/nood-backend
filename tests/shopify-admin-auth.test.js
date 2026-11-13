@@ -1,0 +1,11 @@
+const assert=require('assert'); const axios=require('axios');
+let calls=0; let now=1000; const realNow=Date.now; Date.now=()=>now;
+axios.post=async()=>{calls++; return {data:{access_token:'fake-'+calls, expires_in:120}}};
+const {getAdminToken}=require('../services/shopify-admin-auth');
+(async()=>{process.env.SHOPIFY_STORE_DOMAIN='test.myshopify.com';process.env.SHOPIFY_CLIENT_ID='id';process.env.SHOPIFY_CLIENT_SECRET='secret';
+const r=await Promise.all([getAdminToken(),getAdminToken()]);assert.equal(calls,1);assert.equal(r[0],r[1]);
+assert.equal(await getAdminToken(),'fake-1');now+=61000;assert.equal(await getAdminToken(),'fake-2');
+process.env.SHOPIFY_CLIENT_SECRET='changed';assert.equal(await getAdminToken(),'fake-3');
+process.env.SHOPIFY_CLIENT_ID='';process.env.SHOPIFY_CLIENT_SECRET='';process.env.SHOPIFY_ADMIN_ACCESS_TOKEN='legacy';assert.equal(await getAdminToken(),'legacy');
+process.env.SHOPIFY_ADMIN_ACCESS_TOKEN='';await assert.rejects(getAdminToken(),/not configured/); console.log('Admin auth tests passed: concurrent refresh, cache, expiry, credential change, legacy fallback, missing credentials.');
+})().catch(e=>{console.error(e);process.exitCode=1}).finally(()=>Date.now=realNow);

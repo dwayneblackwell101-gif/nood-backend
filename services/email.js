@@ -231,7 +231,7 @@ Team NOOD
 
             <div style="padding: 30px;">
               <p style="font-size: 16px; color: #333; line-height: 1.6;">Hi ${name || 'there'},</p>
-              <p style="font-size: 16px; color: #333; line-height: 1.6;">Welcome to NOOD — where shopping meets rewards, games, and a little bit of magic.</p>
+              <p style="font-size: 16px; color: #333; line-height: 1.6;">Welcome to NOOD — where shopping meets rewards, referrals, and a little bit of magic.</p>
 
               <div style="background: linear-gradient(135deg, #fff0e0 0%, #ffe8d0 100%); border-radius: 16px; padding: 24px; margin: 24px 0; text-align: center; border: 2px solid #ffd166;">
                 <p style="margin: 0 0 12px; color: #4e260d; font-weight: 800; font-size: 14px;">Your referral code</p>
@@ -241,8 +241,7 @@ Team NOOD
 
               <p style="font-size: 16px; color: #333; line-height: 1.6;">Here's what makes NOOD different:</p>
               <ul style="color: #333; line-height: 2; padding-left: 20px;">
-                <li>🎮 <strong>Games that pay</strong> — Spin, scratch, and win real store credit</li>
-                <li>📅 <strong>Daily rewards</strong> — Check in daily, earn escalating rewards</li>
+                <li>🎁 <strong>Referral rewards</strong> — Invite friends, earn $10 NOOD Balance</li>
                 <li>💎 <strong>VIP status</strong> — The more you shop, the better the perks</li>
                 <li>📸 <strong>Visual search</strong> — Snap a photo, find the product</li>
                 <li>🥽 <strong>AR try-on</strong> — See it on you before you buy</li>
@@ -270,8 +269,7 @@ Your referral code: ${referralCode}
 Share it — you both get $10 when they order.
 
 What makes NOOD different:
-- Games that pay real store credit
-- Daily rewards for checking in
+- Referral rewards — invite friends, earn NOOD Balance
 - VIP status with better perks
 - Visual search & AR try-on
 

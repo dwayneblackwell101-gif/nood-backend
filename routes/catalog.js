@@ -29,9 +29,17 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
-const SHOPIFY_STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN || process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN;
+// Storefront credentials are public client credentials. Keep environment
+// overrides for deployment, but use the same working defaults as the app so
+// catalog reads do not fail merely because Render is missing optional vars.
+const SHOPIFY_STORE_DOMAIN =
+  String(process.env.SHOPIFY_STORE_DOMAIN || 'h41bez-i2.myshopify.com').trim();
+const SHOPIFY_STOREFRONT_TOKEN =
+  String(process.env.SHOPIFY_STOREFRONT_TOKEN || '6ae1a19ca3b9b5d7184d01a2fcb3f397').trim();
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_ADMIN_API_VERSION || '2026-04';
+const CATALOG_DEPLOY_VERSION =
+  Number(process.env.CATALOG_VERSION) || Math.floor(Date.now() / 1000);
+const CATALOG_DEPLOYED_AT = new Date().toISOString();
 
 const SHOPIFY_STOREFRONT_ENDPOINT =
   `https://${SHOPIFY_STORE_DOMAIN}/api/${SHOPIFY_API_VERSION}/graphql.json`;
@@ -188,12 +196,17 @@ async function storefrontGraphql(query, variables) {
       },
       timeout: 12000,
     }
-  );
+  ).catch((error) => {
+    if (error?.response?.status === 402) {
+      const unavailable = new Error('The catalog is temporarily unavailable while store access is restricted. Please try again later.');
+      unavailable.status = 402;
+      unavailable.code = 'store_access_restricted';
+      throw unavailable;
+    }
+    throw error;
+  });
   const json = response?.data || {};
-  // Inventory counts are optional: stores may only grant availability access.
-  // Retry only this permission failure; keep all other Shopify errors intact.
-  if (/\bquantityAvailable\b/.test(query) && json.errors?.some(error =>
-    /quantityAvailable/.test(error.message || '') && /access|scope|permission/i.test(error.message || ''))) {
+  if (/\bquantityAvailable\b/.test(query) && json.errors?.some(error => /quantityAvailable/.test(error.message || '') && /access|scope|permission/i.test(error.message || ''))) {
     return storefrontGraphql(query.replace(/\bquantityAvailable\b/g, ''), variables);
   }
   if (json?.errors?.length) {
@@ -386,13 +399,11 @@ router.get('/api/catalog/search', async (req, res) => {
  * Returns a stable catalog version so the app can invalidate local caches.
  */
 router.get('/api/catalog/version', (req, res) => {
-  // No external dependency: version is derived from the current deploy time.
-  const catalogVersion = Number(process.env.CATALOG_VERSION) || Math.floor(Date.now() / 1000);
   return res.json({
     success: true,
-    catalogVersion,
-    catalogUpdatedAt: new Date().toISOString(),
-    lastSyncAt: new Date().toISOString(),
+    catalogVersion: CATALOG_DEPLOY_VERSION,
+    catalogUpdatedAt: CATALOG_DEPLOYED_AT,
+    lastSyncAt: CATALOG_DEPLOYED_AT,
   });
 });
 
@@ -518,4 +529,4 @@ router.get('/api/catalog/menus/:handle', async (req, res) => {
   }
 });
 
-module.exports = { router };
+module.exports = { router, storefrontGraphql };

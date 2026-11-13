@@ -14,6 +14,7 @@
 
 const express = require('express');
 const { supabase } = require('../utils/supabase');
+const { authenticateCustomer } = require('../services/customer-auth');
 
 const router = express.Router();
 
@@ -65,7 +66,11 @@ router.get('/api/video-feed/:id', async (req, res) => {
 /** POST /api/video-feed/:id/like — toggle like for a user. */
 router.post('/api/video-feed/:id/like', async (req, res) => {
   const videoId = safeString(req.params.id);
-  const userId = safeString(req.body?.userId, 'guest');
+  const customer = await authenticateCustomer(req);
+  const userId = customer?.userId || '';
+  if (!userId) {
+    return res.status(401).json({ success: false, message: 'Signed-in identity required' });
+  }
   if (!videoId) {
     return res.status(400).json({ success: false, message: 'videoId is required' });
   }
@@ -116,8 +121,13 @@ router.post('/api/video-feed/:id/like', async (req, res) => {
 router.post('/api/video-feed/:id/comment', async (req, res) => {
   const videoId = safeString(req.params.id);
   const body = safeString(req.body?.body);
-  const author = safeString(req.body?.author, 'noodshop');
-  const userId = safeString(req.body?.userId, 'guest');
+  const customer = await authenticateCustomer(req);
+  const userId = customer?.userId || '';
+  const author = safeString([customer?.firstName, customer?.lastName].filter(Boolean).join(' '), 'NOOD customer');
+
+  if (!userId) {
+    return res.status(401).json({ success: false, message: 'Signed-in identity required' });
+  }
 
   if (!videoId || !body) {
     return res.status(400).json({ success: false, message: 'videoId and body are required' });
@@ -160,6 +170,10 @@ router.post('/api/video-feed/:id/comment', async (req, res) => {
 /** POST /api/video-feed/:id/share — record a share (increments counter). */
 router.post('/api/video-feed/:id/share', async (req, res) => {
   const videoId = safeString(req.params.id);
+  const customer = await authenticateCustomer(req);
+  if (!customer?.userId) {
+    return res.status(401).json({ success: false, message: 'Signed-in identity required' });
+  }
   if (!videoId) {
     return res.status(400).json({ success: false, message: 'videoId is required' });
   }
@@ -188,6 +202,23 @@ router.post('/api/video-feed/:id/share', async (req, res) => {
   }
 });
 
+/** POST /api/video-feed/:id/report — authenticated, one report per user/video. */
+router.post('/api/video-feed/:id/report', async (req, res) => {
+  const videoId = safeString(req.params.id);
+  const reason = safeString(req.body?.reason).toLowerCase();
+  const customer = await authenticateCustomer(req);
+  if (!customer?.userId) return res.status(401).json({ success: false, message: 'Signed-in identity required' });
+  if (!videoId || !['spam', 'misleading', 'unsafe', 'inappropriate', 'other'].includes(reason)) {
+    return res.status(400).json({ success: false, message: 'A valid report reason is required' });
+  }
+  if (!supabase) return res.status(503).json({ success: false, message: 'Reporting is unavailable' });
+  const { error } = await supabase.from('video_reports').upsert({
+    video_id: videoId, user_id: customer.userId, reason,
+  }, { onConflict: 'video_id,user_id', ignoreDuplicates: true });
+  if (error) return res.status(500).json({ success: false, message: 'Report could not be submitted' });
+  return res.status(201).json({ success: true });
+});
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /**
@@ -212,19 +243,7 @@ async function incrementColumn(videoId, column, delta) {
     delta,
   });
 
-  if (error) {
-    // Fallback: read-modify-write.
-    const { data } = await supabase
-      .from('video_engagement')
-      .select(column)
-      .eq('video_id', videoId)
-      .maybeSingle();
-    const current = Number(data?.[column] || 0);
-    await supabase
-      .from('video_engagement')
-      .update({ [column]: Math.max(0, current + delta) })
-      .eq('video_id', videoId);
-  }
+  if (error) throw new Error(`Atomic engagement update failed: ${error.message}`);
 }
 
 async function incrementLikes(videoId) {

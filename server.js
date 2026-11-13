@@ -6,28 +6,51 @@ const path = require('path');
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-
-// Ensure raw body parsing for Shopify webhook verification
-const rawBodyMiddleware = (req, res, next) => {
-  let data = '';
-  req.setEncoding('utf8');
-  req.on('data', chunk => { data += chunk; });
-  req.on('end', () => {
-    req.rawBody = data;
-    next();
-  });
-};
+const helmet = require('helmet');
+const { rateLimit } = require('express-rate-limit');
 
 const app = express();
 
-app.use(cors());
-app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf.toString(); } }));
-app.use('/webhooks', rawBodyMiddleware); // Raw body only for webhooks
+app.set('trust proxy', 1);
+const allowedOrigins = new Set(
+  String(process.env.CORS_ALLOWED_ORIGINS || process.env.FRONTEND_URL || '')
+    .split(',').map((value) => value.trim()).filter(Boolean)
+);
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin) ||
+        (process.env.NODE_ENV !== 'production' && /^https?:\/\/localhost(?::\d+)?$/.test(origin))) {
+      return callback(null, true);
+    }
+    return callback(new Error('Origin not allowed'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-push-token', 'x-admin-token'],
+}));
+const apiLimiter = rateLimit({ windowMs: 60_000, limit: 180, standardHeaders: 'draft-8', legacyHeaders: false });
+const paymentLimiter = rateLimit({ windowMs: 10 * 60_000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false });
+app.use('/api', apiLimiter);
+app.use(['/api/orders', '/api/wallet', '/create-wipay-payment', '/create-wallet-topup', '/wallet/topup'], paymentLimiter);
+// Capture the exact bytes while parsing JSON. Shopify's HMAC must be checked
+// against this unmodified body; adding a second stream reader after
+// express.json() can hang because the request stream has already been consumed.
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, res, buf) => { req.rawBody = buf.toString('utf8'); },
+}));
 
 const pendingOrders = new Map();
 const PENDING_ORDERS_FILE = path.join(__dirname, 'pending-orders.json');
 
 const PORT = Number(process.env.PORT || 3000);
+const localSyntheticDemo = process.env.NODE_ENV !== 'production' &&
+  ['groq', '9router'].includes(process.env.NOOD_AI_TEST_PROVIDER) && process.env.NOOD_AI_DEMO_DISABLE_JOBS === 'true';
+// Device inspection needs the real API without sending scheduled campaigns or
+// running inventory writes against the configured store in the background.
+const backgroundJobsPaused = localSyntheticDemo || (
+  process.env.NODE_ENV !== 'production' && process.env.NOOD_DISABLE_BACKGROUND_JOBS === 'true'
+);
 const LOCAL_IP = process.env.LOCAL_IP || '192.168.100.238';
 const BACKEND_BASE_URL =
   process.env.BACKEND_BASE_URL || `http://${LOCAL_IP}:${PORT}`;
@@ -35,7 +58,7 @@ const BACKEND_BASE_URL =
 const WIPAY_ACCOUNT_NUMBER = process.env.WIPAY_ACCOUNT_NUMBER;
 const WIPAY_ENVIRONMENT = process.env.WIPAY_ENVIRONMENT || 'sandbox';
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
-const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+const { getAdminToken, hasAdminCredentials } = require('./services/shopify-admin-auth');
 
 loadPendingOrders();
 
@@ -252,193 +275,7 @@ function getReferralEntry(customerId) {
 
 loadReferralStore();
 
-// ─── Reward / referral routes ────────────────────────────────────────────
-
-app.get('/api/rewards/status', (req, res) => {
-  const customerId = safeString(req.query.customerId, '');
-  if (!customerId) {
-    return res.status(400).json({ success: false, message: 'customerId is required' });
-  }
-
-  const code = getOrCreateReferralCode(customerId);
-  const entry = getReferralEntry(customerId);
-  const invites = entry?.invites || [];
-
-  const rewardedCount = invites.filter((i) => i.rewarded).length;
-  const invitedCount = invites.length;
-  const goal = 5;
-  const now = Date.now();
-  const expiresAt = now + 7 * 24 * 60 * 60 * 1000;
-
-  return res.json({
-    success: true,
-    customerId,
-    walletBalance: '0.00',
-    currency: 'USD',
-    challenges: [
-      {
-        id: 'invite_5_friends_7_days',
-        title: 'Invite 5 friends in 7 days',
-        subtitle: 'Earn $10 NOOD Balance',
-        rewardAmount: 10,
-        rewardCurrency: 'USD',
-        rewardLabel: '$10 USD',
-        inviteGoal: goal,
-        invitedCount,
-        daysLeft: 7,
-        expiresAt: new Date(expiresAt).toISOString(),
-        startedAt: new Date(entry?.createdAt || now).toISOString(),
-        shareCount: invitedCount,
-        referralCode: code,
-        referralLink: `https://noodcaribbean.com/invite?code=${code}`,
-        claimed: rewardedCount >= goal,
-        eligibleToClaim: invitedCount >= goal,
-        claimReason: invitedCount >= goal ? 'eligible' : 'complete_challenge_first',
-      },
-    ],
-  });
-});
-
-app.post('/api/rewards/referral/share', (req, res) => {
-  const customerId = safeString(req.body?.customerId, '');
-  if (!customerId) {
-    return res.status(400).json({ success: false, message: 'customerId is required' });
-  }
-
-  const code = getOrCreateReferralCode(customerId);
-  const entry = getReferralEntry(customerId);
-  const invitedCount = entry?.invites?.length || 0;
-
-  return res.json({
-    success: true,
-    referralCode: code,
-    referralLink: `https://noodcaribbean.com/invite?code=${code}`,
-    shareMessage: `Join me on NOOD and we both earn $10 in store credit! Use my code ${code}`,
-    invitedCount,
-  });
-});
-
-app.post('/api/rewards/referral/attributed', (req, res) => {
-  const referralCode = safeString(req.body?.referralCode, '').toUpperCase();
-  const referredCustomerId = safeString(req.body?.referredCustomerId, '');
-
-  if (!referralCode || !referredCustomerId) {
-    return res.status(400).json({ success: false, message: 'referralCode and referredCustomerId are required' });
-  }
-
-  const entry = referralStore.byCode.get(referralCode);
-  if (!entry) {
-    return res.status(404).json({ success: false, message: 'Invalid referral code' });
-  }
-
-  if (entry.ownerCustomerId === referredCustomerId) {
-    return res.status(400).json({ success: false, message: 'Cannot refer yourself' });
-  }
-
-  const invites = entry.invites || [];
-  if (!invites.some((i) => i.referredCustomerId === referredCustomerId)) {
-    invites.push({
-      referredCustomerId,
-      createdAt: Date.now(),
-      rewarded: false,
-    });
-    entry.invites = invites;
-    persistReferralStore();
-  }
-
-  return res.json({
-    success: true,
-    message: 'Referral attributed',
-    referralCode,
-    invitedCount: invites.length,
-  });
-});
-
-app.post('/api/rewards/claim', (req, res) => {
-  const customerId = safeString(req.body?.customerId, '');
-  const challengeId = safeString(req.body?.challengeId, 'invite_5_friends_7_days');
-  if (!customerId) {
-    return res.status(400).json({ success: false, message: 'customerId is required' });
-  }
-
-  const entry = getReferralEntry(customerId);
-  const invites = entry?.invites || [];
-
-  if (invites.length < 5) {
-    return res.status(400).json({
-      success: false,
-      message: 'Invite 5 friends before claiming',
-      invitedCount: invites.length,
-    });
-  }
-
-  const alreadyClaimed = invites.length >= 5 && invites.slice(0, 5).every((i) => i.rewarded);
-  if (alreadyClaimed) {
-    return res.status(400).json({
-      success: false,
-      message: 'Reward already claimed',
-      code: 'already_claimed',
-    });
-  }
-
-  // Mark first 5 invites as rewarded
-  let marked = 0;
-  for (const invite of invites) {
-    if (marked >= 5) break;
-    if (!invite.rewarded) {
-      invite.rewarded = true;
-      marked += 1;
-    }
-  }
-  persistReferralStore();
-
-  return res.json({
-    success: true,
-    message: 'Reward claimed — $10 NOOD Balance added',
-    rewardAmount: 10,
-    rewardCurrency: 'USD',
-    walletBalance: '10.00',
-    challengeId,
-  });
-});
-
-app.get('/api/rewards/scratch/status', (req, res) => {
-  const customerId = safeString(req.query.customerId, '');
-  return res.json({
-    success: true,
-    customerId,
-    canPlay: false,
-    scratchTokens: 0,
-    nextAvailableAt: null,
-    completedAt: null,
-    cooldownDaysRemaining: 0,
-    alreadyClaimed: false,
-    popupEligible: false,
-  });
-});
-
-app.get('/api/rewards/lucky-spin/status', (req, res) => {
-  const customerId = safeString(req.query.customerId, '');
-  return res.json({
-    success: true,
-    customerId,
-    canSpin: false,
-    used: false,
-    luckySpinUsedAt: null,
-    luckySpinRewardAmountUsd: null,
-    alreadyClaimed: false,
-    demoOnly: true,
-  });
-});
-
-app.post('/api/rewards/lucky-spin/spin', (req, res) => {
-  const customerId = safeString(req.body?.customerId, '');
-  return res.json({
-    success: true,
-    message: 'Lucky spin recorded (demo)',
-    customerId,
-  });
-});
+// ─── Reward / referral routes (moved to routes/rewards.js — ledger-backed) ─
 
 app.get('/', (req, res) => {
   res.send(`Backend is running on ${BACKEND_BASE_URL}`);
@@ -452,380 +289,62 @@ app.get('/health', (req, res) => {
     port: PORT,
     has_wipay_account: Boolean(WIPAY_ACCOUNT_NUMBER),
     has_shopify_domain: Boolean(SHOPIFY_STORE_DOMAIN),
-    has_shopify_token: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
+    has_shopify_token: hasAdminCredentials(),
   });
 });
 
-app.post('/create-wipay-payment', async (req, res) => {
+// Read-only readiness check: verifies the current store credential and order scope.
+app.get('/health/shopify', apiLimiter, async (_req, res) => {
   try {
-    const { total, name, email, phone, cartItems = [] } = req.body;
-
-    if (!WIPAY_ACCOUNT_NUMBER) {
-      return res.status(500).json({
-        error: true,
-        message: 'Missing WIPAY_ACCOUNT_NUMBER in .env',
-      });
-    }
-
-    if (!isValidPositiveMoney(total)) {
-      return res.status(400).json({
-        error: true,
-        message: 'Invalid total. Minimum is 1.00.',
-      });
-    }
-
-    if (!Array.isArray(cartItems) || cartItems.length === 0) {
-      return res.status(400).json({
-        error: true,
-        message: 'Cart is empty.',
-      });
-    }
-
-    const parsedTotal = safeMoney(total);
-    const customerName = safeString(name, 'NOOD Customer');
-    const customerEmail = safeString(email, 'test@example.com');
-    const customerPhone = safeString(phone, '8680000000');
-
-    const orderId = `order_${Date.now()}`;
-
-    const returnToken = generateReturnToken();
-
-    setPendingOrder(orderId, {
-      type: 'checkout',
-      orderId,
-      returnToken,
-      total: parsedTotal,
-      name: customerName,
-      email: customerEmail,
-      phone: customerPhone,
-      cartItems,
-      createdAt: Date.now(),
+    const token = await getAdminToken();
+    const { data } = await axios.get(`https://${SHOPIFY_STORE_DOMAIN}/admin/oauth/access_scopes.json`, {
+      headers: { 'X-Shopify-Access-Token': token }, timeout: 15000,
     });
-
-    const payload = new URLSearchParams({
-      account_number: WIPAY_ACCOUNT_NUMBER,
-      country_code: 'TT',
-      currency: 'TTD',
-      environment: WIPAY_ENVIRONMENT,
-      fee_structure: 'customer_pay',
-      method: 'credit_card',
-      order_id: orderId,
-      origin: 'nood_app',
-      response_url: `${BACKEND_BASE_URL}/payment-return?order_id=${encodeURIComponent(orderId)}&return_token=${encodeURIComponent(returnToken)}`,
-      total: parsedTotal,
-      name: customerName,
-      email: customerEmail,
-      phone: customerPhone,
-    });
-
-    const response = await axios.post(
-      'https://tt.wipayfinancial.com/plugins/payments/request',
-      payload.toString(),
-      {
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        timeout: 30000,
-      }
-    );
-
-    const paymentUrl = getWiPayPaymentUrl(response.data);
-
-    if (!paymentUrl) {
-      return res.status(500).json({
-        error: true,
-        message: 'WiPay did not return a payment URL.',
-        raw: response.data,
-      });
-    }
-
-    return res.json({
-      success: true,
-      url: paymentUrl,
-      payment_url: paymentUrl,
-      message: response.data?.message || 'OK',
-      transaction_id: response.data?.transaction_id || null,
-      order_id: orderId,
-    });
-  } catch (error) {
-    const errorData = error.response?.data || error.message;
-    console.error('WiPay CHECKOUT ERROR:', errorData);
-
-    return res.status(500).json({
-      error: true,
-      message:
-        typeof errorData === 'string'
-          ? errorData
-          : errorData?.message || 'WiPay request failed',
-      raw: errorData,
-    });
+    const canCreateOrders = (data?.access_scopes || []).some(scope => scope.handle === 'write_orders');
+    return res.status(canCreateOrders ? 200 : 503).json({ ok: canCreateOrders, store: SHOPIFY_STORE_DOMAIN, canCreateOrders });
+  } catch (_error) {
+    return res.status(503).json({ ok: false, canCreateOrders: false, error: 'Shopify order connection unavailable' });
   }
 });
 
-app.post('/create-wallet-topup', async (req, res) => {
-  try {
-    const { amount, name, email, phone } = req.body;
-
-    if (!WIPAY_ACCOUNT_NUMBER) {
-      return res.status(500).json({
-        error: true,
-        message: 'Missing WIPAY_ACCOUNT_NUMBER in .env',
-      });
-    }
-
-    if (!isValidPositiveMoney(amount)) {
-      return res.status(400).json({
-        error: true,
-        message: 'Invalid amount. Minimum is 1.00.',
-      });
-    }
-
-    const parsedAmount = safeMoney(amount);
-    const customerName = safeString(name, 'NOOD Customer');
-    const customerEmail = safeString(email, 'test@example.com');
-    const customerPhone = safeString(phone, '8680000000');
-
-    const orderId = `wallet_${Date.now()}`;
-
-    const returnToken = generateReturnToken();
-
-    setPendingOrder(orderId, {
-      type: 'wallet_topup',
-      orderId,
-      returnToken,
-      amount: parsedAmount,
-      name: customerName,
-      email: customerEmail,
-      phone: customerPhone,
-      createdAt: Date.now(),
-    });
-
-    const payload = new URLSearchParams({
-      account_number: WIPAY_ACCOUNT_NUMBER,
-      country_code: 'TT',
-      currency: 'TTD',
-      environment: WIPAY_ENVIRONMENT,
-      fee_structure: 'customer_pay',
-      method: 'credit_card',
-      order_id: orderId,
-      origin: 'nood_app',
-      response_url: `${BACKEND_BASE_URL}/payment-return?order_id=${encodeURIComponent(orderId)}&return_token=${encodeURIComponent(returnToken)}`,
-      total: parsedAmount,
-      name: customerName,
-      email: customerEmail,
-      phone: customerPhone,
-    });
-
-    const response = await axios.post(
-      'https://tt.wipayfinancial.com/plugins/payments/request',
-      payload.toString(),
-      {
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        timeout: 30000,
-      }
-    );
-
-    const paymentUrl = getWiPayPaymentUrl(response.data);
-
-    if (!paymentUrl) {
-      return res.status(500).json({
-        error: true,
-        message: 'WiPay did not return a payment URL.',
-        raw: response.data,
-      });
-    }
-
-    return res.json({
-      success: true,
-      url: paymentUrl,
-      payment_url: paymentUrl,
-      message: response.data?.message || 'OK',
-      transaction_id: response.data?.transaction_id || null,
-      order_id: orderId,
-    });
-  } catch (error) {
-    const errorData = error.response?.data || error.message;
-    console.error('WiPay WALLET TOPUP ERROR:', errorData);
-
-    return res.status(500).json({
-      error: true,
-      message:
-        typeof errorData === 'string'
-          ? errorData
-          : errorData?.message || 'Top-up failed',
-      raw: errorData,
-    });
-  }
-});
-
-app.get('/payment-return', async (req, res) => {
-  try {
-    const rawStatus = getReturnStatus(req.query);
-    const orderId = getReturnOrderId(req.query);
-    const transactionId = getReturnTransactionId(req.query);
-    const returnToken = getReturnToken(req.query);
-
-    const isSuccess =
-      rawStatus === 'success' ||
-      rawStatus === 'approved' ||
-      rawStatus === 'paid' ||
-      rawStatus === '1';
-
-    const isCancelled =
-      rawStatus === 'cancelled' ||
-      rawStatus === 'canceled';
-
-    const pending = pendingOrders.get(orderId);
-
-    if (!pending || !returnToken || returnToken !== pending.returnToken) {
-      return res.redirect(
-        buildAppRedirect('payment-result', {
-          status: 'failed',
-          order_id: orderId,
-          transaction_id: transactionId,
-          reason: 'invalid_return_token',
-          method: 'wipay',
-        })
-      );
-    }
-
-    if (!isSuccess) {
-      const failStatus = isCancelled ? 'cancelled' : 'failed';
-
-      removePendingOrder(orderId);
-
-      return res.redirect(
-        buildAppRedirect('payment-result', {
-          status: failStatus,
-          order_id: orderId,
-          transaction_id: transactionId,
-          method: 'wipay',
-        })
-      );
-    }
-
-    if (pending.type === 'wallet_topup') {
-      removePendingOrder(orderId);
-
-      return res.redirect(
-        buildAppRedirect('payment-result', {
-          status: 'success',
-          type: 'wallet_topup',
-          order_id: orderId,
-          transaction_id: transactionId,
-          amount: pending.amount,
-          method: 'wipay',
-        })
-      );
-    }
-
-    let shopifyOrder = null;
-
-    try {
-      shopifyOrder = await createShopifyOrder({
-        email: pending.email,
-        phone: pending.phone,
-        name: pending.name,
-        total: pending.total,
-        cartItems: pending.cartItems,
-        wipayTransactionId: transactionId,
-        clientOrderId: orderId,
-      });
-    } catch (shopifyError) {
-      console.error(
-        'SHOPIFY ORDER CREATE FAILED AFTER PAYMENT:',
-        shopifyError.response?.data || shopifyError.message
-      );
-
-      return res.redirect(
-        buildAppRedirect('payment-result', {
-          status: 'failed',
-          type: 'checkout',
-          order_id: orderId,
-          transaction_id: transactionId,
-          reason: 'shopify_order_create_failed',
-          amount: pending.total,
-          method: 'wipay',
-        })
-      );
-    }
-
-    removePendingOrder(orderId);
-
-    return res.redirect(
-      buildAppRedirect('payment-result', {
-        status: 'success',
-        type: 'checkout',
-        order_id: orderId,
-        transaction_id: transactionId,
-        shopify_order_id: shopifyOrder?.id || '',
-        shopify_order_name: shopifyOrder?.name || '',
-        amount: pending.total,
-        method: 'wipay',
-      })
-    );
-  } catch (error) {
-    console.error('PAYMENT RETURN ERROR:', error.response?.data || error.message);
-
-    return res.redirect(
-      buildAppRedirect('payment-result', {
-        status: 'failed',
-        reason: 'server_error',
-        method: 'wipay',
-      })
-    );
-  }
-});
+app.use(require('./routes/wipay')({ createShopifyOrder, buildAppRedirect, baseUrl: BACKEND_BASE_URL }));
 
 async function createShopifyOrder({
   email,
   phone,
   name,
   total,
+  currency,
   cartItems,
+  pricedCart,
+  gateway = 'WiPay',
+  paymentTransactionId,
   wipayTransactionId,
   clientOrderId,
+  shippingAddress = {},
+  userId = null,
 }) {
   if (!SHOPIFY_STORE_DOMAIN) {
     throw new Error('Missing SHOPIFY_STORE_DOMAIN in .env');
   }
 
-  if (!SHOPIFY_ADMIN_ACCESS_TOKEN) {
+  if (!hasAdminCredentials()) {
     throw new Error('Missing SHOPIFY_ADMIN_ACCESS_TOKEN in .env');
   }
 
   const [firstName, ...rest] = safeString(name, 'NOOD Customer').split(' ');
   const lastName = rest.join(' ') || 'Customer';
 
-  const lineItems = (Array.isArray(cartItems) ? cartItems : []).map((item) => {
-    const quantity = Number(item?.quantity || 1);
-    const price = safeMoney(item?.price || 0);
-    const rawVariantId = item?.variantId ? String(item.variantId) : '';
-
-    const baseItem = {
-      title: safeString(item?.title, 'Product'),
-      quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : 1,
-      priceSet: {
-        shopMoney: {
-          amount: price,
-          currencyCode: 'TTD',
-        },
-      },
-    };
-
-    if (rawVariantId) {
-      return {
-        ...baseItem,
-        variantId: `gid://shopify/ProductVariant/${rawVariantId}`,
-      };
-    }
-
-    return baseItem;
-  });
+  const trusted = pricedCart || await require('./services/catalog-pricing').priceCart(cartItems);
+  const trustedCurrency = safeString(currency || trusted.currency, 'USD').toUpperCase();
+  const trustedTotal = safeMoney(trusted.total || trusted.subtotal);
+  if (trustedCurrency !== trusted.currency || safeMoney(total) !== trustedTotal) {
+    throw new Error('Payment amount does not match the server-authoritative cart price');
+  }
+  const lineItems = trusted.lines.map((item) => ({
+    variantId: item.variantId,
+    quantity: item.quantity,
+  }));
 
   const query = `
     mutation orderCreate($order: OrderCreateOrderInput!) {
@@ -846,23 +365,49 @@ async function createShopifyOrder({
     order: {
       email: email || undefined,
       phone: phone || undefined,
-      tags: ['NOOD App', 'WiPay'],
-      note: `WiPay transaction: ${wipayTransactionId} | Client order: ${clientOrderId}`,
+      tags: ['NOOD App', gateway],
+      note: `${gateway} transaction: ${paymentTransactionId || wipayTransactionId} | Client order: ${clientOrderId}`,
       billingAddress: {
         firstName: firstName || 'NOOD',
         lastName: lastName || 'Customer',
         phone: phone || undefined,
       },
+      shippingAddress: {
+        firstName: safeString(shippingAddress.firstName || shippingAddress.fullName || name, firstName),
+        lastName: safeString(shippingAddress.lastName, lastName),
+        address1: safeString(shippingAddress.address1) || undefined,
+        address2: safeString(shippingAddress.address2) || undefined,
+        city: safeString(shippingAddress.city) || undefined,
+        provinceCode: safeString(shippingAddress.region || shippingAddress.state) || undefined,
+        zip: safeString(shippingAddress.postalCode || shippingAddress.zip) || undefined,
+        countryCode: safeString(shippingAddress.country, 'TT').toUpperCase(),
+        phone: safeString(shippingAddress.phone || phone) || undefined,
+      },
       lineItems,
+      ...(Number(trusted.discount || 0) > 0 && trusted.coupon?.code
+        ? {
+            discountCode: {
+              itemFixedDiscountCode: {
+                code: trusted.coupon.code,
+                amountSet: {
+                  shopMoney: {
+                    amount: safeMoney(trusted.discount),
+                    currencyCode: trustedCurrency,
+                  },
+                },
+              },
+            },
+          }
+        : {}),
       transactions: [
         {
           kind: 'SALE',
           status: 'SUCCESS',
-          gateway: 'WiPay',
+          gateway,
           amountSet: {
             shopMoney: {
               amount: safeMoney(total),
-              currencyCode: 'TTD',
+              currencyCode: trustedCurrency,
             },
           },
         },
@@ -877,7 +422,7 @@ async function createShopifyOrder({
     { query, variables },
     {
       headers: {
-        'X-Shopify-Access-Token': SHOPIFY_ADMIN_ACCESS_TOKEN,
+        'X-Shopify-Access-Token': await getAdminToken(),
         'Content-Type': 'application/json',
       },
       timeout: 30000,
@@ -897,6 +442,23 @@ async function createShopifyOrder({
   if (!result?.order || errors.length > 0) {
     console.error('SHOPIFY ORDER CREATE ERROR:', errors, payload);
     throw new Error(errors[0]?.message || 'Failed to create Shopify order');
+  }
+
+  try {
+    const { upsertOrder } = require('./utils/order-sync');
+    await upsertOrder({
+      ...result.order,
+      email,
+      total: trustedTotal,
+      currency: trustedCurrency,
+      status: 'paid',
+      items: trusted.lines,
+      payment_provider: gateway,
+      payment_transaction_id: paymentTransactionId || wipayTransactionId,
+      created_at: new Date().toISOString(),
+    }, userId);
+  } catch (error) {
+    console.error('[ORDER SYNC] Paid order persistence failed:', error.message);
   }
 
   return result.order;
@@ -920,8 +482,8 @@ app.listen(PORT, '0.0.0.0', () => {
   if (!SHOPIFY_STORE_DOMAIN || SHOPIFY_STORE_DOMAIN === 'your-store.myshopify.com') {
     missing.push('SHOPIFY_STORE_DOMAIN (e.g. noodcaribbean.myshopify.com)');
   }
-  if (!SHOPIFY_ADMIN_ACCESS_TOKEN || SHOPIFY_ADMIN_ACCESS_TOKEN === 'your_shopify_admin_access_token') {
-    missing.push('SHOPIFY_ADMIN_ACCESS_TOKEN (Admin API access token)');
+  if (!hasAdminCredentials()) {
+    missing.push('SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET (or legacy Admin token)');
   }
 
   if (missing.length > 0) {
@@ -936,6 +498,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
   // Start background jobs (wrapped so a job failure never crashes the server)
   console.log('[JOBS] Starting background jobs...');
+  if (!backgroundJobsPaused) {
   try {
     require('./jobs/cart-abandonment');
   } catch (error) {
@@ -946,6 +509,9 @@ app.listen(PORT, '0.0.0.0', () => {
   } catch (error) {
     console.error('[JOBS] inventory-sync failed to start:', error.message);
   }
+
+  // Mount webhook routes
+  } else { console.log('[JOBS] Background notification and inventory jobs paused for this local session.'); }
 
   // Mount webhook routes
   try {
@@ -987,6 +553,31 @@ app.listen(PORT, '0.0.0.0', () => {
     console.error('[JOBS] payment routes failed to mount:', error.message);
   }
 
+  // Mount server-authoritative promotions and coupon quote routes.
+  try {
+    const { router: promotionsRouter } = require('./routes/promotions');
+    app.use('/', promotionsRouter);
+  } catch (error) {
+    console.error('[JOBS] promotions routes failed to mount:', error.message);
+  }
+
+  // Mount support, verified reviews, consented analytics, and security events.
+  try {
+    const { router: platformRouter } = require('./routes/platform');
+    app.use('/', platformRouter);
+  } catch (error) {
+    console.error('[JOBS] platform routes failed to mount:', error.message);
+  }
+
+  // Authenticated deterministic support assistant. Human support cases remain
+  // authoritative and are reused for handoff.
+  try {
+    const { router: supportAssistantRouter } = require('./routes/support-assistant');
+    app.use('/', supportAssistantRouter);
+  } catch (error) {
+    console.error('[JOBS] support assistant routes failed to mount:', error.message);
+  }
+
   // Mount catalog routes (menus, etc.)
   try {
     const { router: catalogRouter } = require('./routes/catalog');
@@ -1019,6 +610,42 @@ app.listen(PORT, '0.0.0.0', () => {
     console.error('[JOBS] refunds routes failed to mount:', error.message);
   }
 
+  // Mount wishlist sync routes
+  try {
+    const { router: wishlistRouter } = require('./routes/wishlist');
+    app.use('/', wishlistRouter);
+  } catch (error) {
+    console.error('[JOBS] wishlist routes failed to mount:', error.message);
+  }
+
+  // Mount rewards / games / wallet routes (ledger-backed)
+  try {
+    const { router: rewardsRouter } = require('./routes/rewards');
+    app.use('/', rewardsRouter);
+  } catch (error) {
+    console.error('[JOBS] rewards routes failed to mount:', error.message);
+  }
+
+  // Start the real-trigger engine (wishlist / cart / referral scans).
+  if (!backgroundJobsPaused) {
+  try {
+    const { runNotificationTriggers } = require('./jobs/notification-triggers');
+    const triggerIntervalMs = Number(process.env.PUSH_TRIGGER_INTERVAL_MINUTES || 15) * 60 * 1000;
+    setInterval(() => {
+      runNotificationTriggers().catch((error) =>
+        console.error('[TRIGGERS] interval error:', error.message)
+      );
+    }, triggerIntervalMs);
+    setTimeout(() => {
+      runNotificationTriggers().catch((error) =>
+        console.error('[TRIGGERS] startup error:', error.message)
+      );
+    }, 20000);
+    console.log('[TRIGGERS] real-trigger engine started');
+  } catch (error) {
+    console.error('[TRIGGERS] failed to start:', error.message);
+  }
+
   // Start automated notification campaigns (Temu-style pushes with
   // frequency control + dedupe). Replaces the old new-product-campaign job,
   // which directly hit Expo's API — new-product pushes now fire from
@@ -1039,6 +666,9 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('[JOBS] notification-campaigns engine started');
   } catch (error) {
     console.error('[JOBS] notification-campaigns failed to start:', error.message);
+  }
+
+  // Serve the push-sender admin page at /push (self-contained copy)
   }
 
   // Serve the push-sender admin page at /push (self-contained copy)
@@ -1072,3 +702,4 @@ app.listen(PORT, '0.0.0.0', () => {
     res.status(404).send('Campaign Center page not found');
   });
 });
+

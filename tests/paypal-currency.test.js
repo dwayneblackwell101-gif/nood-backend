@@ -1,0 +1,20 @@
+const assert = require('assert');
+const axios = require('axios');
+let calls=0;
+axios.get = async () => { calls++; return {data:{result:'success',base_code:'USD',time_last_update_unix:Math.floor(Date.now()/1000),rates:{TTD:6.78}}}; };
+const {quotePayPalSettlement,convertTtdToUsd,refundSettlement} = require('../services/paypal-currency');
+(async()=>{
+  assert.equal(convertTtdToUsd('67.80',6.78),'10.00');
+  assert.equal(convertTtdToUsd('100.00',6.78),'14.75');
+  assert.throws(()=>convertTtdToUsd('10abc',6.78));
+  assert.throws(()=>convertTtdToUsd('10.00',0));
+  const [a,b]=await Promise.all([quotePayPalSettlement({total:'67.80',currency:'TTD'}),quotePayPalSettlement({total:'135.60',currency:'TTD'})]);
+  assert.equal(calls,1);assert.equal(a.amount,'10.00');assert.equal(b.amount,'20.00');assert.equal(a.sourceCurrency,'TTD');
+  const session={quote:{paypalSettlement:a}};
+  assert.deepEqual(refundSettlement('67.80','TTD',session),{amount:'10.00',currency:'USD'});
+  assert.deepEqual(refundSettlement('33.90','TTD',session),{amount:'5.00',currency:'USD'});
+  assert.throws(()=>refundSettlement('67.81','TTD',session));assert.throws(()=>refundSettlement('10.00','TTD',null));
+  assert.equal((await quotePayPalSettlement({total:'10.00',currency:'USD'})).amount,'10.00');
+  await assert.rejects(quotePayPalSettlement({total:'10.00',currency:'GBP'}));
+  console.log('PayPal currency tests passed: conversion, rounding, invalid inputs, shared rate fetch, USD passthrough, original-rate refunds and refund limits.');
+})().catch(e=>{console.error(e);process.exitCode=1});

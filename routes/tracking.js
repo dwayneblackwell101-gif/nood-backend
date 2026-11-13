@@ -2,14 +2,13 @@
  * Order tracking API — normalized tracking state consumed by the app.
  *
  * SECURITY: tracking data is private to the order owner. Identity is
- * resolved from the device's push token (x-push-token header) which is a
- * bearer credential bound to a user_id in push_tokens. A raw userId query
- * param is NEVER trusted for private tracking data.
+ * resolved from a validated Shopify Customer Account token. A raw userId
+ * query parameter is never trusted for private tracking data.
  */
 
 const express = require('express');
 const { getOrderTracking, listTrackingForUser, TRACKER_STEPS } = require('../utils/tracking');
-const { findTokenRecord } = require('../utils/push-tokens-db');
+const { authenticateCustomer } = require('../services/customer-auth');
 
 const router = express.Router();
 
@@ -17,19 +16,11 @@ function safeString(value, fallback = '') {
   return String(value ?? fallback).trim();
 }
 
-/** Resolve authenticated identity from x-push-token (bearer) header. */
 async function resolveIdentity(req) {
-  const bearerToken = safeString(req.headers?.['x-push-token'] || req.query?.token);
-  if (bearerToken) {
-    const record = await findTokenRecord(bearerToken);
-    if (record?.userId) {
-      return { kind: 'user', id: record.userId, token: bearerToken };
-    }
-    if (record?.deviceId) {
-      return { kind: 'device', id: record.deviceId, token: bearerToken };
-    }
-  }
-  return null;
+  const customer = await authenticateCustomer(req);
+  return customer?.userId
+    ? { kind: 'user', id: customer.userId, email: customer.email }
+    : null;
 }
 
 function serialize(tracking) {
@@ -75,11 +66,7 @@ router.get('/api/tracking/:orderId', async (req, res) => {
     return res.status(403).json({ success: false, message: 'Forbidden' });
   }
   if (tracking.user_id === null && tracking.email) {
-    // Fall back to email match if no user_id yet.
-    const { loadTokens } = require('../utils/push-tokens-db');
-    const tokens = await loadTokens();
-    const token = Object.values(tokens).find((t) => t.token === identity.token);
-    if (!token || String(token.email || '').toLowerCase() !== String(tracking.email).toLowerCase()) {
+    if (!identity.email || String(identity.email).toLowerCase() !== String(tracking.email).toLowerCase()) {
       return res.status(403).json({ success: false, message: 'Forbidden' });
     }
   }

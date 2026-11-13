@@ -4,6 +4,45 @@
 
 const { supabase } = require('./supabase');
 
+async function upsertOrder(order, userId = null) {
+  if (!supabase || !order?.id) return { ok: false, reason: 'database_unavailable' };
+  const items = Array.isArray(order.items)
+    ? order.items
+    : Array.isArray(order.line_items)
+      ? order.line_items.map((item) => ({
+          id: String(item.id || ''),
+          variantId: item.variant_id ? `gid://shopify/ProductVariant/${item.variant_id}` : '',
+          title: String(item.title || item.name || 'Product'),
+          quantity: Math.max(1, Number(item.quantity || 1)),
+          price: Math.max(
+            0,
+            (Number(item.price || 0) * Math.max(1, Number(item.quantity || 1)) - Number(item.total_discount || 0)) /
+              Math.max(1, Number(item.quantity || 1))
+          ).toFixed(2),
+          currency: String(order.currency || 'USD').toUpperCase(),
+          image: String(item.image?.src || ''),
+        }))
+      : [];
+  const row = {
+    shopify_order_id: String(order.id),
+    email: String(order.email || '').trim().toLowerCase() || null,
+    user_id: userId || order.user_id || null,
+    name: String(order.name || ''),
+    total: Number(order.total || order.total_price || 0),
+    currency: String(order.currency || 'USD').toUpperCase(),
+    status: String(order.status || order.financial_status || 'paid').toLowerCase(),
+    fulfillment_status: order.fulfillment_status || null,
+    payment_provider: String(order.payment_provider || order.gateway || '').toLowerCase() || null,
+    payment_transaction_id: order.payment_transaction_id || null,
+    items,
+    created_at: order.created_at || new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await supabase.from('orders').upsert(row, { onConflict: 'shopify_order_id' });
+  if (error) throw error;
+  return { ok: true };
+}
+
 async function updateOrderFromFulfillment(fulfillment) {
   if (!supabase) {
     console.warn('[ORDER SYNC] Supabase not configured');
@@ -63,4 +102,4 @@ async function updateOrderStatus(orderId, updates) {
   }
 }
 
-module.exports = { updateOrderFromFulfillment, updateOrderStatus };
+module.exports = { upsertOrder, updateOrderFromFulfillment, updateOrderStatus };

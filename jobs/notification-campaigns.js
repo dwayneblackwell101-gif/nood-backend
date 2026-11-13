@@ -2,7 +2,7 @@
  * NOOD campaign engine — Temu-style automated pushes with frequency control.
  *
  * One place to create + send every campaign type:
- *   new_product, hot-product, price-drop, flash-live, daily-reward,
+ *   new_product, hot-product, price-drop, flash-live,
  *   cart-nudge, order-update, broadcast, general
  *
  * All sends go through utils/push-delivery.js (single Expo integration point).
@@ -76,12 +76,6 @@ function templateFor(type, ctx) {
         title: '⚡ Flash Deal',
         body: 'Your deal is live now — prices go back up when the timer hits zero.',
         data: { type: 'flash-live', screen: 'modal', route: '/modal' },
-      };
-    case 'daily-reward':
-      return {
-        title: '🎁 Your NOOD reward is ready',
-        body: 'Open NOOD to claim it.',
-        data: { type: 'daily-reward', route: '/account/rewards', screen: 'rewards' },
       };
     case 'cart-nudge':
       return {
@@ -285,22 +279,6 @@ async function runScheduledEngagementCampaigns() {
 
   const hour = new Date().getHours();
   const day = todayKey();
-
-  // Daily reward — once per day at the configured hour.
-  const rewardHour = Number(process.env.PUSH_REWARD_REMINDER_HOUR ?? 18);
-  if (hour === rewardHour) {
-    const template = templateFor('daily-reward', {});
-    await sendPush({
-      recipients,
-      title: template.title,
-      body: template.body,
-      data: template.data,
-      campaignId: makeCampaignId('daily-reward', `day_${day}`),
-      campaignType: 'daily-reward',
-      dedupeKey: `daily_reward_${day}`,
-      frequency: { check: true },
-    });
-  }
 
   // Flash sale — once per day during an active flash window.
   const flashStart = Number(process.env.PUSH_FLASH_WINDOW_START ?? 6);

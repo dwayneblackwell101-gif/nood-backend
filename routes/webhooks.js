@@ -5,14 +5,21 @@
 
 const express = require('express');
 const crypto = require('crypto');
-const { updateOrderFromFulfillment, updateOrderStatus } = require('../utils/order-sync');
+const { upsertOrder, updateOrderFromFulfillment, updateOrderStatus } = require('../utils/order-sync');
 const {
   upsertOrderTracking,
   notifyTrackingChange,
   normalizeStatus,
 } = require('../utils/tracking');
+const { supabaseAdmin } = require('../utils/supabase-admin');
 
 const router = express.Router();
+
+function shopifyCustomerId(payload) {
+  const raw = payload?.customer?.admin_graphql_api_id || payload?.customer?.id || payload?.user_id || '';
+  const value = String(raw).trim();
+  return /^\d+$/.test(value) ? `gid://shopify/Customer/${value}` : value;
+}
 
 // Verify Shopify webhook signature
 function verifyShopifyWebhook(req, res, next) {
@@ -35,7 +42,9 @@ function verifyShopifyWebhook(req, res, next) {
     .update(req.rawBody || JSON.stringify(req.body))
     .digest('base64');
 
-  if (!crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(generatedHmac))) {
+  const providedBuffer = Buffer.from(hmac);
+  const expectedBuffer = Buffer.from(generatedHmac);
+  if (providedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(providedBuffer, expectedBuffer)) {
     console.warn('[WEBHOOK] Invalid signature from', shop);
     return res.status(401).json({ error: 'Invalid signature' });
   }
@@ -105,6 +114,17 @@ router.post('/webhooks/fulfillments/update', verifyShopifyWebhook, async (req, r
   }
 });
 
+router.post(['/webhooks/orders/create', '/webhooks/orders/paid'], verifyShopifyWebhook, async (req, res) => {
+  try {
+    const userId = shopifyCustomerId(req.body) || null;
+    await upsertOrder(req.body, userId);
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('[WEBHOOK] Order snapshot error:', error.message);
+    return res.status(500).json({ error: 'Processing failed' });
+  }
+});
+
 // Order fulfilled webhook (legacy)
 router.post('/webhooks/orders/fulfilled', verifyShopifyWebhook, async (req, res) => {
   const order = req.body;
@@ -154,4 +174,4 @@ router.post('/webhooks/orders/refunded', verifyShopifyWebhook, async (req, res) 
   }
 });
 
-module.exports = { router, verifyShopifyWebhook };
+module.exports = { router, verifyShopifyWebhook, shopifyCustomerId };

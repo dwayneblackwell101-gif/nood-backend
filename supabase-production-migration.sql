@@ -302,6 +302,8 @@ CREATE TABLE IF NOT EXISTS orders (
   currency TEXT DEFAULT 'USD',
   status TEXT,
   fulfillment_status TEXT,
+  payment_provider TEXT,
+  payment_transaction_id TEXT,
   tracking_number TEXT,
   tracking_url TEXT,
   tracking_company TEXT,
@@ -319,6 +321,8 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS total NUMERIC;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD';
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS fulfillment_status TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_provider TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_transaction_id TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_number TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_url TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_company TEXT;
@@ -588,6 +592,60 @@ CREATE INDEX IF NOT EXISTS notification_analytics_event_idx
   ON notification_analytics (event);
 
 -- ============================================================
+-- 12c. Wishlist Items (backend-persisted, per-user)
+--     Enables server-side wishlist triggers (price-drop / restock /
+--     low-stock) with price snapshots for drop detection.
+--     identity: user_id (bound to push token) OR customer email.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS wishlist_items (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  user_id TEXT,
+  email TEXT,
+  handle TEXT NOT NULL,
+  product_id TEXT,
+  variant_id TEXT,
+  title TEXT,
+  image TEXT,
+  price NUMERIC,
+  currency TEXT DEFAULT 'USD',
+  size TEXT,
+  color TEXT,
+  notified_price NUMERIC,
+  notified_restock BOOLEAN NOT NULL DEFAULT FALSE,
+  notified_low_stock BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, handle)
+);
+
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS id UUID;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS handle TEXT;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS product_id TEXT;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS variant_id TEXT;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS image TEXT;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS price NUMERIC;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD';
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS size TEXT;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS color TEXT;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS notified_price NUMERIC;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS notified_restock BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS notified_low_stock BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE wishlist_items ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage wishlist_items" ON wishlist_items;
+CREATE POLICY "service role can manage wishlist_items" ON wishlist_items
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+CREATE INDEX IF NOT EXISTS wishlist_items_user_id_idx ON wishlist_items (user_id);
+CREATE INDEX IF NOT EXISTS wishlist_items_email_idx ON wishlist_items (email);
+CREATE INDEX IF NOT EXISTS wishlist_items_handle_idx ON wishlist_items (handle);
+
+-- ============================================================
 -- 13. Video Engagement (likes, comments, shares)
 --     PUBLIC READ ONLY on counts + comments (public feed content).
 --     Likes writes (insert/delete) are backend-only.
@@ -663,6 +721,15 @@ DROP POLICY IF EXISTS "public insert comments" ON video_comments;
 CREATE INDEX IF NOT EXISTS video_comments_video_id_idx
   ON video_comments (video_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS video_reports (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(), video_id TEXT NOT NULL, user_id TEXT NOT NULL,
+  reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(video_id, user_id)
+);
+ALTER TABLE video_reports ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage video_reports" ON video_reports;
+CREATE POLICY "service role can manage video_reports" ON video_reports FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
 -- ============================================================
 -- Atomic counter increment function (idempotent by definition)
 -- ============================================================
@@ -686,5 +753,697 @@ VALUES
 ON CONFLICT (id) DO NOTHING;
 
 -- ============================================================
+-- 14. Reward Ledger (immutable, server-authoritative)
+--     Every reward/credit transaction. Balance is DERIVED by summing
+--     this ledger — never from client state.
+--     idempotency_key UNIQUE prevents replay.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS reward_ledger (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  transaction_id TEXT UNIQUE NOT NULL,
+  user_id TEXT NOT NULL,
+  type TEXT NOT NULL,                -- credit | debit | reversal | expire
+  source TEXT NOT NULL,              -- referral | loyalty | order | admin | bonus
+  amount NUMERIC NOT NULL,           -- positive for credit, negative for debit/expire
+  currency TEXT NOT NULL DEFAULT 'USD',
+  points INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'issued',  -- issued | redeemed | expired | reversed
+  issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ,
+  redeemed_at TIMESTAMPTZ,
+  related_id TEXT,                   -- referral/order/challenge id
+  idempotency_key TEXT UNIQUE NOT NULL,
+  metadata JSONB DEFAULT '{}'
+);
+
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS id UUID;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS transaction_id TEXT;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS type TEXT;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS amount NUMERIC;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'USD';
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS points INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'issued';
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS redeemed_at TIMESTAMPTZ;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS related_id TEXT;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE reward_ledger ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}';
+
+ALTER TABLE reward_ledger ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage reward_ledger" ON reward_ledger;
+CREATE POLICY "service role can manage reward_ledger" ON reward_ledger
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+CREATE INDEX IF NOT EXISTS reward_ledger_user_id_idx ON reward_ledger (user_id, issued_at DESC);
+CREATE INDEX IF NOT EXISTS reward_ledger_idempotency_idx ON reward_ledger (idempotency_key);
+CREATE INDEX IF NOT EXISTS reward_ledger_status_idx ON reward_ledger (status, expires_at);
+
+-- ============================================================
+-- 15. Wallet Transactions (authoritative debit/credit history)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS wallet_transactions (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  txn_id TEXT UNIQUE NOT NULL,
+  user_id TEXT NOT NULL,
+  type TEXT NOT NULL,               -- credit | debit | reversal | expire
+  source TEXT NOT NULL,             -- topup | reward | order_payment | referral | admin | reversal
+  amount NUMERIC NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'USD',
+  balance_after NUMERIC NOT NULL DEFAULT 0,
+  reference TEXT,
+  idempotency_key TEXT UNIQUE NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  metadata JSONB DEFAULT '{}',
+  reverses_transaction_id TEXT      -- links to the transaction_id being reversed (for reversal type)
+);
+
+-- Add reversal linkage column if not exists
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS reverses_transaction_id TEXT;
+
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS id UUID;
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS txn_id TEXT;
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS type TEXT;
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS amount NUMERIC;
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'USD';
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS balance_after NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS reference TEXT;
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}';
+
+ALTER TABLE wallet_transactions ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage wallet_transactions" ON wallet_transactions;
+CREATE POLICY "service role can manage wallet_transactions" ON wallet_transactions
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+CREATE INDEX IF NOT EXISTS wallet_transactions_user_idx ON wallet_transactions (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS wallet_transactions_idempotency_idx ON wallet_transactions (idempotency_key);
+
+CREATE UNIQUE INDEX IF NOT EXISTS wallet_transactions_idempotency_unique_idx
+  ON wallet_transactions (idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+-- Serializes each user's wallet writes and performs the balance check plus
+-- insert in one transaction. The service-role backend is the only caller.
+CREATE OR REPLACE FUNCTION apply_wallet_transaction_atomic(
+  p_user_id TEXT,
+  p_amount NUMERIC,
+  p_currency TEXT,
+  p_type TEXT,
+  p_source TEXT,
+  p_reference TEXT,
+  p_idempotency_key TEXT,
+  p_metadata JSONB DEFAULT '{}'::JSONB,
+  p_reverses_transaction_id TEXT DEFAULT NULL
+) RETURNS JSONB
+LANGUAGE PLPGSQL
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  existing wallet_transactions%ROWTYPE;
+  current_balance NUMERIC := 0;
+  next_balance NUMERIC := 0;
+  new_txn_id TEXT;
+BEGIN
+  IF p_user_id IS NULL OR BTRIM(p_user_id) = '' OR p_amount IS NULL OR p_idempotency_key IS NULL THEN
+    RETURN JSONB_BUILD_OBJECT('ok', FALSE, 'error', 'invalid_txn');
+  END IF;
+
+  PERFORM PG_ADVISORY_XACT_LOCK(HASHTEXT('nood_wallet:' || p_user_id));
+
+  SELECT * INTO existing FROM wallet_transactions
+    WHERE idempotency_key = p_idempotency_key LIMIT 1;
+  IF FOUND THEN
+    RETURN JSONB_BUILD_OBJECT('ok', FALSE, 'replay', TRUE, 'balance', existing.balance_after, 'txnId', existing.txn_id);
+  END IF;
+
+  SELECT COALESCE(SUM(amount), 0) INTO current_balance
+    FROM wallet_transactions WHERE user_id = p_user_id AND currency = p_currency;
+  next_balance := current_balance + p_amount;
+  IF next_balance < 0 THEN
+    RETURN JSONB_BUILD_OBJECT('ok', FALSE, 'error', 'insufficient_balance', 'balance', current_balance);
+  END IF;
+
+  new_txn_id := 'txn_' || REPLACE(GEN_RANDOM_UUID()::TEXT, '-', '');
+  INSERT INTO wallet_transactions (
+    txn_id, user_id, type, source, amount, currency, balance_after,
+    reference, idempotency_key, metadata, reverses_transaction_id
+  ) VALUES (
+    new_txn_id, p_user_id, p_type, p_source, p_amount, p_currency, next_balance,
+    p_reference, p_idempotency_key, COALESCE(p_metadata, '{}'::JSONB), p_reverses_transaction_id
+  );
+
+  RETURN JSONB_BUILD_OBJECT('ok', TRUE, 'balance', next_balance, 'txnId', new_txn_id);
+END $$;
+
+REVOKE ALL ON FUNCTION apply_wallet_transaction_atomic(TEXT, NUMERIC, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION apply_wallet_transaction_atomic(TEXT, NUMERIC, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT) TO service_role;
+
+CREATE OR REPLACE FUNCTION issue_reward_atomic(
+  p_user_id TEXT,
+  p_source TEXT,
+  p_amount NUMERIC,
+  p_currency TEXT,
+  p_points INTEGER,
+  p_related_id TEXT,
+  p_idempotency_key TEXT,
+  p_expires_at TIMESTAMPTZ,
+  p_metadata JSONB,
+  p_max_prize NUMERIC,
+  p_user_daily_limit NUMERIC,
+  p_user_monthly_limit NUMERIC,
+  p_global_daily_budget NUMERIC
+) RETURNS JSONB
+LANGUAGE PLPGSQL
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  existing reward_ledger%ROWTYPE;
+  daily_total NUMERIC := 0;
+  monthly_total NUMERIC := 0;
+  global_total NUMERIC := 0;
+  wallet_balance NUMERIC := 0;
+  reward_txn_id TEXT;
+  wallet_txn_id TEXT;
+BEGIN
+  IF p_user_id IS NULL OR BTRIM(p_user_id) = '' OR p_amount IS NULL OR p_amount < 0 OR p_amount > p_max_prize THEN
+    RETURN JSONB_BUILD_OBJECT('ok', FALSE, 'error', 'reward_limit_exceeded');
+  END IF;
+  PERFORM PG_ADVISORY_XACT_LOCK(HASHTEXT('nood_wallet:' || p_user_id));
+  SELECT * INTO existing FROM reward_ledger WHERE idempotency_key = p_idempotency_key LIMIT 1;
+  IF FOUND THEN
+    RETURN JSONB_BUILD_OBJECT('ok', FALSE, 'existing', TRUE, 'replay', TRUE, 'transactionId', existing.transaction_id);
+  END IF;
+
+  SELECT COALESCE(SUM(amount), 0) INTO daily_total FROM reward_ledger
+    WHERE user_id = p_user_id AND type = 'credit' AND status <> 'reversed' AND issued_at >= DATE_TRUNC('day', NOW());
+  SELECT COALESCE(SUM(amount), 0) INTO monthly_total FROM reward_ledger
+    WHERE user_id = p_user_id AND type = 'credit' AND status <> 'reversed' AND issued_at >= DATE_TRUNC('month', NOW());
+  SELECT COALESCE(SUM(amount), 0) INTO global_total FROM reward_ledger
+    WHERE type = 'credit' AND status <> 'reversed' AND issued_at >= DATE_TRUNC('day', NOW());
+  IF daily_total + p_amount > p_user_daily_limit OR monthly_total + p_amount > p_user_monthly_limit OR global_total + p_amount > p_global_daily_budget THEN
+    RETURN JSONB_BUILD_OBJECT('ok', FALSE, 'error', 'reward_budget_exceeded');
+  END IF;
+
+  reward_txn_id := 'txn_' || REPLACE(GEN_RANDOM_UUID()::TEXT, '-', '');
+  INSERT INTO reward_ledger (transaction_id, user_id, type, source, amount, currency, points,
+    status, expires_at, related_id, idempotency_key, metadata)
+  VALUES (reward_txn_id, p_user_id, 'credit', p_source, p_amount, p_currency, COALESCE(p_points, 0),
+    'issued', p_expires_at, p_related_id, p_idempotency_key, COALESCE(p_metadata, '{}'::JSONB));
+
+  SELECT COALESCE(SUM(amount), 0) INTO wallet_balance FROM wallet_transactions
+    WHERE user_id = p_user_id AND currency = p_currency;
+  wallet_balance := wallet_balance + p_amount;
+  wallet_txn_id := 'txn_' || REPLACE(GEN_RANDOM_UUID()::TEXT, '-', '');
+  INSERT INTO wallet_transactions (txn_id, user_id, type, source, amount, currency, balance_after,
+    reference, idempotency_key, metadata)
+  VALUES (wallet_txn_id, p_user_id, 'credit', 'reward_' || p_source, p_amount, p_currency, wallet_balance,
+    reward_txn_id, 'reward-wallet:' || p_idempotency_key,
+    JSONB_BUILD_OBJECT('rewardTransactionId', reward_txn_id));
+  RETURN JSONB_BUILD_OBJECT('ok', TRUE, 'transactionId', reward_txn_id,
+    'walletTxnId', wallet_txn_id, 'balance', wallet_balance);
+END $$;
+
+REVOKE ALL ON FUNCTION issue_reward_atomic(TEXT, TEXT, NUMERIC, TEXT, INTEGER, TEXT, TEXT, TIMESTAMPTZ, JSONB, NUMERIC, NUMERIC, NUMERIC, NUMERIC) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION issue_reward_atomic(TEXT, TEXT, NUMERIC, TEXT, INTEGER, TEXT, TEXT, TIMESTAMPTZ, JSONB, NUMERIC, NUMERIC, NUMERIC, NUMERIC) TO service_role;
+
+-- Durable PayPal/wallet state. It survives deploys and makes capture retries
+-- idempotent even when Render restarts between create and capture.
+CREATE TABLE IF NOT EXISTS payment_sessions (
+  provider_order_id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  user_id TEXT,
+  status TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  currency TEXT NOT NULL,
+  cart JSONB NOT NULL,
+  customer JSONB DEFAULT '{}'::JSONB,
+  shipping_address JSONB DEFAULT '{}'::JSONB,
+  shopify_order JSONB,
+  capture_id TEXT,
+  wallet_transaction_id TEXT,
+  wallet_balance NUMERIC,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE payment_sessions ADD COLUMN IF NOT EXISTS wallet_transaction_id TEXT;
+ALTER TABLE payment_sessions ADD COLUMN IF NOT EXISTS wallet_balance NUMERIC;
+ALTER TABLE payment_sessions ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage payment_sessions" ON payment_sessions;
+CREATE POLICY "service role can manage payment_sessions" ON payment_sessions
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+-- ============================================================
+-- 20. Referral Records (durable Supabase persistence)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS referral_codes (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  code TEXT UNIQUE NOT NULL,
+  owner_user_id TEXT UNIQUE NOT NULL,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE referral_codes ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage referral_codes" ON referral_codes;
+CREATE POLICY "service role can manage referral_codes" ON referral_codes
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+CREATE TABLE IF NOT EXISTS referral_records (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  referral_code TEXT NOT NULL,
+  owner_user_id TEXT NOT NULL,
+  referred_user_id TEXT,
+  referred_email TEXT,
+  status TEXT NOT NULL DEFAULT 'invited',  -- invited | joined | qualified | rewarded
+  qualified_at TIMESTAMPTZ,
+  rewarded_at TIMESTAMPTZ,
+  reward_amount NUMERIC NOT NULL DEFAULT 10,
+  reward_currency TEXT NOT NULL DEFAULT 'USD',
+  idempotency_key TEXT UNIQUE NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (owner_user_id, referred_user_id)
+);
+
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS id UUID;
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS referral_code TEXT;
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS owner_user_id TEXT;
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS referred_user_id TEXT;
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS referred_email TEXT;
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'invited';
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS qualified_at TIMESTAMPTZ;
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS rewarded_at TIMESTAMPTZ;
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS reward_amount NUMERIC NOT NULL DEFAULT 10;
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS reward_currency TEXT NOT NULL DEFAULT 'USD';
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE referral_records ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE referral_records ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage referral_records" ON referral_records;
+CREATE POLICY "service role can manage referral_records" ON referral_records
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+CREATE INDEX IF NOT EXISTS referral_records_owner_idx ON referral_records (owner_user_id);
+CREATE INDEX IF NOT EXISTS referral_records_code_idx ON referral_records (referral_code);
+CREATE INDEX IF NOT EXISTS referral_records_referred_idx ON referral_records (referred_user_id);
+
+-- ============================================================
+-- 21. Loyalty State (tiers, milestones)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS loyalty_state (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  user_id TEXT UNIQUE NOT NULL,
+  tier TEXT NOT NULL DEFAULT 'member',   -- member | bronze | silver | gold | vip
+  tier_points INTEGER NOT NULL DEFAULT 0,
+  lifetime_points INTEGER NOT NULL DEFAULT 0,
+  progress INTEGER NOT NULL DEFAULT 0,
+  next_tier TEXT,
+  tier_changed_at TIMESTAMPTZ,
+  milestone_history JSONB DEFAULT '[]',
+  birthday_reward_at TIMESTAMPTZ,
+  anniversary_reward_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS id UUID;
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'member';
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS tier_points INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS lifetime_points INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS next_tier TEXT;
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS tier_changed_at TIMESTAMPTZ;
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS milestone_history JSONB DEFAULT '[]';
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS birthday_reward_at TIMESTAMPTZ;
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS anniversary_reward_at TIMESTAMPTZ;
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE loyalty_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE loyalty_state ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage loyalty_state" ON loyalty_state;
+CREATE POLICY "service role can manage loyalty_state" ON loyalty_state
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+-- ============================================================
+-- 22. Reward contracts (Style Challenges, wallet-credit grants)
+-- Additive only. Wallet value remains authoritative in wallet_transactions.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS reward_events (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  event_id TEXT UNIQUE NOT NULL,
+  user_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  source TEXT NOT NULL,
+  ruleset_version TEXT NOT NULL,
+  idempotency_key TEXT UNIQUE NOT NULL,
+  qualifying_metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+  verification_source TEXT NOT NULL,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS id UUID DEFAULT GEN_RANDOM_UUID();
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS event_id TEXT;
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS event_type TEXT;
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS ruleset_version TEXT;
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS qualifying_metadata JSONB NOT NULL DEFAULT '{}'::JSONB;
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS verification_source TEXT;
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE reward_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE reward_events ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage reward_events" ON reward_events;
+CREATE POLICY "service role can manage reward_events" ON reward_events FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+CREATE INDEX IF NOT EXISTS reward_events_user_idx ON reward_events (user_id, occurred_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS reward_events_event_id_uidx ON reward_events (event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS reward_events_idempotency_key_uidx ON reward_events (idempotency_key);
+
+CREATE TABLE IF NOT EXISTS reward_grants (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  grant_id TEXT UNIQUE NOT NULL,
+  user_id TEXT NOT NULL,
+  source_event_id TEXT,
+  source TEXT NOT NULL,
+  reward_type TEXT NOT NULL CHECK (reward_type IN ('nood_coins','xp','wallet_credit','coupon','shipping_benefit','product_reward','unlock')),
+  amount NUMERIC NOT NULL DEFAULT 0,
+  currency TEXT,
+  status TEXT NOT NULL CHECK (status IN ('pending','locked','available','redeemed','expired','revoked')),
+  unlock_condition JSONB,
+  expires_at TIMESTAMPTZ,
+  redeemed_at TIMESTAMPTZ,
+  ruleset_version TEXT NOT NULL,
+  idempotency_key TEXT UNIQUE NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+  issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS id UUID DEFAULT GEN_RANDOM_UUID();
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS grant_id TEXT;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS source_event_id TEXT;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS reward_type TEXT;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS amount NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS currency TEXT;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS status TEXT;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS unlock_condition JSONB;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS redeemed_at TIMESTAMPTZ;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS ruleset_version TEXT;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::JSONB;
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE reward_grants ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE reward_grants ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage reward_grants" ON reward_grants;
+CREATE POLICY "service role can manage reward_grants" ON reward_grants FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+CREATE INDEX IF NOT EXISTS reward_grants_user_idx ON reward_grants (user_id, issued_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS reward_grants_grant_id_uidx ON reward_grants (grant_id);
+CREATE UNIQUE INDEX IF NOT EXISTS reward_grants_idempotency_key_uidx ON reward_grants (idempotency_key);
+
+CREATE TABLE IF NOT EXISTS style_dna_completions (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  user_id TEXT NOT NULL,
+  event_version TEXT NOT NULL,
+  profile_version INTEGER NOT NULL CHECK (profile_version > 0),
+  selection_summary JSONB NOT NULL,
+  completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, event_version)
+);
+ALTER TABLE style_dna_completions ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage style_dna_completions" ON style_dna_completions;
+CREATE POLICY "service role can manage style_dna_completions" ON style_dna_completions
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+-- Constraints are added NOT VALID so legacy rows can be audited by the preflight
+-- without blocking this additive definition step. PostgreSQL still enforces them
+-- for every new or changed row. Production deployment validates them only after
+-- the preflight confirms there are no orphaned or invalid legacy records.
+DO $$ BEGIN
+  ALTER TABLE reward_grants ADD CONSTRAINT reward_grants_type_check
+    CHECK (reward_type IN ('nood_coins','xp','wallet_credit','coupon','shipping_benefit','product_reward','unlock')) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE reward_grants ADD CONSTRAINT reward_grants_status_check
+    CHECK (status IN ('pending','locked','available','redeemed','expired','revoked')) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE reward_grants ADD CONSTRAINT reward_grants_source_event_fk
+    FOREIGN KEY (source_event_id) REFERENCES reward_events(event_id) ON DELETE RESTRICT NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+ALTER TABLE reward_grants VALIDATE CONSTRAINT reward_grants_type_check;
+ALTER TABLE reward_grants VALIDATE CONSTRAINT reward_grants_status_check;
+ALTER TABLE reward_grants VALIDATE CONSTRAINT reward_grants_source_event_fk;
+
+-- ============================================================
+-- 22. Coupon campaigns and atomic checkout reservations
+-- ============================================================
+CREATE TABLE IF NOT EXISTS coupon_campaigns (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  code TEXT UNIQUE NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  discount_type TEXT NOT NULL CHECK (discount_type IN ('percent', 'fixed')),
+  discount_value NUMERIC NOT NULL CHECK (discount_value > 0),
+  max_discount NUMERIC,
+  min_subtotal NUMERIC NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'USD',
+  max_redemptions INTEGER,
+  per_user_limit INTEGER NOT NULL DEFAULT 1 CHECK (per_user_limit > 0),
+  starts_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ends_at TIMESTAMPTZ NOT NULL,
+  emoji TEXT NOT NULL DEFAULT '🏷️',
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_by TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (ends_at > starts_at),
+  CHECK (max_discount IS NULL OR max_discount >= 0),
+  CHECK (max_redemptions IS NULL OR max_redemptions > 0)
+);
+
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS id UUID;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS code TEXT;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS discount_type TEXT;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS discount_value NUMERIC;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS max_discount NUMERIC;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS min_subtotal NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'USD';
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS max_redemptions INTEGER;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS per_user_limit INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS ends_at TIMESTAMPTZ;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS emoji TEXT NOT NULL DEFAULT '🏷️';
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS created_by TEXT;
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE coupon_campaigns ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE UNIQUE INDEX IF NOT EXISTS coupon_campaigns_code_upper_idx ON coupon_campaigns (UPPER(code));
+CREATE INDEX IF NOT EXISTS coupon_campaigns_active_window_idx ON coupon_campaigns (active, starts_at, ends_at);
+
+CREATE TABLE IF NOT EXISTS coupon_reservations (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+  campaign_id UUID NOT NULL REFERENCES coupon_campaigns (id),
+  user_id TEXT NOT NULL,
+  checkout_reference TEXT UNIQUE NOT NULL,
+  order_id TEXT,
+  status TEXT NOT NULL DEFAULT 'reserved' CHECK (status IN ('reserved', 'consumed', 'released')),
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE coupon_reservations ADD COLUMN IF NOT EXISTS id UUID;
+ALTER TABLE coupon_reservations ADD COLUMN IF NOT EXISTS campaign_id UUID;
+ALTER TABLE coupon_reservations ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE coupon_reservations ADD COLUMN IF NOT EXISTS checkout_reference TEXT;
+ALTER TABLE coupon_reservations ADD COLUMN IF NOT EXISTS order_id TEXT;
+ALTER TABLE coupon_reservations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'reserved';
+ALTER TABLE coupon_reservations ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE coupon_reservations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE coupon_reservations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS coupon_reservations_campaign_idx ON coupon_reservations (campaign_id, status);
+CREATE INDEX IF NOT EXISTS coupon_reservations_user_idx ON coupon_reservations (user_id, campaign_id, status);
+
+ALTER TABLE coupon_campaigns ENABLE ROW LEVEL SECURITY;
+ALTER TABLE coupon_reservations ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage coupon_campaigns" ON coupon_campaigns;
+CREATE POLICY "service role can manage coupon_campaigns" ON coupon_campaigns
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS "service role can manage coupon_reservations" ON coupon_reservations;
+CREATE POLICY "service role can manage coupon_reservations" ON coupon_reservations
+  FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+CREATE OR REPLACE FUNCTION reserve_coupon_atomic(
+  p_campaign_id UUID,
+  p_user_id TEXT,
+  p_checkout_reference TEXT,
+  p_ttl_minutes INTEGER DEFAULT 30
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  campaign coupon_campaigns%ROWTYPE;
+  existing coupon_reservations%ROWTYPE;
+  total_used INTEGER;
+  user_used INTEGER;
+  reservation_id UUID;
+BEGIN
+  IF COALESCE(TRIM(p_user_id), '') = '' OR COALESCE(TRIM(p_checkout_reference), '') = '' THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'invalid_reservation_identity');
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtext(p_campaign_id::TEXT));
+  SELECT * INTO existing FROM coupon_reservations WHERE checkout_reference = p_checkout_reference;
+  IF FOUND THEN
+    IF existing.campaign_id = p_campaign_id AND existing.user_id = p_user_id
+       AND existing.status IN ('reserved', 'consumed') THEN
+      RETURN jsonb_build_object('ok', true, 'replay', true, 'reservationId', existing.id);
+    END IF;
+    RETURN jsonb_build_object('ok', false, 'error', 'checkout_reference_conflict');
+  END IF;
+  UPDATE coupon_reservations SET status = 'released', updated_at = NOW()
+    WHERE status = 'reserved' AND expires_at <= NOW();
+  SELECT * INTO campaign FROM coupon_campaigns WHERE id = p_campaign_id FOR UPDATE;
+  IF NOT FOUND OR NOT campaign.active OR campaign.starts_at > NOW() OR campaign.ends_at <= NOW() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'coupon_inactive');
+  END IF;
+  SELECT COUNT(*) INTO total_used FROM coupon_reservations
+    WHERE campaign_id = p_campaign_id AND status IN ('reserved', 'consumed');
+  IF campaign.max_redemptions IS NOT NULL AND total_used >= campaign.max_redemptions THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'coupon_limit_reached');
+  END IF;
+  SELECT COUNT(*) INTO user_used FROM coupon_reservations
+    WHERE campaign_id = p_campaign_id AND user_id = p_user_id AND status IN ('reserved', 'consumed');
+  IF user_used >= campaign.per_user_limit THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'coupon_already_used');
+  END IF;
+  INSERT INTO coupon_reservations (campaign_id, user_id, checkout_reference, expires_at)
+    VALUES (p_campaign_id, p_user_id, p_checkout_reference,
+      NOW() + make_interval(mins => GREATEST(1, LEAST(COALESCE(p_ttl_minutes, 30), 120))))
+    RETURNING id INTO reservation_id;
+  RETURN jsonb_build_object('ok', true, 'replay', false, 'reservationId', reservation_id);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION consume_coupon_reservation(
+  p_checkout_reference TEXT,
+  p_order_id TEXT
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  changed coupon_reservations%ROWTYPE;
+BEGIN
+  UPDATE coupon_reservations SET status = 'consumed', order_id = p_order_id, updated_at = NOW()
+    WHERE checkout_reference = p_checkout_reference AND status = 'reserved'
+    RETURNING * INTO changed;
+  IF FOUND THEN RETURN jsonb_build_object('ok', true, 'replay', false); END IF;
+  SELECT * INTO changed FROM coupon_reservations WHERE checkout_reference = p_checkout_reference;
+  IF FOUND AND changed.status = 'consumed' AND changed.order_id = p_order_id THEN
+    RETURN jsonb_build_object('ok', true, 'replay', true);
+  END IF;
+  RETURN jsonb_build_object('ok', false, 'error', 'reservation_not_found');
+END;
+$$;
+
+REVOKE ALL ON FUNCTION reserve_coupon_atomic(UUID, TEXT, TEXT, INTEGER) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION consume_coupon_reservation(TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reserve_coupon_atomic(UUID, TEXT, TEXT, INTEGER) TO service_role;
+GRANT EXECUTE ON FUNCTION consume_coupon_reservation(TEXT, TEXT) TO service_role;
+
+-- ============================================================
+-- 23. Support cases and immutable conversation history
+-- ============================================================
+CREATE TABLE IF NOT EXISTS support_cases (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(), ticket_id TEXT UNIQUE NOT NULL,
+  user_id TEXT NOT NULL, customer_email TEXT, category TEXT NOT NULL, subject TEXT NOT NULL,
+  order_id TEXT, priority TEXT NOT NULL DEFAULT 'normal', status TEXT NOT NULL DEFAULT 'open',
+  assigned_role TEXT, sla_due_at TIMESTAMPTZ, escalated_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS support_messages (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(), case_id UUID NOT NULL REFERENCES support_cases(id) ON DELETE CASCADE,
+  sender_user_id TEXT, sender_role TEXT NOT NULL CHECK (sender_role IN ('customer', 'agent', 'system')),
+  body TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS support_cases_user_idx ON support_cases(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS support_messages_case_idx ON support_messages(case_id, created_at);
+ALTER TABLE support_cases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE support_messages ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage support_cases" ON support_cases;
+CREATE POLICY "service role can manage support_cases" ON support_cases FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS "service role can manage support_messages" ON support_messages;
+CREATE POLICY "service role can manage support_messages" ON support_messages FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+-- ============================================================
+-- 24. Verified and moderated product reviews
+-- ============================================================
+CREATE TABLE IF NOT EXISTS product_reviews (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(), user_id TEXT NOT NULL, order_id TEXT NOT NULL,
+  order_item_id TEXT NOT NULL, product_handle TEXT NOT NULL, rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  title TEXT, body TEXT NOT NULL, photo_urls JSONB NOT NULL DEFAULT '[]', verified_purchase BOOLEAN NOT NULL DEFAULT FALSE,
+  helpful_count INTEGER NOT NULL DEFAULT 0, report_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'published', 'rejected', 'hidden')),
+  moderation_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(user_id, order_item_id)
+);
+CREATE TABLE IF NOT EXISTS review_votes (
+  review_id UUID NOT NULL REFERENCES product_reviews(id) ON DELETE CASCADE, user_id TEXT NOT NULL,
+  helpful BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(review_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS review_reports (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(), review_id UUID NOT NULL REFERENCES product_reviews(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL, reason TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(review_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS product_reviews_product_idx ON product_reviews(product_handle, status, created_at DESC);
+ALTER TABLE product_reviews ENABLE ROW LEVEL SECURITY;
+ALTER TABLE review_votes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE review_reports ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage product_reviews" ON product_reviews;
+CREATE POLICY "service role can manage product_reviews" ON product_reviews FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS "service role can manage review_votes" ON review_votes;
+CREATE POLICY "service role can manage review_votes" ON review_votes FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS "service role can manage review_reports" ON review_reports;
+CREATE POLICY "service role can manage review_reports" ON review_reports FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+-- ============================================================
+-- 25. Privacy-respecting product analytics and security events
+-- ============================================================
+CREATE TABLE IF NOT EXISTS product_analytics (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(), event TEXT NOT NULL, user_id TEXT,
+  session_hash TEXT, properties JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS security_events (
+  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(), user_id TEXT NOT NULL, event_type TEXT NOT NULL,
+  device_fingerprint TEXT, risk_level TEXT NOT NULL DEFAULT 'low', metadata JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS product_analytics_event_idx ON product_analytics(event, created_at DESC);
+CREATE INDEX IF NOT EXISTS security_events_user_idx ON security_events(user_id, created_at DESC);
+ALTER TABLE product_analytics ENABLE ROW LEVEL SECURITY;
+ALTER TABLE security_events ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service role can manage product_analytics" ON product_analytics;
+CREATE POLICY "service role can manage product_analytics" ON product_analytics FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS "service role can manage security_events" ON security_events;
+CREATE POLICY "service role can manage security_events" ON security_events FOR ALL TO service_role USING (TRUE) WITH CHECK (TRUE);
+
+-- ============================================================
 -- End of migration
 -- ============================================================
+
+-- WiPay stores the trusted quote with the durable payment session.
+ALTER TABLE payment_sessions ADD COLUMN IF NOT EXISTS quote JSONB;
+ALTER TABLE payment_sessions ADD COLUMN IF NOT EXISTS coupon_reference TEXT;

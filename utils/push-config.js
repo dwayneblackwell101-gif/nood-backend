@@ -25,8 +25,6 @@ const CATEGORY = {
   WISHLIST: 'wishlist',
   RESTOCK: 'restock',
   CART: 'cart',
-  GAMES: 'games',
-  REWARDS: 'rewards',
   ORDERS: 'orders',
   RETURNS: 'returns',
   TRACKING: 'tracking',
@@ -71,24 +69,6 @@ const TYPE_TO_CATEGORY = {
   'brand-sale': CATEGORY.DEALS,
   'category-sale': CATEGORY.DEALS,
   'personalized-deal': CATEGORY.DEALS,
-
-  // Games / rewards
-  'spin-ready': CATEGORY.GAMES,
-  'scratch-ready': CATEGORY.GAMES,
-  'game-live': CATEGORY.GAMES,
-  'game-ending': CATEGORY.GAMES,
-  'streak-reminder': CATEGORY.REWARDS,
-  'streak-at-risk': CATEGORY.REWARDS,
-  'streak-completed': CATEGORY.REWARDS,
-  'reward-unlocked': CATEGORY.REWARDS,
-  'reward-expiring': CATEGORY.REWARDS,
-  'reward-won': CATEGORY.REWARDS,
-  'daily-reward': CATEGORY.REWARDS,
-  'bonus-unlocked': CATEGORY.REWARDS,
-  'points-earned': CATEGORY.REWARDS,
-  'points-expiring': CATEGORY.REWARDS,
-  'credit-earned': CATEGORY.REWARDS,
-  'credit-expiring': CATEGORY.REWARDS,
 
   // Cart
   'cart-nudge': CATEGORY.CART,
@@ -219,9 +199,6 @@ const PERSONAL_HIGH_TYPES = new Set([
   'size-restock',
   'color-restock',
   'recommended-restock',
-  'reward-unlocked',
-  'reward-won',
-  'reward-expiring',
   'coupon-ready',
   'coupon-applied',
 ]);
@@ -235,9 +212,6 @@ function priorityClassForType(type) {
   if (CRITICAL_TYPES.has(t)) return PRIORITY_CLASS.CRITICAL;
   if (TRANSACTIONAL_HIGH_TYPES.has(t)) return PRIORITY_CLASS.TRANSACTIONAL_HIGH;
   if (PERSONAL_HIGH_TYPES.has(t)) return PRIORITY_CLASS.PERSONAL_HIGH;
-  if (['spin-ready', 'scratch-ready', 'game-live', 'game-ending'].includes(t)) {
-    return PRIORITY_CLASS.PROMOTIONAL;
-  }
   return PRIORITY_CLASS.PROMOTIONAL;
 }
 
@@ -253,7 +227,6 @@ const CAMPAIGN_TYPES = [
   'hot-product',
   'price-drop',
   'flash-live',
-  'daily-reward',
   'cart-nudge',
   'order-update',
   'broadcast',
@@ -267,7 +240,6 @@ const TRANSACTIONAL_TYPES = new Set([
 
 const CAMPAIGN_PRIORITY = {
   'order-update': PRIORITY_CLASS.TRANSACTIONAL_HIGH,
-  'daily-reward': PRIORITY_CLASS.PERSONAL_HIGH,
   'hot-product': PRIORITY_CLASS.PROMOTIONAL,
   'price-drop': PRIORITY_CLASS.PERSONAL_HIGH,
   new_product: PRIORITY_CLASS.PROMOTIONAL,

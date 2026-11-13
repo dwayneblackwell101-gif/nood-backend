@@ -30,6 +30,7 @@ const {
 const { loadPreferences, setPreference } = require('../utils/preferences-db');
 const { REGISTRY, entryFor, statusFor } = require('../utils/notification-registry');
 const { getAnalyticsSummary } = require('../utils/notification-analytics');
+const { authenticateCustomer } = require('../services/customer-auth');
 
 const router = express.Router();
 
@@ -82,8 +83,9 @@ router.post('/api/notifications/register-token', async (req, res) => {
   const suffix = token.slice(-12);
   const platform = safeString(req.body?.platform, 'android');
   const deviceId = safeString(req.body?.deviceId);
-  const userId = safeString(req.body?.userId);
-  const email = safeString(req.body?.email);
+  const customer = await authenticateCustomer(req);
+  const userId = customer?.userId || '';
+  const email = customer?.email || '';
   const appVersion = safeString(req.body?.appVersion);
 
   console.log(
@@ -137,7 +139,7 @@ router.post('/api/notifications/logout', async (req, res) => {
  */
 const DEV_SEED_EVENTS = [
   { type: 'deal-live', title: '🔥 Deal Live', body: "Up to 40% off today's picks.", route: '/(tabs)/deals' },
-  { type: 'reward-unlocked', title: '🎁 Reward Unlocked', body: 'You earned a new NOOD reward.', route: '/account/rewards' },
+  { type: 'referral-invite', title: '👋 Referral Invite', body: 'Invite friends and earn NOOD Balance.', route: '/account/rewards' },
   { type: 'order-shipped', title: '📦 Order Shipped', body: 'Your order is on its way.', route: '/account/tracking' },
   { type: 'new_product', title: '🆕 New Arrival', body: 'Fresh styles just landed on NOOD.', route: '/collection/new-arrivals' },
   { type: 'cart-nudge', title: '🛒 Cart Waiting', body: 'Your NOOD cart is waiting for you.', route: '/(tabs)/cart' },
@@ -275,7 +277,7 @@ router.post('/api/notifications/send', requireAdmin, async (req, res) => {
 
 /**
  * POST /api/notifications/campaign — send a named campaign (ADMIN ONLY).
- * Body: { campaign: 'daily-reward' | 'flash-live' | 'cart-nudge' |
+ * Body: { campaign: 'flash-live' | 'cart-nudge' |
  *              'hot-product' | 'price-drop' | 'new_product' | 'broadcast',
  *         title?, body?, data?, targetUserId?, productHandle? }
  */
@@ -409,9 +411,10 @@ router.post('/api/notifications/inbox/read-all', async (req, res) => {
  * GET /api/notifications/preferences?userId=...
  */
 router.get('/api/notifications/preferences', async (req, res) => {
-  const userId = safeString(req.query?.userId);
+  const customer = await authenticateCustomer(req);
+  const userId = customer?.userId || '';
   if (!userId) {
-    return res.status(400).json({ success: false, message: 'userId is required' });
+    return res.status(401).json({ success: false, message: 'Signed-in identity required' });
   }
   const prefs = await loadPreferences(userId);
   return res.json({ success: true, preferences: prefs });
@@ -422,11 +425,15 @@ router.get('/api/notifications/preferences', async (req, res) => {
  * Body: { userId, category, enabled }
  */
 router.post('/api/notifications/preferences', async (req, res) => {
-  const userId = safeString(req.body?.userId);
+  const customer = await authenticateCustomer(req);
+  const userId = customer?.userId || '';
   const category = safeString(req.body?.category);
   const enabled = Boolean(req.body?.enabled);
   if (!userId || !category) {
-    return res.status(400).json({ success: false, message: 'userId and category are required' });
+    return res.status(userId ? 400 : 401).json({
+      success: false,
+      message: userId ? 'category is required' : 'Signed-in identity required',
+    });
   }
   const result = await setPreference(userId, category, enabled);
   return res.json({ success: result.success });

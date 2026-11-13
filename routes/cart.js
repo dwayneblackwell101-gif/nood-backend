@@ -5,6 +5,7 @@
 
 const express = require('express');
 const { supabase } = require('../utils/supabase');
+const { authenticateCustomer } = require('../services/customer-auth');
 
 const router = express.Router();
 
@@ -14,13 +15,17 @@ function safeString(value, fallback = '') {
 
 /** POST /api/cart/sync — upsert a cart for a user (by email). */
 router.post('/api/cart/sync', async (req, res) => {
-  const email = safeString(req.body?.email).toLowerCase();
-  const name = safeString(req.body?.name);
-  const profileId = safeString(req.body?.profileId);
+  const customer = await authenticateCustomer(req);
+  if (!customer?.userId || !customer?.email) {
+    return res.status(401).json({ success: false, message: 'Signed-in identity required' });
+  }
+  const email = customer.email;
+  const name = safeString([customer.firstName, customer.lastName].filter(Boolean).join(' '));
+  const profileId = customer.userId;
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
 
-  if (!email || !items.length) {
-    return res.json({ success: false, message: 'email and items required' });
+  if (!Array.isArray(req.body?.items) || items.length > 100) {
+    return res.status(400).json({ success: false, message: 'Cart must contain 0 to 100 items' });
   }
 
   if (!supabase) {
