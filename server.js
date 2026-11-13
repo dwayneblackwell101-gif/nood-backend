@@ -396,9 +396,10 @@ async function createShopifyOrder({
         address1: safeString(shippingAddress.address1) || undefined,
         address2: safeString(shippingAddress.address2) || undefined,
         city: safeString(shippingAddress.city) || undefined,
-        provinceCode: safeString(shippingAddress.region || shippingAddress.state) || undefined,
+        provinceCode: /^[A-Z0-9-]{1,6}$/.test(safeString(shippingAddress.region || shippingAddress.state))
+          ? safeString(shippingAddress.region || shippingAddress.state) : undefined,
         zip: safeString(shippingAddress.postalCode || shippingAddress.zip) || undefined,
-        countryCode: safeString(shippingAddress.country, 'TT').toUpperCase(),
+        countryCode: require('./utils/shopify-country').countryCode(shippingAddress.country || 'TT'),
         phone: safeString(shippingAddress.phone || phone) || undefined,
       },
       lineItems,
