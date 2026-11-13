@@ -293,6 +293,20 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Probe payment schema without retrieving customer or payment records.
+app.get('/health/database', apiLimiter, async (_req, res) => {
+  const { supabaseAdmin } = require('./utils/supabase-admin');
+  if (!supabaseAdmin) return res.status(503).json({ ok: false, configured: false });
+  try {
+    const { error } = await supabaseAdmin.from('payment_sessions')
+      .select('provider_order_id,status,capture_id,quote').limit(0);
+    if (error) return res.status(503).json({ ok: false, configured: true, paymentStorageReady: false });
+    return res.json({ ok: true, configured: true, paymentStorageReady: true });
+  } catch (_error) {
+    return res.status(503).json({ ok: false, configured: true, paymentStorageReady: false });
+  }
+});
+
 // Read-only readiness check: verifies the current store credential and order scope.
 app.get('/health/shopify', apiLimiter, async (_req, res) => {
   try {
