@@ -381,6 +381,9 @@ async function createShopifyOrder({
 
   const variables = {
     order: {
+      test: gateway === 'PayPal'
+        ? String(process.env.PAYPAL_ENVIRONMENT || 'sandbox').toLowerCase() !== 'live'
+        : gateway === 'WiPay' && String(process.env.WIPAY_ENVIRONMENT || 'sandbox').toLowerCase() !== 'live',
       email: email || undefined,
       phone: phone || undefined,
       tags: ['NOOD App', gateway],
