@@ -31,23 +31,24 @@ function verifyShopifyWebhook(req, res, next) {
     return res.status(400).json({ error: 'Missing Shopify headers' });
   }
 
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
-  if (!secret) {
-    console.error('[WEBHOOK] SHOPIFY_WEBHOOK_SECRET not configured');
-    return res.status(500).json({ error: 'Webhook secret not configured' });
+  const secrets = [...new Set([
+    process.env.SHOPIFY_WEBHOOK_SECRET,
+    process.env.SHOPIFY_CLIENT_SECRET,
+  ].map(value => String(value || '').trim()).filter(Boolean))];
+  if (!secrets.length) return res.status(503).json({ error: 'Webhook verification unavailable' });
+  const expectedShop = String(process.env.SHOPIFY_STORE_DOMAIN || '').trim().toLowerCase();
+  if (!expectedShop || String(shop || '').trim().toLowerCase() !== expectedShop) {
+    return res.status(401).json({ error: 'Unexpected Shopify store' });
   }
-
-  const generatedHmac = crypto
-    .createHmac('sha256', secret)
-    .update(req.rawBody || JSON.stringify(req.body))
-    .digest('base64');
-
+  if (typeof req.rawBody !== 'string') {
+    return res.status(400).json({ error: 'Raw webhook body required' });
+  }
   const providedBuffer = Buffer.from(hmac);
-  const expectedBuffer = Buffer.from(generatedHmac);
-  if (providedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(providedBuffer, expectedBuffer)) {
-    console.warn('[WEBHOOK] Invalid signature from', shop);
-    return res.status(401).json({ error: 'Invalid signature' });
-  }
+  const verified = secrets.some(secret => {
+    const expectedBuffer = Buffer.from(crypto.createHmac('sha256', secret).update(req.rawBody).digest('base64'));
+    return providedBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(providedBuffer, expectedBuffer);
+  });
+  if (!verified) return res.status(401).json({ error: 'Invalid signature' });
 
   req.shopifyTopic = topic;
   req.shopifyShop = shop;
@@ -117,7 +118,8 @@ router.post('/webhooks/fulfillments/update', verifyShopifyWebhook, async (req, r
 router.post(['/webhooks/orders/create', '/webhooks/orders/paid'], verifyShopifyWebhook, async (req, res) => {
   try {
     const userId = shopifyCustomerId(req.body) || null;
-    await upsertOrder(req.body, userId);
+    const saved = await upsertOrder(req.body, userId);
+    if (!saved?.ok) return res.status(503).json({ error: 'Order storage unavailable; retry delivery' });
     return res.status(200).json({ success: true });
   } catch (error) {
     console.error('[WEBHOOK] Order snapshot error:', error.message);
