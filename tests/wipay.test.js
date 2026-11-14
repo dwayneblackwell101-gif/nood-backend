@@ -72,6 +72,10 @@ const server = app.listen(0, '127.0.0.1');
   assert.equal(adminData.sandbox_test,true);
   assert.equal(sessions.get(adminData.order_id).provider,'wipay_test');
   assert.match(adminData.return_url,/return_token=/);
+  process.env.WIPAY_ENVIRONMENT='live';process.env.WIPAY_ACCOUNT_NUMBER='1234567891';process.env.WIPAY_API_KEY='private-test-key';
+  const bodyOverride=await create('/create-wipay-payment',{cartItems:[{}],sandboxTest:true,provider:'wipay_test',isTestPayment:true});
+  assert.equal(bodyOverride.code,200);assert.equal(bodyOverride.data.sandbox_test,false);
+  assert.equal(sessions.get(bodyOverride.data.order_id).provider,'wipay');
   console.log('WiPay tests passed: forged proofs, currency/token/order binding, trusted pricing, replay, wallet auth and credit, interrupted fulfillment, production sandbox rejection');
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => server.close());
 
