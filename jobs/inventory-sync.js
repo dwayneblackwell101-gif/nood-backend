@@ -234,7 +234,7 @@ async function fetchStorefrontProductsForSync() {
     if (error?.graphqlErrors?.length) {
       console.warn(
         '[INVENTORY SYNC] Storefront inventory query failed — falling back to availableForSale only.',
-        { detail: error.message }
+        { detail: String(error.message || '').slice(0, 500) }
       );
       includeInventory = false;
     } else {
@@ -302,7 +302,11 @@ async function pageAllStorefront({ domain, token, apiVersion, query, includeInve
  */
 async function fetchShopifyProductsForSync() {
   const domain = process.env.SHOPIFY_STORE_DOMAIN;
-  const adminToken = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  let adminToken;
+  try {
+    const { getAdminToken, hasAdminCredentials } = require('../services/shopify-admin-auth');
+    if (hasAdminCredentials()) adminToken = await getAdminToken();
+  } catch { console.warn('[INVENTORY SYNC] Admin authentication unavailable; using Storefront fallback.'); }
   const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION || '2026-04';
 
   if (!domain || domain.includes('your-store')) {
@@ -313,12 +317,19 @@ async function fetchShopifyProductsForSync() {
   // 1) Admin REST API.
   if (adminToken) {
     try {
-      const response = await axios.get(`https://${domain}/admin/api/${apiVersion}/products.json`, {
-        headers: { 'X-Shopify-Access-Token': adminToken },
-        params: { limit: 250, status: 'active' },
-        timeout: 15000,
-      });
-      const raw = Array.isArray(response?.data?.products) ? response.data.products : [];
+      let nextUrl = `https://${domain}/admin/api/${apiVersion}/products.json?limit=250&status=active`;
+      const raw = [];
+      let pages = 0;
+      while (nextUrl && pages++ < MAX_STOREFRONT_PAGES) {
+        const pageUrl = new URL(nextUrl);
+        if (pageUrl.protocol !== 'https:' || pageUrl.hostname !== domain) throw Error('Unexpected Shopify pagination host');
+        const response = await axios.get(nextUrl, {
+          headers: { 'X-Shopify-Access-Token': adminToken }, timeout: 15000, maxRedirects: 0,
+        });
+        raw.push(...(Array.isArray(response?.data?.products) ? response.data.products : []));
+        nextUrl = String(response.headers?.link || '').match(/<([^>]+)>;\s*rel="next"/)?.[1] || '';
+      }
+      if (nextUrl) throw Error('Inventory pagination limit exceeded');
       if (raw.length) {
         const products = raw.map(normalizeAdminProduct);
         console.log(`[INVENTORY SYNC] Fetched ${products.length} products via Admin API`);
