@@ -1,11 +1,11 @@
 const crypto = require('crypto');
 const axios = require('axios');
 
-function configuration() {
-  const environment = process.env.WIPAY_ENVIRONMENT || 'sandbox';
+function configuration({ sandboxTest = false } = {}) {
+  const environment = sandboxTest ? 'sandbox' : process.env.WIPAY_ENVIRONMENT || 'sandbox';
   if (!['live', 'sandbox'].includes(environment)) throw new Error('Invalid WIPAY_ENVIRONMENT');
   // Public sandbox keys must never authorize production fulfillment.
-  if (environment !== 'live' && process.env.NODE_ENV === 'production') throw new Error('Production WiPay requires live credentials');
+  if (environment !== 'live' && process.env.NODE_ENV === 'production' && !sandboxTest) throw new Error('Production WiPay requires live credentials');
   if (process.env.NODE_ENV === 'production' && (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY)) throw new Error('Production WiPay requires durable Supabase payment state');
   const account = environment === 'sandbox' ? '1234567890' : process.env.WIPAY_ACCOUNT_NUMBER;
   const key = environment === 'sandbox' ? '123' : process.env.WIPAY_API_KEY;
@@ -25,7 +25,7 @@ function verifyResponse(query, session, key) {
 }
 
 async function requestPayment(session, responseUrl) {
-  const config = configuration();
+  const config = configuration({ sandboxTest: session.provider === 'wipay_test' });
   const cents = require('./catalog-pricing').moneyToCents(session.amount);
   if (!['TTD', 'USD'].includes(session.currency) || !cents || cents < (session.currency === 'TTD' ? 500 : 100)) {
     throw Object.assign(new Error('WiPay minimum is TTD 5.00 or USD 1.00'), { statusCode: 400 });

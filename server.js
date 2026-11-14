@@ -341,6 +341,7 @@ async function createShopifyOrder({
   clientOrderId,
   shippingAddress = {},
   userId = null,
+  isTestPayment = false,
 }) {
   if (!SHOPIFY_STORE_DOMAIN) {
     throw new Error('Missing SHOPIFY_STORE_DOMAIN in .env');
@@ -381,9 +382,9 @@ async function createShopifyOrder({
 
   const variables = {
     order: {
-      test: gateway === 'PayPal'
+      test: isTestPayment || (gateway === 'PayPal'
         ? String(process.env.PAYPAL_ENVIRONMENT || 'sandbox').toLowerCase() !== 'live'
-        : gateway === 'WiPay' && String(process.env.WIPAY_ENVIRONMENT || 'sandbox').toLowerCase() !== 'live',
+        : gateway === 'WiPay' && String(process.env.WIPAY_ENVIRONMENT || 'sandbox').toLowerCase() !== 'live'),
       email: email || undefined,
       phone: phone || undefined,
       tags: ['NOOD App', gateway],

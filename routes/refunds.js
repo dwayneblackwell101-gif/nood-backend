@@ -22,6 +22,7 @@ const { applyWalletTxn } = require('../utils/reward-ledger');
 const paypal = require('../services/paypal');
 const { refundSettlement } = require('../services/paypal-currency');
 const { getPaymentByCapture } = require('../utils/payment-state');
+const { recordExternalRefund } = require('../services/shopify-refunds');
 
 const router = express.Router();
 
@@ -552,13 +553,31 @@ router.post('/api/refunds/requests/:id/update', requireAdmin, async (req, res) =
       }
       const paymentSession = await getPaymentByCapture(existing.payment_transaction_id);
       const refundQuote = refundSettlement(existing.amount, existing.currency, paymentSession);
-      const providerRefund = await paypal.refundCapture(existing.payment_transaction_id, {
-        ...refundQuote,
-        requestId: `nood-refund-${requestId}`,
-      });
-      if (String(providerRefund?.status || '').toUpperCase() !== 'COMPLETED') {
-        return res.status(502).json({ success: false, message: 'PayPal has not confirmed the refund as completed' });
+      let providerRefundId = existing.provider_refund_id;
+      if (!providerRefundId) {
+        const providerRefund = await paypal.refundCapture(existing.payment_transaction_id, {
+          ...refundQuote, requestId: `nood-refund-${requestId}`,
+        });
+        if (String(providerRefund?.status || '').toUpperCase() !== 'COMPLETED') {
+          return res.status(502).json({ success: false, message: 'PayPal has not confirmed the refund as completed' });
+        }
+        providerRefundId = providerRefund.id;
+        const { error: receiptError } = await supabaseAdmin.from('refund_requests').update({
+          provider_refund_id: providerRefundId, provider_refund_status: 'COMPLETED',
+          updated_at: new Date().toISOString(),
+        }).eq('request_id', requestId);
+        if (receiptError) throw receiptError;
       }
+      const shopifyRefund = await recordExternalRefund({ orderId: existing.shopify_order_id,
+        amount: existing.amount, currency: existing.currency, items: existing.items,
+        reference: providerRefundId });
+      const { error: syncError } = await supabaseAdmin.from('refund_requests')
+        .update({ shopify_refund_id: shopifyRefund.id }).eq('request_id', requestId);
+      if (syncError) throw syncError;
+      await supabaseAdmin.from('orders').update({
+        status: newStatus === 'partially_refunded' ? 'partially_refunded' : 'refunded',
+        updated_at: new Date().toISOString(),
+      }).eq('shopify_order_id', existing.shopify_order_id);
     }
 
     const updateData = {
