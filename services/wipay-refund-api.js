@@ -12,7 +12,7 @@ function configuration(environment) {
     headers: { 'X-WAPI-Key': key, Accept: 'application/json' }, timeout: 20000, maxRedirects: 0 };
 }
 function transactionPath(id) {
-  if (typeof id !== 'string' || !/^[a-zA-Z0-9-]{3,150}$/.test(id)) throw Error('Invalid WiPay transaction reference');
+  if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{3,150}$/.test(id)) throw Error('Invalid WiPay transaction reference');
   return `/transactions/${encodeURIComponent(id)}`;
 }
 async function retrieve(id, environment) {

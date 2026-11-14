@@ -70,6 +70,7 @@ function scenario({ timeout = false, rejected = false, badSnapshot = false, sync
       post: async (...args) => { calls.push(args); return { status: 201 }; } };
   } } }, { WIPAY_WAPI_SANDBOX_KEY: `wapi_test_${'a'.repeat(18)}_${'b'.repeat(64)}` });
   await api.retrieve('SB-test-1', 'sandbox'); await api.request('SB-test-1', 'sandbox');
+  await api.retrieve('legacy_transaction_123', 'sandbox');
   assert.equal(calls[0][0], '/transactions/SB-test-1/refund'); assert.equal(calls[0][1], '');
   assert.throws(() => api.configuration('live'), /not configured/);
   await assert.rejects(() => api.retrieve('../auth/tokens', 'sandbox'), /Invalid/);
