@@ -79,6 +79,19 @@ module.exports = function createWiPayRouter({ createShopifyOrder, buildAppRedire
           !returnToken || returnToken !== session.customer.returnToken) {
         return redirect({ status: 'failed', reason: 'invalid_payment_session' });
       }
+      // Read-only recovery: the private session token may read a result that
+      // this backend already verified and saved. It cannot capture or fulfil a
+      // pending payment. This handles browsers that cannot open the app scheme.
+      if (String(req.get('Accept') || '').includes('application/json') &&
+          req.query.hash === undefined && req.query.status === undefined) {
+        if (session.status === 'completed' && session.capture_id &&
+            (session.shopify_order?.id || (session.provider === 'wipay_wallet_topup' && session.wallet_transaction_id))) {
+          return redirect({ status: 'success', type: session.provider === 'wipay_wallet_topup' ? 'wallet_topup' : 'checkout',
+            transaction_id: session.capture_id, amount: session.amount, currency: session.currency,
+            shopify_order_id: session.shopify_order?.id, shopify_order_name: session.shopify_order?.name });
+        }
+        return res.json({ success: false, status: 'pending', reason: 'awaiting_provider_confirmation' });
+      }
       if (!wipay.verifyResponse(req.query, session, wipay.configuration({ sandboxTest: session.provider === 'wipay_test',
         sandboxAccount: session.customer.wipaySandboxAccount || (session.provider === 'wipay_test' ? '1234567890' : undefined) }).key)) {
         return redirect({ status: 'failed', reason: 'payment_not_verified' });
