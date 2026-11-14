@@ -43,7 +43,7 @@ module.exports = function createWiPayRouter({ createShopifyOrder, buildAppRedire
       await savePayment(session);
       const returnUrl = `${baseUrl}/payment-return?order_id=${encodeURIComponent(id)}&return_token=${token}`;
       const url = await wipay.requestPayment(session, returnUrl);
-      return res.json({ success: true, url, payment_url: url, order_id: id, return_url: returnUrl });
+      return res.json({ success: true, url, payment_url: url, order_id: id, return_url: returnUrl, sandbox_test: sandboxTest });
     } catch (error) { return failure(res, error); }
   }
   router.post('/create-wipay-payment', (req, res) => create(req, res, false));

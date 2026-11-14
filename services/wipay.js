@@ -10,7 +10,9 @@ function configuration({ sandboxTest = false } = {}) {
   const account = environment === 'sandbox' ? '1234567890' : process.env.WIPAY_ACCOUNT_NUMBER;
   const key = environment === 'sandbox' ? '123' : process.env.WIPAY_API_KEY;
   if (!account || !key || (environment === 'live' && key === '123')) throw new Error('Configure WIPAY_ACCOUNT_NUMBER and WIPAY_API_KEY');
-  return { environment, account, key, endpoint: `https://${environment === 'live' ? 'tt' : 'ttsb'}.wipayfinancial.com/plugins/payments/request` };
+  // WiPay selects sandbox from the environment form field; requests use the
+  // documented country endpoint in both modes.
+  return { environment, account, key, endpoint: 'https://tt.wipayfinancial.com/plugins/payments/request' };
 }
 
 function verifyResponse(query, session, key) {
