@@ -629,6 +629,7 @@ app.listen(PORT, '0.0.0.0', () => {
   try {
     const { router: refundsRouter } = require('./routes/refunds');
     app.use('/', refundsRouter);
+    app.use('/', require('./routes/wipay-refunds').router);
   } catch (error) {
     console.error('[JOBS] refunds routes failed to mount:', error.message);
   }

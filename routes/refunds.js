@@ -23,6 +23,7 @@ const paypal = require('../services/paypal');
 const { refundSettlement } = require('../services/paypal-currency');
 const { getPaymentByCapture } = require('../utils/payment-state');
 const { recordExternalRefund } = require('../services/shopify-refunds');
+const { requestRefund: requestWiPayRefund } = require('../services/wipay-refunds');
 
 const router = express.Router();
 
@@ -522,6 +523,39 @@ router.post('/api/refunds/requests/:id/update', requireAdmin, async (req, res) =
       return res.status(409).json({ success: false, message: 'A completed refund cannot be changed' });
     }
 
+    // An in-flight full WiPay refund must not be redirected to wallet or
+    // cancelled locally while the provider may still return the card payment.
+    if (String(existing.provider_refund_id || '').startsWith('wipay:') && newStatus !== 'refunded_to_original') {
+      return res.status(409).json({ success: false, message: 'Reconcile the existing WiPay refund before changing this request.' });
+    }
+    if (newStatus === 'refunded_to_wallet' && String(existing.payment_provider || '').includes('wipay') && existing.payment_transaction_id) {
+      const { data: inFlight, error: inFlightError } = await supabaseAdmin.from('wipay_refunds').select('transaction_id')
+        .eq('transaction_id', existing.payment_transaction_id).maybeSingle();
+      if (inFlightError) throw inFlightError;
+      if (inFlight) return res.status(409).json({ success: false, message: 'This WiPay payment already has an original-payment refund attempt.' });
+    }
+    if (String(existing.payment_provider || '').includes('wipay') &&
+        ['refunded_to_original', 'partially_refunded'].includes(newStatus)) {
+      if (newStatus === 'partially_refunded' || !['approved', 'manual_refund_required'].includes(existing.status)) {
+        return res.status(409).json({ success: false, message: 'Approve a full original-payment refund first. WiPay partial refunds require manual review.' });
+      }
+      const result = await requestWiPayRefund(existing);
+      // A fast webhook can complete the refund before this request returns.
+      const { error: pendingError } = await supabaseAdmin.from('refund_requests').update({
+        status: result.status, admin_notes: adminNotes || existing.admin_notes,
+        refund_destination_label: refundDestinationLabel || existing.refund_destination_label,
+        updated_at: new Date().toISOString(),
+      }).eq('request_id', requestId).eq('status', existing.status);
+      if (pendingError) throw pendingError;
+      const { data: current, error: currentError } = await supabaseAdmin.from('refund_requests').select('status')
+        .eq('request_id', requestId).single();
+      if (currentError) throw currentError;
+      return res.status(current.status === 'refunded_to_original' ? 200 : 202).json({ success: true,
+        requestId, status: current.status, processing: current.status !== 'refunded_to_original',
+        replay: Boolean(result.replay), message: current.status === 'refunded_to_original' ? 'WiPay refund confirmed.' :
+          current.status === 'manual_refund_required' ? 'WiPay refund needs review.' : 'WiPay refund is processing; completion is not yet confirmed.' });
+    }
+
     if (newStatus === 'refunded_to_wallet') {
       if (existing.refund_method !== 'wallet' || !existing.user_id) {
         return res.status(409).json({ success: false, message: 'This request is not eligible for a wallet refund' });
@@ -653,7 +687,8 @@ router.post('/api/refunds/requests/:id/update', requireAdmin, async (req, res) =
 
   } catch (error) {
     console.error('[REFUNDS] Admin update error:', error.message);
-    return res.status(500).json({ success: false, message: 'Update failed' });
+    return res.status(error.statusCode || 500).json({ success: false,
+      message: error.statusCode ? error.message : 'Update failed' });
   }
 });
 

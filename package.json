@@ -4,7 +4,7 @@
   "description": "",
   "main": "server.js",
   "scripts": {
-    "test": "node tests/push.test.js && node tests/commerce.test.js && node tests/wipay.test.js && node tests/shopify-admin-auth.test.js && node tests/paypal-currency.test.js && node tests/paypal-conversion-route.test.js && node tests/support.test.js && node tests/support-assistant.test.js && node tests/shopping-fixes.test.js && node tests/nood-ai.test.js && node tests/groq-synthetic.test.js && node tests/nine-router-synthetic.test.js && node tests/nood-ai-practice.test.js && node tests/khiel-openai.test.js",
+    "test": "node tests/push.test.js && node tests/commerce.test.js && node tests/wipay.test.js && node tests/wipay-refunds.test.js && node tests/shopify-refunds.test.js && node tests/shopify-admin-auth.test.js && node tests/paypal-currency.test.js && node tests/paypal-conversion-route.test.js && node tests/support.test.js && node tests/support-assistant.test.js && node tests/shopping-fixes.test.js && node tests/nood-ai.test.js && node tests/groq-synthetic.test.js && node tests/nine-router-synthetic.test.js && node tests/nood-ai-practice.test.js && node tests/khiel-openai.test.js",
     "test:groq": "node tests/groq-synthetic.test.js",
     "test:groq:live": "node scripts/test-groq-synthetic-live.js",
     "test:nood-ai": "node tests/nood-ai.test.js",
@@ -30,5 +30,3 @@
     "helmet": "8.3.0"
   }
 }
-
-
