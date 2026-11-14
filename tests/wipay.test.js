@@ -39,6 +39,7 @@ const server = app.listen(0, '127.0.0.1');
   async function callback(params) { const res = await fetch(`${base}/payment-return?${new URLSearchParams(params)}`, { redirect: 'manual' }); return res.headers.get('location'); }
   const first = await create('/create-wipay-payment', { total: 1, cartItems: [{ id: '123', quantity: 1 }] });
   assert.equal(first.code, 200); const id = first.data.order_id;
+  assert.match(id,/^[A-Za-z0-9]{16}$/);
   assert.equal(sessions.get(id).amount, '10.00');
   assert.match(await callback({ ...proof(id), hash: '0'.repeat(32) }), /payment_not_verified/); assert.equal(orders, 0);
   assert.match(await callback({ ...proof(id), currency: 'TTD' }), /payment_not_verified/);

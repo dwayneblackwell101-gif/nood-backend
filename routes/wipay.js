@@ -30,7 +30,9 @@ module.exports = function createWiPayRouter({ createShopifyOrder, buildAppRedire
           !['USD', 'TTD'].includes(currency) || (topup && currency !== 'USD')) {
         return res.status(400).json({ success: false, message: 'WiPay minimum is TTD 5.00 or USD 1.00; wallet top-ups must use USD and stay within the top-up limit' });
       }
-      const id = `nood_${crypto.randomUUID()}`;
+      // WiPay's FGB processor accepts at most 16 characters. A UUID is truncated
+      // there, breaking both the gateway token and receipt-to-order binding.
+      const id = `N${crypto.randomBytes(8).toString('hex').slice(0, 15)}`;
       const token = crypto.randomBytes(32).toString('hex');
       const session = { provider_order_id: id, provider: sandboxTest ? 'wipay_test' : topup ? 'wipay_wallet_topup' : 'wipay',
         user_id: identity?.userId || null, status: 'created', amount: (cents / 100).toFixed(2), currency,
