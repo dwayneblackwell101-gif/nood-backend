@@ -11,6 +11,12 @@
    Store its signing secret as WIPAY_WEBHOOK_SECRET.
 5. Sandbox uses merchant-owned sandbox credentials, WIPAY_WAPI_SANDBOX_KEY,
    WIPAY_SANDBOX_WEBHOOK_SECRET, and the /sandbox webhook endpoint.
+   The protected checkout test also needs WIPAY_SANDBOX_ACCOUNT_NUMBER and
+   WIPAY_SANDBOX_API_KEY from that same sandbox account. These are separate
+   from the live Payment API credentials. Test sessions pin their account
+   number so adding merchant test credentials cannot change existing public
+   sandbox verification. The account's availability for merchant-scoped
+   checkout/refunds must be confirmed with WiPay.
    The shared public account 1234567890 cannot be retrieved/refunded with a
    live merchant's credentials and does not send that merchant's webhooks.
 

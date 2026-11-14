@@ -17,7 +17,7 @@ module.exports = function createWiPayRouter({ createShopifyOrder, buildAppRedire
   }
   async function create(req, res, topup, sandboxTest = false) {
     try {
-      wipay.configuration({ sandboxTest });
+      const paymentConfig = wipay.configuration({ sandboxTest });
       if (process.env.NODE_ENV === 'production' && !baseUrl.startsWith('https://')) throw new Error('WiPay requires an HTTPS BACKEND_BASE_URL');
       const body = req.body || {};
       const identity = await authenticateCustomer(req);
@@ -38,10 +38,13 @@ module.exports = function createWiPayRouter({ createShopifyOrder, buildAppRedire
         user_id: identity?.userId || null, status: 'created', amount: (cents / 100).toFixed(2), currency,
         cart: quote?.lines || [], quote,
         customer: { name: String(body.name || 'NOOD Customer'), email: String(identity?.email || body.email || ''),
-          phone: String(body.phone || ''), returnToken: token }, shipping_address: body.shippingAddress || {},
+          phone: String(body.phone || ''), returnToken: token,
+          ...(sandboxTest ? { wipaySandboxAccount: paymentConfig.account } : {}) }, shipping_address: body.shippingAddress || {},
         updated_at: new Date().toISOString() };
       await savePayment(session);
-      const returnUrl = `${baseUrl}/payment-return?order_id=${encodeURIComponent(id)}&return_token=${token}`;
+      // WiPay appends order_id itself. Put our session binding in the path so
+      // duplicate query keys cannot turn Express's order_id into an array.
+      const returnUrl = `${baseUrl}/payment-return/${encodeURIComponent(id)}/${token}`;
       const url = await wipay.requestPayment(session, returnUrl);
       return res.json({ success: true, url, payment_url: url, order_id: id, return_url: returnUrl, sandbox_test: sandboxTest });
     } catch (error) { return failure(res, error); }
@@ -53,8 +56,12 @@ module.exports = function createWiPayRouter({ createShopifyOrder, buildAppRedire
     if (req.body?.provider === 'paypal') return res.redirect(307, '/api/wallet/paypal/orders');
     return create(req, res, true);
   });
-  router.get('/payment-return', async (req, res) => {
-    const id = typeof req.query.order_id === 'string' ? req.query.order_id : '';
+  router.get(['/payment-return', '/payment-return/:sessionId/:sessionToken'], async (req, res) => {
+    const singleValue = value => typeof value === 'string' ? value :
+      Array.isArray(value) && value.length > 0 && value.every(v => typeof v === 'string' && v === value[0]) ? value[0] : '';
+    const queryId = singleValue(req.query.order_id);
+    const id = req.params.sessionId || queryId;
+    const returnToken = req.params.sessionToken || singleValue(req.query.return_token);
     let verified = false;
     let acquired = false;
     const redirect = (params) => {
@@ -68,10 +75,12 @@ module.exports = function createWiPayRouter({ createShopifyOrder, buildAppRedire
     try {
       const session = await getPayment(id);
       if (!session || !['wipay', 'wipay_wallet_topup', 'wipay_test'].includes(session.provider) ||
-          typeof req.query.return_token !== 'string' || req.query.return_token !== session.customer.returnToken) {
+          (req.query.order_id !== undefined && queryId !== id) ||
+          !returnToken || returnToken !== session.customer.returnToken) {
         return redirect({ status: 'failed', reason: 'invalid_payment_session' });
       }
-      if (!wipay.verifyResponse(req.query, session, wipay.configuration({ sandboxTest: session.provider === 'wipay_test' }).key)) {
+      if (!wipay.verifyResponse(req.query, session, wipay.configuration({ sandboxTest: session.provider === 'wipay_test',
+        sandboxAccount: session.customer.wipaySandboxAccount || (session.provider === 'wipay_test' ? '1234567890' : undefined) }).key)) {
         return redirect({ status: 'failed', reason: 'payment_not_verified' });
       }
       verified = true;
