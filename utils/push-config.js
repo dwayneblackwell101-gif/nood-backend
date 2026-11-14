@@ -265,7 +265,7 @@ function minPromoIntervalMinutes() {
   return numberFromEnv('PUSH_MIN_INTERVAL_MINUTES', 60);
 }
 function maxPromoPerDay() {
-  return numberFromEnv('PUSH_MAX_PROMO_PER_DAY', 3);
+  return numberFromEnv('PUSH_MAX_PROMO_PER_DAY', 6);
 }
 function quietHoursEnabled() {
   return String(process.env.PUSH_QUIET_HOURS_ENABLED || 'true').toLowerCase() !== 'false';

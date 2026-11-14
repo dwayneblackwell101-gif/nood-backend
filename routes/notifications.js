@@ -183,7 +183,7 @@ router.post('/api/notifications/dev-seed', async (req, res) => {
  * GET /api/notifications/devices — list registered devices.
  * Returns a SAFE summary: no full tokens, no secrets.
  */
-router.get('/api/notifications/devices', async (req, res) => {
+router.get('/api/notifications/devices', requireAdmin, async (req, res) => {
   const tokens = await loadTokens({ includeInactive: true });
   const devices = Object.values(tokens).map((t) => ({
     id: String(t.token).slice(-8),
