@@ -84,6 +84,7 @@ router.post('/api/notifications/register-token', async (req, res) => {
   const platform = safeString(req.body?.platform, 'android');
   const deviceId = safeString(req.body?.deviceId);
   const customer = await authenticateCustomer(req);
+  if (req.headers?.authorization && !customer) return res.status(401).json({ success: false, message: 'Please sign in again to register notifications.' });
   const userId = customer?.userId || '';
   const email = customer?.email || '';
   const appVersion = safeString(req.body?.appVersion);
@@ -412,6 +413,7 @@ router.post('/api/notifications/inbox/read-all', async (req, res) => {
  */
 router.get('/api/notifications/preferences', async (req, res) => {
   const customer = await authenticateCustomer(req);
+  if (req.headers?.authorization && !customer) return res.status(401).json({ success: false, message: 'Please sign in again to register notifications.' });
   const userId = customer?.userId || '';
   if (!userId) {
     return res.status(401).json({ success: false, message: 'Signed-in identity required' });
@@ -426,6 +428,7 @@ router.get('/api/notifications/preferences', async (req, res) => {
  */
 router.post('/api/notifications/preferences', async (req, res) => {
   const customer = await authenticateCustomer(req);
+  if (req.headers?.authorization && !customer) return res.status(401).json({ success: false, message: 'Please sign in again to register notifications.' });
   const userId = customer?.userId || '';
   const category = safeString(req.body?.category);
   const enabled = Boolean(req.body?.enabled);

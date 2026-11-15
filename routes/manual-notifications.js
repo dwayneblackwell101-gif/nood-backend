@@ -1,0 +1,11 @@
+const express=require('express');
+const {requireAdmin}=require('../utils/admin-auth');
+const {loadAllRecipients,sendPush}=require('../utils/push-delivery');
+const {config}=require('../utils/push-config');
+const {createHandlers}=require('../utils/manual-notifications');
+const handlers=createHandlers({loadRecipients:loadAllRecipients,sendPush,config});
+const router=express.Router();
+router.get('/api/campaign-center/manual/phones',requireAdmin,handlers.targets);
+router.post('/api/campaign-center/manual/preview',requireAdmin,handlers.preview);
+router.post('/api/campaign-center/manual/send',requireAdmin,handlers.send);
+module.exports={router};

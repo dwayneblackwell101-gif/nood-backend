@@ -16,6 +16,7 @@ const allowedOrigins = new Set(
   [
     'https://noodcaribbean.com',
     'https://www.noodcaribbean.com',
+    'https://nood-backend.onrender.com',
     ...String(process.env.CORS_ALLOWED_ORIGINS || process.env.FRONTEND_URL || '')
       .split(',').map((value) => value.trim()).filter(Boolean),
   ]
@@ -24,7 +25,7 @@ app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false 
 app.use(cors({
   origin(origin, callback) {
     if (!origin || allowedOrigins.has(origin) ||
-        (process.env.NODE_ENV !== 'production' && /^https?:\/\/localhost(?::\d+)?$/.test(origin))) {
+        (process.env.NODE_ENV !== 'production' && /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/.test(origin))) {
       return callback(null, true);
     }
     return callback(new Error('Origin not allowed'));
@@ -612,6 +613,7 @@ app.listen(PORT, '0.0.0.0', () => {
   // Mount push notification routes
   try {
     const { router: notificationsRouter } = require('./routes/notifications');
+    app.use(require('./routes/manual-notifications').router);
     app.use('/', notificationsRouter);
   } catch (error) {
     console.error('[JOBS] notifications routes failed to mount:', error.message);
@@ -710,6 +712,8 @@ app.listen(PORT, '0.0.0.0', () => {
     }
     res.status(404).send('Push sender page not found');
   });
+
+  app.get('/notify', (_req, res) => res.sendFile(path.join(__dirname, 'public-notify.html')));
 
   // Serve the admin Campaign Center page at /campaign-center.
   const campaignCenterPath = path.join(__dirname, 'public-campaign-center.html');
