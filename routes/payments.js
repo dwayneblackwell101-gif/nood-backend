@@ -47,7 +47,7 @@ router.post('/api/orders', async (req, res) => {
   try {
     const body = req.body || {};
     const resolved = await identity(req);
-    const trusted = await quoteCart(body.cartItems || body.cart, body.couponCode, resolved?.userId);
+    const trusted = await quoteCart(body.cartItems || body.cart, body.couponCode, resolved?.userId, { shippingAddress: body.shippingAddress, enforceExpected: true, total: body.total, currency: body.currency });
     reference = safeString(body.clientOrderId || body.checkoutSessionId) || `nood_${crypto.randomUUID()}`;
     if (trusted.coupon) {
       await reserveCoupon({ coupon: trusted.coupon, userId: resolved.userId, reference });
@@ -163,7 +163,7 @@ router.post('/api/wallet/checkout', async (req, res) => {
       trusted = existing.quote;
       debit = { ok: true, replay: true, txnId: existing.capture_id, balance: existing.wallet_balance };
     } else {
-      trusted = await quoteCart(body.cartItems, body.couponCode, resolved.userId);
+      trusted = await quoteCart(body.cartItems, body.couponCode, resolved.userId, { shippingAddress: body.shippingAddress, enforceExpected: true, total: body.total, currency: body.currency });
       trusted.walletSettlement = await quotePayPalSettlement(trusted);
       if (trusted.coupon) await reserveCoupon({ coupon: trusted.coupon, userId: resolved.userId, reference });
       debit = await applyWalletTxn({

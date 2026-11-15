@@ -66,7 +66,7 @@ function calculateDiscount(campaign, subtotalCents, currency) {
   return Math.max(0, Math.min(cents, subtotalCents));
 }
 
-async function quoteCart(items, couponCode, userId) {
+async function quoteMerchandise(items, couponCode, userId) {
   const trusted = await priceCart(items);
   const subtotalCents = moneyToCents(trusted.subtotal);
   const code = cleanCode(couponCode);
@@ -82,6 +82,16 @@ async function quoteCart(items, couponCode, userId) {
     total: ((subtotalCents - discountCents) / 100).toFixed(2),
     coupon: publicCoupon(campaign),
   };
+}
+
+async function quoteCart(items, couponCode, userId, checkout) {
+  const quote = await quoteMerchandise(items, couponCode, userId);
+  if (!checkout) return quote;
+  const full = await require('./checkout-shipping').addShopifyShipping(quote, checkout.shippingAddress);
+  if (checkout.enforceExpected && (moneyToCents(checkout.total) !== moneyToCents(full.total) || checkout.currency !== full.currency)) {
+    throw Object.assign(new Error('Your shipping or order total changed. Refresh checkout and review the new total before paying.'), { statusCode: 409 });
+  }
+  return full;
 }
 
 async function reserveCoupon({ coupon, userId, reference }) {

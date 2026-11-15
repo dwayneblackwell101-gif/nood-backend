@@ -408,6 +408,13 @@ async function createShopifyOrder({
         phone: safeString(shippingAddress.phone || phone) || undefined,
       },
       lineItems,
+      ...(Array.isArray(trusted.shippingLines) && trusted.shippingLines.length ? {
+        shippingLines: trusted.shippingLines.map(line => ({ title: line.title, priceSet: { shopMoney: { amount: safeMoney(line.amount), currencyCode: trustedCurrency } } })),
+      } : {}),
+      ...(Number(trusted.tax || 0) > 0 ? {
+        taxLines: [{ title: 'Shopify calculated tax', rate: Number(trusted.tax) / (Number(trusted.subtotal) + Number(trusted.shipping || 0)),
+          priceSet: { shopMoney: { amount: safeMoney(trusted.tax), currencyCode: trustedCurrency } } }],
+      } : {}),
       ...(Number(trusted.discount || 0) > 0 && trusted.coupon?.code
         ? {
             discountCode: {

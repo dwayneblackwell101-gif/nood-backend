@@ -18,7 +18,7 @@ router.get('/api/promotions/coupons', async (req, res) => {
 router.post('/api/promotions/quote', async (req, res) => {
   try {
     const customer = await authenticateCustomer(req);
-    const quote = await quoteCart(req.body?.cartItems || [], req.body?.couponCode, customer?.userId);
+    const quote = await quoteCart(req.body?.cartItems || [], req.body?.couponCode, customer?.userId, { shippingAddress: req.body?.shippingAddress });
     return res.json({ success: true, quote });
   } catch (error) {
     return res.status(Number(error.statusCode || 500)).json({ success: false, message: error.message });
