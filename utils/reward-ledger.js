@@ -83,6 +83,7 @@ function makeTxnId() {
 async function issueReward(opts) {
   const userId = String(opts.user_id || '').trim();
   const amount = Number(opts.amount);
+  if (String(opts.currency || 'USD').toUpperCase() !== 'USD') return { ok: false, error: 'unsupported_wallet_currency' };
   if (!userId || !Number.isFinite(amount) || amount < 0) {
     return { ok: false, error: 'invalid_issuance' };
   }
@@ -301,6 +302,7 @@ async function applyWalletTxn(opts) {
   // same balance.
   if (supabaseAdmin) {
     try {
+      await getWalletBalance(userId);
       const { data, error } = await supabaseAdmin.rpc('apply_wallet_transaction_atomic', {
         p_user_id: userId,
         p_amount: amount,
@@ -380,9 +382,14 @@ async function getWalletBalance(userId) {
   const txns = await listWalletTxns(userId);
   let balance = 0;
   for (const t of txns) {
-    balance += Number(t.amount);
+    if (String(t.currency || 'USD').toUpperCase() !== 'USD') {
+      throw Object.assign(new Error('Wallet history needs a currency review. Please use another payment method.'), { statusCode: 503 });
+    }
+    const amount = Number(t.amount);
+    if (!Number.isFinite(amount)) throw new Error('Wallet history contains an invalid amount');
+    balance += Math.round(amount * 100);
   }
-  return Math.max(0, balance);
+  return Math.max(0, balance) / 100;
 }
 
 async function listWalletTxns(userId) {
@@ -397,7 +404,7 @@ async function listWalletTxns(userId) {
       return data || [];
     } catch (error) {
       console.error('[WALLET] list failed:', error.message);
-      return [];
+      throw Object.assign(new Error('Wallet is temporarily unavailable. Please try again.'), { statusCode: 503 });
     }
   }
   return loadJsonFile(walletFile()).filter((r) => r.user_id === userId);

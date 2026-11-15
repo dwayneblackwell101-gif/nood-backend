@@ -147,27 +147,37 @@ router.post('/api/wallet/checkout', async (req, res) => {
     if (!reference) return res.status(400).json({ success: false, message: 'Checkout session ID is required' });
 
     const existing = await getPayment(stateKey);
+    if (existing?.user_id && existing.user_id !== resolved.userId) return res.status(409).json({ success: false, message: 'This checkout belongs to another account. Start a new checkout.' });
     if (existing?.shopify_order) {
-      return res.json({ success: true, transaction_id: existing.capture_id, wallet_balance: existing.wallet_balance,
+      return res.json({ success: true, transaction_id: existing.capture_id, wallet_balance: (existing.quote?.currency === 'USD' || existing.quote?.walletSettlement) ? existing.wallet_balance : null, wallet_currency: 'USD',
         shopify_order_id: existing.shopify_order.id, shopify_order_name: existing.shopify_order.name,
         shopify_order: existing.shopify_order, replay: true });
     }
     if (existing?.status === 'reversed') {
       return res.status(409).json({ success: false, message: 'This checkout attempt was reversed. Start checkout again.' });
     }
+    if (existing?.status === 'debited' && existing.quote?.currency !== 'USD' && !existing.quote?.walletSettlement) {
+      return res.status(409).json({ success: false, message: 'This earlier wallet payment needs a currency review. Contact support before trying it again.' });
+    }
     if (existing?.status === 'debited' && existing.quote && existing.capture_id) {
       trusted = existing.quote;
       debit = { ok: true, replay: true, txnId: existing.capture_id, balance: existing.wallet_balance };
     } else {
       trusted = await quoteCart(body.cartItems, body.couponCode, resolved.userId);
+      trusted.walletSettlement = await quotePayPalSettlement(trusted);
       if (trusted.coupon) await reserveCoupon({ coupon: trusted.coupon, userId: resolved.userId, reference });
       debit = await applyWalletTxn({
-        user_id: resolved.userId, amount: -Number(trusted.total), currency: trusted.currency,
+        user_id: resolved.userId, amount: -Number(trusted.walletSettlement.amount), currency: 'USD',
         type: 'debit', source: 'order_payment', reference,
         idempotency_key: `wallet-checkout:${resolved.userId}:${reference}`,
-        metadata: { checkoutSessionId: reference },
+        metadata: { checkoutSessionId: reference, sourceAmount: trusted.total, sourceCurrency: trusted.currency, settlement: trusted.walletSettlement },
       });
-      if (!debit.ok && !debit.replay) {
+      if (debit.replay) {
+        if (trusted.coupon) await releaseCoupon(reference).catch(() => {});
+        return res.status(409).json({ success: false, message: 'This earlier wallet debit needs review. Start a new checkout or contact support.' });
+      }
+      if (!debit.ok) {
+        if (trusted.coupon) await releaseCoupon(reference).catch(() => {});
         const status = debit.error === 'insufficient_balance' ? 409 : 500;
         return res.status(status).json({ success: false,
           message: debit.error === 'insufficient_balance' ? 'Insufficient wallet balance' : 'Wallet debit failed',
@@ -176,7 +186,7 @@ router.post('/api/wallet/checkout', async (req, res) => {
       await savePayment({ provider_order_id: stateKey, provider: 'wallet', user_id: resolved.userId,
         status: 'debited', amount: trusted.total, currency: trusted.currency, cart: trusted.lines, quote: trusted,
         customer: customerFrom(body, resolved), shipping_address: body.shippingAddress || {},
-        capture_id: debit.txnId, wallet_balance: debit.balance, updated_at: new Date().toISOString() });
+        capture_id: debit.txnId, wallet_balance: debit.balance, wallet_currency: 'USD', updated_at: new Date().toISOString() });
     }
 
     shopifyOrder = await createShopifyOrder({
@@ -188,23 +198,23 @@ router.post('/api/wallet/checkout', async (req, res) => {
     await savePayment({ provider_order_id: stateKey, provider: 'wallet', user_id: resolved.userId,
       status: 'completed', amount: trusted.total, currency: trusted.currency, cart: trusted.lines, quote: trusted,
       customer: customerFrom(body, resolved), shipping_address: body.shippingAddress || {},
-      capture_id: debit.txnId, shopify_order: shopifyOrder, wallet_balance: debit.balance,
+      capture_id: debit.txnId, shopify_order: shopifyOrder, wallet_balance: debit.balance, wallet_currency: 'USD',
       updated_at: new Date().toISOString() });
     if (trusted.coupon) await finalizeCoupon(reference, shopifyOrder.id).catch((error) => {
       console.error('[WALLET CHECKOUT] coupon finalization needs reconciliation:', error.message);
     });
-    return res.json({ success: true, transaction_id: debit.txnId, wallet_balance: debit.balance,
+    return res.json({ success: true, transaction_id: debit.txnId, wallet_balance: debit.balance, wallet_currency: 'USD',
       shopify_order_id: shopifyOrder.id, shopify_order_name: shopifyOrder.name, shopify_order: shopifyOrder });
   } catch (error) {
     if (shopifyOrder && debit) {
       console.error('[WALLET CHECKOUT] post-order persistence needs reconciliation:', error.message);
-      return res.json({ success: true, transaction_id: debit.txnId, wallet_balance: debit.balance,
+      return res.json({ success: true, transaction_id: debit.txnId, wallet_balance: debit.balance, wallet_currency: 'USD',
         shopify_order_id: shopifyOrder.id, shopify_order_name: shopifyOrder.name, shopify_order: shopifyOrder,
         reconciliation_pending: true });
     }
     if (debit?.ok && resolved && trusted) {
       const reversal = await applyWalletTxn({
-        user_id: resolved.userId, amount: Number(trusted.total), currency: trusted.currency,
+        user_id: resolved.userId, amount: Number(trusted.walletSettlement?.amount || trusted.total), currency: trusted.walletSettlement ? 'USD' : trusted.currency,
         type: 'reversal', source: 'reversal', reference,
         idempotency_key: `wallet-checkout-reversal:${resolved.userId}:${reference}`,
         reverses_transaction_id: debit.txnId, metadata: { reason: 'shopify_order_failed' },
