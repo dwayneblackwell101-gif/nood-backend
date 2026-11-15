@@ -367,8 +367,8 @@ async function createShopifyOrder({
   }));
 
   const query = `
-    mutation orderCreate($order: OrderCreateOrderInput!) {
-      orderCreate(order: $order) {
+    mutation orderCreate($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) {
+      orderCreate(order: $order, options: $options) {
         order {
           id
           name
@@ -438,6 +438,9 @@ async function createShopifyOrder({
       ],
     },
   };
+
+  // A paid live order gets a receipt; creating it does not mean it has shipped.
+  variables.options = { sendReceipt: Boolean(email) && !variables.order.test, sendFulfillmentReceipt: false };
 
   const SHOPIFY_ADMIN_API_VERSION = process.env.SHOPIFY_ADMIN_API_VERSION || '2026-04';
 
