@@ -609,6 +609,7 @@ app.listen(PORT, '0.0.0.0', () => {
   try {
     const { router: catalogRouter } = require('./routes/catalog');
     app.use('/', catalogRouter);
+    app.use('/', require('./routes/customer-orders').router);
   } catch (error) {
     console.error('[JOBS] catalog routes failed to mount:', error.message);
   }
