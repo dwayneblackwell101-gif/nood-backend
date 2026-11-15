@@ -32,25 +32,10 @@ async function addShopifyShipping(quote, address) {
   } })).cartCreate;
   if (created?.userErrors?.length || !created?.cart) throw failure('Shopify could not confirm your delivery address.');
   let cart = created.cart;
-  const groups = cart.deliveryGroups?.nodes || [];
-  const physical = cart.lines?.nodes?.some(line => line.merchandise?.requiresShipping !== false);
-  if (physical && !groups.length) throw failure('Shopify has no shipping rate for this address. Please check your address or contact support.');
-  const selected = groups.map(group => {
-    const valid = (group.deliveryOptions || []).filter(option =>
-      option.estimatedCost?.currencyCode === quote.currency && moneyToCents(option.estimatedCost?.amount) !== null);
-    if (!valid.length) throw failure('Shopify has no shipping rate for this address. Please check your address or contact support.');
-    valid.sort((a, b) => moneyToCents(a.estimatedCost.amount) - moneyToCents(b.estimatedCost.amount));
-    return { group, option: valid[0] };
-  });
-  if (selected.length) {
-    const updated = (await request(`mutation NoodSelectShipping($cartId:ID!, $selectedDeliveryOptions:[CartSelectedDeliveryOptionInput!]!) {
-      cartSelectedDeliveryOptionsUpdate(cartId:$cartId,selectedDeliveryOptions:$selectedDeliveryOptions) {
-        cart { ${COST} } userErrors { message }
-      }
-    }`, { cartId: cart.id, selectedDeliveryOptions: selected.map(({ group, option }) => ({ deliveryGroupId: group.id, deliveryOptionHandle: option.handle })) })).cartSelectedDeliveryOptionsUpdate;
-    if (updated?.userErrors?.length || !updated?.cart) throw failure('Shopify could not confirm the shipping rate.');
-    cart = updated.cart;
-  }
+  // NOOD selling prices already include the ZQ Dropshipping shipping cost.
+  // We still create the Shopify cart so variant prices, tax, and address validity
+  // are confirmed, but we must never select or charge a Shopify delivery rate.
+  const selected = [];
   const cost = cart.cost;
   if (cost?.totalAmount?.currencyCode !== quote.currency || cost?.subtotalAmount?.currencyCode !== quote.currency) {
     throw failure('Shopify changed the checkout currency. Please contact support before paying.');
@@ -61,10 +46,10 @@ async function addShopifyShipping(quote, address) {
   const tax = cost.totalTaxAmount ? moneyToCents(cost.totalTaxAmount.amount) : 0;
   // Never charge a guessed total if Shopify changed prices or applied a discount
   // that the external-payment order cannot yet reproduce.
-  if (subtotal !== moneyToCents(quote.subtotal) || total == null || tax == null || total !== subtotal + shipping + tax) {
+  if (subtotal !== moneyToCents(quote.subtotal) || total == null || tax == null || total !== subtotal + tax) {
     throw failure('Shopify changed this order’s price or discounts. Please refresh your cart before paying.');
   }
-  return { ...quote, shipping: (shipping / 100).toFixed(2), tax: (tax / 100).toFixed(2), total: (total / 100).toFixed(2),
+  return { ...quote, shipping: '0.00', tax: (tax / 100).toFixed(2), total: (total / 100).toFixed(2), shippingIncluded: true,
     shippingLines: selected.map(({ option }) => ({ title: option.title, amount: option.estimatedCost.amount })),
     shippingSource: 'shopify', quotedAt: new Date().toISOString() };
 }
