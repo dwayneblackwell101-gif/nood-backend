@@ -22,8 +22,8 @@ module.exports = function createWiPayRouter({ createShopifyOrder, buildAppRedire
       const body = req.body || {};
       const identity = await authenticateCustomer(req);
       if (topup && !identity) return res.status(401).json({ success: false, message: 'Sign in to top up your wallet' });
-      if (body.couponCode) return res.status(400).json({ success: false, message: 'Use PayPal or Wallet for coupon checkout' });
-      const quote = topup ? null : await quoteCart(body.cartItems || body.cart, null, identity?.userId, { shippingAddress: body.shippingAddress, enforceExpected: true, total: body.total, currency: body.currency });
+      if (topup && body.couponCode) return res.status(400).json({ success: false, message: 'Coupons cannot be used on wallet top-ups' });
+      const quote = topup ? null : await quoteCart(body.cartItems || body.cart, body.couponCode, identity?.userId, { shippingAddress: body.shippingAddress, enforceExpected: true, total: body.total, currency: body.currency });
       const cents = topup ? moneyToCents(body.amount) : moneyToCents(quote.total);
       const currency = topup ? String(body.currency || 'USD').toUpperCase() : quote.currency;
       if (!cents || cents < (currency === 'TTD' ? 500 : 100) || (topup && cents > Number(process.env.WALLET_TOPUP_MAX_CENTS || 50000)) ||

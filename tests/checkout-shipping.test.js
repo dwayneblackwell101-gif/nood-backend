@@ -4,6 +4,14 @@ const id = require.resolve('axios');
 require.cache[id] = { id, filename: id, loaded: true, exports: { post: async (_url, { query, variables }) => {
   const cost = { subtotalAmount: { amount: mode === 'changed' ? '110.00' : '100.00', currencyCode: 'TTD' }, totalAmount: { amount: mode === 'changed' ? '115.00' : '105.00', currencyCode: mode === 'currency' ? 'USD' : 'TTD' }, totalTaxAmount: { amount: '5.00', currencyCode: 'TTD' } };
   const cart = { id: 'cart1', cost, lines: { nodes: [{ merchandise: { requiresShipping: true } }] } };
+  if (mode === 'coupon' || mode === 'invalid-code' || mode === 'automatic') {
+    if (mode !== 'automatic') {
+      assert.deepEqual(variables.input.discountCodes, ['SAVE20']);
+      cart.discountCodes = [{ code: 'SAVE20', applicable: mode === 'coupon' }];
+    }
+    cart.discountAllocations = [{ discountedAmount: { amount: '20.00', currencyCode: 'TTD' } }];
+    cost.totalAmount.amount = '85.00';
+  }
   if (query.includes('cartSelectedDeliveryOptionsUpdate')) {
     selected = variables.selectedDeliveryOptions;
     return { data: { data: { cartSelectedDeliveryOptionsUpdate: { cart, userErrors: [] } } } };
@@ -28,5 +36,11 @@ const address = { address1: '1 Test Street', city: 'Port of Spain', country: 'TT
   for (const scenario of ['changed', 'currency']) {
     mode = scenario; await assert.rejects(addShopifyShipping(quote, address));
   }
+  mode = 'coupon';
+  const discounted = await addShopifyShipping(quote, address, 'SAVE20');
+  assert.equal(discounted.discount, '20.00'); assert.equal(discounted.total, '85.00');
+  assert.equal(discounted.coupon.source, 'shopify'); assert.equal(discounted.coupon.code, 'SAVE20');
+  mode = 'invalid-code'; await assert.rejects(addShopifyShipping(quote, address, 'SAVE20'), /does not apply/);
+  mode = 'automatic'; await assert.rejects(addShopifyShipping(quote, address), /automatic Shopify discount/);
   console.log('Included shipping checks passed: no added delivery charge or rate selection, tax preserved, complete address required, changed prices/currency rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

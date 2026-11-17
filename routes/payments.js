@@ -49,7 +49,7 @@ router.post('/api/orders', async (req, res) => {
     const resolved = await identity(req);
     const trusted = await quoteCart(body.cartItems || body.cart, body.couponCode, resolved?.userId, { shippingAddress: body.shippingAddress, enforceExpected: true, total: body.total, currency: body.currency });
     reference = safeString(body.clientOrderId || body.checkoutSessionId) || `nood_${crypto.randomUUID()}`;
-    if (trusted.coupon) {
+    if (trusted.coupon && trusted.coupon.source !== 'shopify') {
       await reserveCoupon({ coupon: trusted.coupon, userId: resolved.userId, reference });
       reserved = true;
     }
@@ -60,7 +60,7 @@ router.post('/api/orders', async (req, res) => {
     await savePayment({
       provider_order_id: order.id, provider: 'paypal', user_id: resolved?.userId || null, status: 'created',
       amount: trusted.total, currency: trusted.currency, cart: trusted.lines, quote: trusted,
-      coupon_reference: trusted.coupon ? reference : null,
+      coupon_reference: trusted.coupon && trusted.coupon.source !== 'shopify' ? reference : null,
       customer: customerFrom(body, resolved), shipping_address: body.shippingAddress || {},
       updated_at: new Date().toISOString(),
     });
@@ -165,7 +165,7 @@ router.post('/api/wallet/checkout', async (req, res) => {
     } else {
       trusted = await quoteCart(body.cartItems, body.couponCode, resolved.userId, { shippingAddress: body.shippingAddress, enforceExpected: true, total: body.total, currency: body.currency });
       trusted.walletSettlement = await quotePayPalSettlement(trusted);
-      if (trusted.coupon) await reserveCoupon({ coupon: trusted.coupon, userId: resolved.userId, reference });
+      if (trusted.coupon && trusted.coupon.source !== 'shopify') await reserveCoupon({ coupon: trusted.coupon, userId: resolved.userId, reference });
       debit = await applyWalletTxn({
         user_id: resolved.userId, amount: -Number(trusted.walletSettlement.amount), currency: 'USD',
         type: 'debit', source: 'order_payment', reference,
@@ -200,7 +200,7 @@ router.post('/api/wallet/checkout', async (req, res) => {
       customer: customerFrom(body, resolved), shipping_address: body.shippingAddress || {},
       capture_id: debit.txnId, shopify_order: shopifyOrder, wallet_balance: debit.balance, wallet_currency: 'USD',
       updated_at: new Date().toISOString() });
-    if (trusted.coupon) await finalizeCoupon(reference, shopifyOrder.id).catch((error) => {
+    if (trusted.coupon && trusted.coupon.source !== 'shopify') await finalizeCoupon(reference, shopifyOrder.id).catch((error) => {
       console.error('[WALLET CHECKOUT] coupon finalization needs reconciliation:', error.message);
     });
     return res.json({ success: true, transaction_id: debit.txnId, wallet_balance: debit.balance, wallet_currency: 'USD',

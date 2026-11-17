@@ -85,16 +85,23 @@ async function quoteMerchandise(items, couponCode, userId) {
 }
 
 async function quoteCart(items, couponCode, userId, checkout) {
-  const quote = await quoteMerchandise(items, couponCode, userId);
-  if (!checkout) return quote;
-  const full = await require('./checkout-shipping').addShopifyShipping(quote, checkout.shippingAddress);
-  if (checkout.enforceExpected && (moneyToCents(checkout.total) !== moneyToCents(full.total) || checkout.currency !== full.currency)) {
-    throw Object.assign(new Error('Your shipping or order total changed. Refresh checkout and review the new total before paying.'), { statusCode: 409 });
+  if (checkout) {
+    const code = String(couponCode || '').trim();
+    if (code.length > 100) throw Object.assign(new Error('Discount code is too long'), { statusCode: 400 });
+    if (code) await require('./shopify-discounts').validatePublicCode(code);
+    const priced = await priceCart(items);
+    const full = await require('./checkout-shipping').addShopifyShipping({ ...priced, discount: '0.00', total: priced.subtotal, coupon: null }, checkout.shippingAddress, code);
+    if (checkout.enforceExpected && (moneyToCents(checkout.total) !== moneyToCents(full.total) || checkout.currency !== full.currency)) {
+      throw Object.assign(new Error('Your shipping or order total changed. Refresh checkout and review the new total before paying.'), { statusCode: 409 });
+    }
+    return full;
   }
-  return full;
+  const quote = await quoteMerchandise(items, couponCode, userId);
+  return quote;
 }
 
 async function reserveCoupon({ coupon, userId, reference }) {
+  if (coupon?.source === 'shopify') return null;
   if (!coupon) return null;
   if (!supabaseAdmin) throw Object.assign(new Error('Coupon service is unavailable'), { statusCode: 503 });
   const { data, error } = await supabaseAdmin.rpc('reserve_coupon_atomic', {
