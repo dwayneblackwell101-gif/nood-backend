@@ -54,7 +54,6 @@ async function addShopifyShipping(quote, address, couponCode = '') {
   }
   const subtotal = moneyToCents(cost.subtotalAmount.amount);
   const total = moneyToCents(cost.totalAmount.amount);
-  const shipping = selected.reduce((sum, { option }) => sum + moneyToCents(option.estimatedCost.amount), 0);
   const tax = cost.totalTaxAmount ? moneyToCents(cost.totalTaxAmount.amount) : 0;
   const allocations = [...(cart.discountAllocations || []), ...(cart.lines?.nodes || []).flatMap(line => line.discountAllocations || [])];
   const discountCents = allocations.reduce((sum, allocation) => {
@@ -72,12 +71,24 @@ async function addShopifyShipping(quote, address, couponCode = '') {
   }
   // Never charge a guessed total if Shopify changed prices or applied a discount
   // that the external-payment order cannot yet reproduce.
-  if (subtotal == null || subtotal > originalSubtotal || total == null || tax == null || discountCents > originalSubtotal || total !== originalSubtotal - discountCents + tax) {
+  const includedTotal = originalSubtotal - discountCents + tax;
+  // Shopify can automatically include the sole delivery rate in its cart total.
+  // Remove it only when every group has one valid rate and their sum reconciles exactly.
+  const groups = cart.deliveryGroups?.nodes || [];
+  const rateCents = groups.map(({ deliveryOptions }) => {
+    const cost = deliveryOptions?.length === 1 ? deliveryOptions[0].estimatedCost : null;
+    return cost?.currencyCode === quote.currency ? moneyToCents(cost.amount) : null;
+  });
+  const confirmedDelivery = rateCents.length > 0 && rateCents.every(rate => rate != null)
+    ? rateCents.reduce((sum, rate) => sum + rate, 0)
+    : null;
+  if (originalSubtotal == null || (subtotal !== originalSubtotal && subtotal !== originalSubtotal - discountCents) || total == null || tax == null || discountCents > originalSubtotal ||
+      (total !== includedTotal && (confirmedDelivery == null || total !== includedTotal + confirmedDelivery))) {
     throw failure('Shopify changed this order’s price or discounts. Please refresh your cart before paying.');
   }
   return { ...quote, discount: (discountCents / 100).toFixed(2),
     coupon: discountCents > 0 ? { code: couponCode, source: 'shopify' } : null,
-    shipping: '0.00', tax: (tax / 100).toFixed(2), total: (total / 100).toFixed(2), shippingIncluded: true,
+    shipping: '0.00', tax: (tax / 100).toFixed(2), total: (includedTotal / 100).toFixed(2), shippingIncluded: true,
     shippingLines: selected.map(({ option }) => ({ title: option.title, amount: option.estimatedCost.amount })),
     shippingSource: 'shopify', quotedAt: new Date().toISOString() };
 }

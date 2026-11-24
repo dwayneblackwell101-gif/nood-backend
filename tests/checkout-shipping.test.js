@@ -21,6 +21,10 @@ require.cache[id] = { id, filename: id, loaded: true, exports: { post: async (_u
     { handle: 'express', title: 'Express', estimatedCost: { amount: '120.00', currencyCode: 'TTD' } },
     { handle: 'standard', title: 'Standard', estimatedCost: { amount: '75.00', currencyCode: 'TTD' } },
   ] }] };
+  if (mode === 'auto-delivery' || mode === 'unexplained-total') {
+    cart.deliveryGroups.nodes[0].deliveryOptions.length = 1;
+    cost.totalAmount.amount = mode === 'auto-delivery' ? '225.00' : '224.99';
+  }
   const warnings = mode === 'out-of-stock' ? [{ code: 'MERCHANDISE_OUT_OF_STOCK' }] : [];
   return { data: { data: { cartCreate: { cart, userErrors: [], warnings } } } };
 } } };
@@ -32,6 +36,10 @@ const address = { address1: '1 Test Street', city: 'Port of Spain', country: 'TT
   const result = await addShopifyShipping(quote, address);
   assert.equal(result.shipping, '0.00'); assert.equal(result.tax, '5.00'); assert.equal(result.total, '105.00');
   assert.equal(result.shippingIncluded, true); assert.equal(result.shippingLines.length, 0); assert.equal(selected.length, 0);
+  mode = 'auto-delivery';
+  assert.equal((await addShopifyShipping(quote, address)).total, '105.00');
+  mode = 'unexplained-total';
+  await assert.rejects(addShopifyShipping(quote, address), /changed this order/);
   mode = 'no-rate';
   assert.equal((await addShopifyShipping(quote, address)).total, '105.00');
   await assert.rejects(addShopifyShipping(quote, null), /complete shipping address/);
