@@ -34,6 +34,9 @@ async function addShopifyShipping(quote, address, couponCode = '') {
   } })).cartCreate;
   if (created?.userErrors?.length || !created?.cart) throw failure('Shopify could not confirm your delivery address.');
   let cart = created.cart;
+  if (!cart.lines?.nodes?.length) {
+    throw failure('The items in this cart aren’t available for this delivery destination. Check your address or remove the unavailable items.');
+  }
   if (couponCode && !(cart.discountCodes || []).some(code => code.applicable && code.code.toUpperCase() === couponCode.toUpperCase())) {
     throw failure('This code does not apply to the items or delivery address in your cart.');
   }

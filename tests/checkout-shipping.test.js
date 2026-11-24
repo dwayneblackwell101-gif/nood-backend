@@ -4,6 +4,7 @@ const id = require.resolve('axios');
 require.cache[id] = { id, filename: id, loaded: true, exports: { post: async (_url, { query, variables }) => {
   const cost = { subtotalAmount: { amount: mode === 'changed' ? '110.00' : '100.00', currencyCode: 'TTD' }, totalAmount: { amount: mode === 'changed' ? '115.00' : '105.00', currencyCode: mode === 'currency' ? 'USD' : 'TTD' }, totalTaxAmount: { amount: '5.00', currencyCode: 'TTD' } };
   const cart = { id: 'cart1', cost, lines: { nodes: [{ merchandise: { requiresShipping: true } }] } };
+  if (mode === 'empty') cart.lines.nodes = [];
   if (mode === 'coupon' || mode === 'invalid-code' || mode === 'automatic') {
     if (mode !== 'automatic') {
       assert.deepEqual(variables.input.discountCodes, ['SAVE20']);
@@ -33,6 +34,8 @@ const address = { address1: '1 Test Street', city: 'Port of Spain', country: 'TT
   mode = 'no-rate';
   assert.equal((await addShopifyShipping(quote, address)).total, '105.00');
   await assert.rejects(addShopifyShipping(quote, null), /complete shipping address/);
+  mode = 'empty';
+  await assert.rejects(addShopifyShipping(quote, address), /aren’t available for this delivery destination/);
   for (const scenario of ['changed', 'currency']) {
     mode = scenario; await assert.rejects(addShopifyShipping(quote, address));
   }
