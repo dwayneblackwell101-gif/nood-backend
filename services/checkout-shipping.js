@@ -22,6 +22,7 @@ async function addShopifyShipping(quote, address, couponCode = '') {
   };
   const created = (await request(`mutation NoodShipping($input:CartInput!) { cartCreate(input:$input) {
     cart { ${COST} deliveryGroups(first:20) { nodes { id deliveryOptions { handle title estimatedCost { amount currencyCode } } } } }
+    warnings { code }
     userErrors { message }
   } }`, { input: {
     ...(couponCode ? { discountCodes: [couponCode] } : {}),
@@ -33,6 +34,9 @@ async function addShopifyShipping(quote, address, couponCode = '') {
     } }] },
   } })).cartCreate;
   if (created?.userErrors?.length || !created?.cart) throw failure('Shopify could not confirm your delivery address.');
+  if (created.warnings?.some(({ code }) => code === 'MERCHANDISE_OUT_OF_STOCK' || code === 'MERCHANDISE_NOT_ENOUGH_STOCK')) {
+    throw failure('An item in your cart is sold out or has insufficient stock. Update your cart and try again.');
+  }
   let cart = created.cart;
   if (!cart.lines?.nodes?.length) {
     throw failure('The items in this cart aren’t available for this delivery destination. Check your address or remove the unavailable items.');

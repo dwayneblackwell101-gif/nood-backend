@@ -21,7 +21,8 @@ require.cache[id] = { id, filename: id, loaded: true, exports: { post: async (_u
     { handle: 'express', title: 'Express', estimatedCost: { amount: '120.00', currencyCode: 'TTD' } },
     { handle: 'standard', title: 'Standard', estimatedCost: { amount: '75.00', currencyCode: 'TTD' } },
   ] }] };
-  return { data: { data: { cartCreate: { cart, userErrors: [] } } } };
+  const warnings = mode === 'out-of-stock' ? [{ code: 'MERCHANDISE_OUT_OF_STOCK' }] : [];
+  return { data: { data: { cartCreate: { cart, userErrors: [], warnings } } } };
 } } };
 process.env.SHOPIFY_STORE_DOMAIN = 'test.myshopify.com'; process.env.SHOPIFY_STOREFRONT_TOKEN = 'test';
 const { addShopifyShipping } = require('../services/checkout-shipping');
@@ -36,6 +37,8 @@ const address = { address1: '1 Test Street', city: 'Port of Spain', country: 'TT
   await assert.rejects(addShopifyShipping(quote, null), /complete shipping address/);
   mode = 'empty';
   await assert.rejects(addShopifyShipping(quote, address), /aren’t available for this delivery destination/);
+  mode = 'out-of-stock';
+  await assert.rejects(addShopifyShipping(quote, address), /sold out or has insufficient stock/);
   for (const scenario of ['changed', 'currency']) {
     mode = scenario; await assert.rejects(addShopifyShipping(quote, address));
   }
