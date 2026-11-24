@@ -35,7 +35,7 @@ const router = express.Router();
 const SHOPIFY_STORE_DOMAIN =
   String(process.env.SHOPIFY_STORE_DOMAIN || 'h41bez-i2.myshopify.com').trim();
 const SHOPIFY_STOREFRONT_TOKEN =
-  String(process.env.SHOPIFY_STOREFRONT_TOKEN || '6ae1a19ca3b9b5d7184d01a2fcb3f397').trim();
+  String(process.env.SHOPIFY_STOREFRONT_TOKEN || process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN || '6ae1a19ca3b9b5d7184d01a2fcb3f397').trim();
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_ADMIN_API_VERSION || '2026-04';
 const CATALOG_DEPLOY_VERSION =
   Number(process.env.CATALOG_VERSION) || Math.floor(Date.now() / 1000);
@@ -56,6 +56,14 @@ const PRODUCT_LIST_FRAGMENT = `
   tags
   availableForSale
   featuredImage { url width height altText }
+  media(first: 20) {
+    edges {
+      node {
+        __typename
+        ... on Video { id previewImage { url } sources { url mimeType } }
+      }
+    }
+  }
   priceRange { minVariantPrice { amount currencyCode } }
   compareAtPriceRange { maxVariantPrice { amount currencyCode } }
   collections(first: 3) { edges { node { id handle title } } }
@@ -87,6 +95,7 @@ const PRODUCT_DETAIL_FRAGMENT = `
   media(first: 30) {
     edges {
       node {
+        ... on Video { __typename id previewImage { url } sources { url mimeType } }
         ... on MediaImage {
           __typename
           id
